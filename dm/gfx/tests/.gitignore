@@ -74,3 +74,6 @@ t_upgrade_alias
 t_upgrade_alias.dSYM/
 t_stencil_view
 t_stencil_view.dSYM/
+
+t_index_cache_lifetime
+t_index_cache_lifetime.dSYM/
