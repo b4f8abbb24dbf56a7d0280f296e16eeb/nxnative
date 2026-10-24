@@ -1,0 +1,43 @@
+name: GPU pool bounds validation
+
+on:
+  push:
+    branches: [ci/gpu-pool-bounds]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-pool-bounds-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      GAME: 010015100B514000
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          clang --version
+      - name: Portable range regression
+        run: make -C dm/gfx/tests check_t_pool_range
+      - name: Sanitized range regression
+        run: |
+          clang -std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined dm/gfx/tests/t_pool_range.c -o "$RUNNER_TEMP/t_pool_range_san"
+          ASAN_OPTIONS=detect_leaks=0 "$RUNNER_TEMP/t_pool_range_san"
+      - name: Compile native host
+        run: make -C dm/host GAME="$GAME" -j3
+      - name: Run production Objective-C lookup regression
+        run: make -C dm/gfx/tests GAME="$GAME" check_t_pool_bounds
+      # The lookup test uses synthetic resident entries and submits no GPU work.
+      # This does not claim device/gameplay validation.
