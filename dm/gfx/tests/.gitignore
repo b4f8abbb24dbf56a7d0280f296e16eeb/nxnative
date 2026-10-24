@@ -1,4 +1,6 @@
 t_nvn
+t_report_value
+t_report_value.dSYM/
 t_nvn.dSYM/
 t_builtin
 t_deswz_gpu
@@ -74,3 +76,16 @@ t_upgrade_alias
 t_upgrade_alias.dSYM/
 t_stencil_view
 t_stencil_view.dSYM/
+
+t_pool_range
+t_pool_range.dSYM/
+t_pool_bounds
+t_pool_bounds.dSYM/
+t_pool_registration_identity
+t_pool_registration_identity.dSYM/
+t_pool_registration
+t_pool_registration.dSYM/
+t_dirty_registration
+t_dirty_registration.dSYM/
+t_index_cache_lifetime
+t_index_cache_lifetime.dSYM/
