@@ -1,0 +1,107 @@
+name: Independent GPU feature validation
+
+on:
+  push:
+    branches: [ci/gpu-feature-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-feature-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+# Keep CI-only wiring separate from the three independent feature branches.
+# Each checkout pins the exact published feature commit, not a combined tree.
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      GAME: 010015100B514000
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out pool registration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 6753b2a02dab9a4eaac372233ce416b0c9bc5249
+          path: registration
+          persist-credentials: false
+      - name: Check out ReportValue
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: cb19820d65682ab837ab64ffcf2a3657fb9b65c4
+          path: report-value
+          persist-credentials: false
+      - name: Check out index cache lifetime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a4d71d91efbcf2094e512271b22abb5d45601f93
+          path: index-cache
+          persist-credentials: false
+      - name: Verify exact independent commits and toolchain
+        run: |
+          test "$(git -C registration rev-parse HEAD)" = 6753b2a02dab9a4eaac372233ce416b0c9bc5249
+          test "$(git -C report-value rev-parse HEAD)" = cb19820d65682ab837ab64ffcf2a3657fb9b65c4
+          test "$(git -C index-cache rev-parse HEAD)" = a4d71d91efbcf2094e512271b22abb5d45601f93
+          xcodebuild -version
+          clang --version
+      - name: Registration portable and sanitizer regressions
+        working-directory: registration
+        run: |
+          make -C dm/gfx/tests check_t_pool_registration_identity
+          clang -std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined dm/gfx/nvn/tests/t_pool_registration.c -o "$RUNNER_TEMP/t_pool_registration_san"
+          "$RUNNER_TEMP/t_pool_registration_san"
+      - name: Registration native VM regressions
+        if: ${{ !cancelled() }}
+        working-directory: registration/dm/gfx/tests
+        run: |
+          make GAME="$GAME" -j3 t_dirty_registration t_dirty_race t_dirty_slots
+          ./t_dirty_registration
+          ./t_dirty_race
+          ./t_dirty_slots
+          clang -O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/"$GAME" -fsanitize=undefined t_dirty_registration.c ../../host/crash.c -o "$RUNNER_TEMP/t_dirty_registration_ubsan"
+          "$RUNNER_TEMP/t_dirty_registration_ubsan"
+      - name: Registration host and Metal regression compile only
+        if: ${{ !cancelled() }}
+        working-directory: registration
+        run: |
+          make -C dm/host GAME="$GAME" -j3 dmhost
+          test -x dm/host/dmhost
+          make -C dm/gfx/tests GAME="$GAME" t_pool_registration
+      - name: ReportValue portable and sanitizer regressions
+        if: ${{ !cancelled() }}
+        working-directory: report-value
+        run: |
+          make -C dm/gfx/tests check_report_value
+          clang -std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -I dm/gfx/nvn/include -fsanitize=address,undefined dm/gfx/tests/t_report_value.c -o "$RUNNER_TEMP/t_report_value_san"
+          "$RUNNER_TEMP/t_report_value_san"
+      - name: ReportValue host and completion regression compile only
+        if: ${{ !cancelled() }}
+        working-directory: report-value
+        run: |
+          make -C dm/host GAME="$GAME" -j3 dmhost
+          test -x dm/host/dmhost
+          make -C dm/gfx/tests GAME="$GAME" t_nvn
+      - name: Index cache production-function and sanitizer regressions
+        if: ${{ !cancelled() }}
+        working-directory: index-cache
+        run: |
+          CC=clang python3 dm/gfx/tests/test_index_cache_lifetime.py
+          CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined' python3 dm/gfx/tests/test_index_cache_lifetime.py
+      - name: Index cache host and Metal regression compile only
+        if: ${{ !cancelled() }}
+        working-directory: index-cache
+        run: |
+          make -C dm/host GAME="$GAME" -j3 dmhost
+          test -x dm/host/dmhost
+          make -C dm/gfx/tests GAME="$GAME" t_index_cache_lifetime
+      # Hosted runners lack Metal 4. Never execute mtl_init or submit GPU work:
+      # t_pool_registration, t_nvn and t_index_cache_lifetime are compile-only.
+      # The index-cache Python fixture uses production functions and dirty tracking,
+      # but models Metal registration epochs; this is not device/gameplay coverage.
