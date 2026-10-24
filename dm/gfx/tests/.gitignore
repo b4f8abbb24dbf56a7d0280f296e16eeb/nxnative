@@ -74,3 +74,9 @@ t_upgrade_alias
 t_upgrade_alias.dSYM/
 t_stencil_view
 t_stencil_view.dSYM/
+t_pool_registration_identity
+t_pool_registration_identity.dSYM/
+t_pool_registration
+t_pool_registration.dSYM/
+t_dirty_registration
+t_dirty_registration.dSYM/
