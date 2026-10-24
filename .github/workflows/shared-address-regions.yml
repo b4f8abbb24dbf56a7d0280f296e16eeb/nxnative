@@ -1,0 +1,82 @@
+name: Shared native address-region validation
+
+on:
+  push:
+    branches: [ci/shared-address-regions]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-address-regions-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GAME: 010015100B514000
+  FEATURE_SHA: 08f1b17d35733d428cf93fe1434bacf5297dc6da
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  address-regions:
+    name: Native regions, sanitizers, profiles and host build
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: b4f8abbb24dbf56a7d0280f296e16eeb/nxnative
+          ref: 08f1b17d35733d428cf93fe1434bacf5297dc6da
+          persist-credentials: false
+      - name: Verify exact feature revision and runner
+        run: |
+          test "$(git rev-parse HEAD)" = "$FEATURE_SHA"
+          mkdir -p logs
+          git show --no-patch --format=fuller HEAD | tee logs/revision.log
+          sw_vers
+          uname -a
+          clang --version
+          sysctl hw.pagesize
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Install Python test dependencies
+        run: python -m pip install lz4 capstone fonttools
+      - name: Native address manager and production SVC tests
+        if: ${{ !cancelled() }}
+        run: make -C dm/host/tests address-space address-space-svc 2>&1 | tee logs/address-space.log
+      - name: AddressSanitizer and UndefinedBehaviorSanitizer
+        if: ${{ !cancelled() }}
+        env:
+          ASAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: make -C dm/host/tests address-space-sanitize address-space-svc-sanitize 2>&1 | tee logs/address-space-sanitize.log
+      - name: ThreadSanitizer
+        if: ${{ !cancelled() }}
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: make -C dm/host/tests address-space-tsan address-space-svc-tsan 2>&1 | tee logs/address-space-tsan.log
+      - name: Profile boundaries and patch, alias and chain checks
+        if: ${{ !cancelled() }}
+        env:
+          DM_GAME: ${{ env.GAME }}
+        run: |
+          python -m unittest -v \
+            dm/tools/tests/test_address_regions.py \
+            dm/tools/tests/test_patches.py \
+            dm/tools/tests/test_nsp_alias.py \
+            dm/tools/tests/test_nsp_chain.py 2>&1 | tee logs/python-checks.log
+      - name: Full Mac host build
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host GAME="$GAME" -j3 dmhost 2>&1 | tee logs/dmhost.log
+          test -x dm/host/dmhost
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: shared-address-regions-logs
+          path: logs
+          retention-days: 7
