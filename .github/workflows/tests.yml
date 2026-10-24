@@ -65,6 +65,12 @@ jobs:
           make -C dm/host/tests address-space address-space-svc 2>&1 | tee logs/address-space.log
           make -C dm/host/tests address-space-sanitize address-space-svc-sanitize 2>&1 | tee logs/address-space-sanitize.log
           make -C dm/host/tests address-space-tsan address-space-svc-tsan 2>&1 | tee logs/address-space-tsan.log
+      - name: MapMemory source-ownership regressions and sanitizers
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests map-memory 2>&1 | tee logs/map-memory.log
+          make -C dm/host/tests map-memory-sanitize 2>&1 | tee logs/map-memory-sanitize.log
+          make -C dm/host/tests map-memory-tsan 2>&1 | tee logs/map-memory-tsan.log
       - name: Full host CPU unit tests
         if: ${{ !cancelled() }}
         run: make -C dm/host/tests GAME="$GAME" -j3 run 2>&1 | tee logs/host-tests.log
