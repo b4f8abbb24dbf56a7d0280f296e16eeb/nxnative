@@ -120,6 +120,61 @@ Failed protection does not initialize bytes or notify dirty tracking. The
 uses the process's fill policy for newly allocated physical pages (normally
 zero); this host does not implement its debug-fill policy.
 
+## MapMemory source ownership
+
+The production SVC dispatcher also tracks the source of each `MapMemory` stack.
+Mapping borrows one nonempty, 4 KiB-aligned source interval; a second mapping
+cannot borrow any part of it until an **exact** destination/source/size
+`UnmapMemory` copies the stack contents back. The source must be wholly committed
+alias memory, an opened heap interval, or writable data/BSS in a loaded static
+module. Free logical slices are rejected even when their host page is accessible.
+Code, read-only data, executable patch areas and stacks are not eligible sources.
+The loader's read-only key-table page and 16 KiB-rounded text/patch seals also
+split nominal CodeData query runs; no source may include these nonwritable bytes.
+Dynamic NRO module sources are deliberately unsupported: the existing loader
+restores their data on reload outside the memory locks. Supporting that lifetime
+requires loader integration, not merely recognizing a writable module address.
+
+`QueryMemory` preserves the source's underlying Heap/CodeData state, reports
+attribute bit 0 (`Locked` / `IsBorrowed`) and no user permission, and splits the
+surrounding unlocked runs at source ownership boundaries. This is **not** the
+distinct permission-lock attribute (bit 4). Exact unmap restores the ordinary
+RW source run and reports the destination as free. Its public `MemoryInfo`
+output is exactly 40 bytes, including zero IPC/device counts and reserved word;
+PageInfo is returned in register x1 by this raw SVC dispatcher.
+
+Both physical commit and decommit reject an entire request that intersects a
+borrowed source, without touching other pages in that request. Heap shrink
+similarly refuses to remove a borrowed tail; disjoint changes remain allowed.
+The legacy permission/attribute SVC stubs reject mutations intersecting borrowed
+sources; general permission/attribute changes remain unimplemented.
+Map/unmap, query, physical operations and heap resizing observe the lock order
+`g_map_lock` → `g_phys_mu` → address-manager lock. Source ownership publishes
+only after destination protection and copying succeed. A protection failure
+returns an error without copying, acquiring ownership or notifying dirty
+tracking. Full mapping metadata returns `OutOfResource` rather than aborting.
+
+Map/unmap address misalignment returns `0xcc01`; zero/misaligned size returns
+`0xca01`; overflow, invalid source state, conflicts and unmatched unmaps return
+`0xd401`; a destination outside the stack region or two valid exact ranges
+belonging to different mapping pairs return `0xdc01`. Partial unmap remains
+unsupported and returns `0xd401`, even within a valid mapping. Validation
+precedes host memory access. These contracts were independently implemented
+using the [reference SVC validation](https://github.com/Atmosphere-NX/Atmosphere/blob/6b0c077b4c608a3a2ee712b8dc35fee87ceb62e8/libraries/libmesosphere/source/svc/kern_svc_memory.cpp),
+[MapMemory state transitions](https://github.com/Atmosphere-NX/Atmosphere/blob/6b0c077b4c608a3a2ee712b8dc35fee87ceb62e8/libraries/libmesosphere/source/kern_k_page_table_base.cpp)
+and [public MemoryInfo definition](https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h)
+as behavioral/interface references; no reference implementation was copied.
+
+This remains the native **copy/move** implementation, not coherent aliases.
+Source and destination do not share live writes: the stack copy is authoritative
+until copyback. Source permission removal is logical only; host access remains
+possible, and an unmapped stack's host pages are retained so that adjacent live
+4 KiB stacks on a 16 KiB host page are not revoked. Dirty tracking is notified
+for the full destination host-page run on map and the source bytes on copyback.
+No claim of per-4-KiB hardware isolation, partial unmap, general permission-SVC
+support or NRO lifecycle ownership is made. Existing game patches/profiles and
+the SDK's address-region reservation ownership are unchanged.
+
 The generic core delegates initialization to an optional, non-failing callback;
 without it, the core makes **no zero-fill promise**. That callback must not
 allocate, re-enter the manager or change page protections. It sees only old-zero
@@ -136,6 +191,7 @@ Profile-free production tests run on Linux or macOS, without game binaries:
 make -C dm/host/tests address-space address-space-svc
 make -C dm/host/tests address-space-sanitize address-space-svc-sanitize
 make -C dm/host/tests address-space-tsan address-space-svc-tsan
+make -C dm/host/tests map-memory map-memory-sanitize map-memory-tsan
 python3 -m unittest dm.tools.tests.test_address_regions
 ```
 
@@ -148,6 +204,14 @@ includes the real dispatcher/backend and tests both `mem_map_limit` policies,
 concurrent initialization, native read/write, heap rollback, and free-range
 queries outside the alias boundaries. The normal targets are also in the
 existing host `run` suite.
+
+The MapMemory SVC harness covers lifecycle/copyback, source/destination overlap,
+invalid/overflowing inputs, exact 40-byte query writes with unaligned guard
+buffers, source-state splits, readonly module seals, bounded metadata exhaustion
+and reuse, dirty-prewrite notifications, protection failure, backing-decommit and
+heap-shrink protection, and concurrent ownership/query/decommit/shrink races.
+It runs native and simulated 16 KiB host pages with both pool-accounting policies;
+the simulation does not substitute for Apple hardware protection/device tests.
 
 For environments where LeakSanitizer cannot use ptrace, only leak detection can
 be disabled with `ASAN_OPTIONS=detect_leaks=0`; this is not a leak-check pass.
