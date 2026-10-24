@@ -74,3 +74,8 @@ t_upgrade_alias
 t_upgrade_alias.dSYM/
 t_stencil_view
 t_stencil_view.dSYM/
+
+t_pool_range
+t_pool_range.dSYM/
+t_pool_bounds
+t_pool_bounds.dSYM/
