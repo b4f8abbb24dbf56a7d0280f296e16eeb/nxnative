@@ -1,0 +1,261 @@
+# Tests that need no game files, keys or GPU. GitHub's macOS runners are virtual Macs without Metal 4 (issue #112), so the tests that go through mtl_init
+# (t_nvn, t_mip_extent, t_rt_range and the rest of dm/gfx/tests' run list) stay local: run `make -C dm/gfx/tests GAME=<id> run` on an Apple-silicon Mac.
+# `profile_guess.py --check` stays local too: it compares the guesses with the extractions of the games (it needs their files).
+name: Clean image atomic exact-head ARM64 validation
+
+on:
+  push:
+    branches: [ci/image-atomic-clean-arm64-20261025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-image-atomic-exact-head-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+  GAME: 010015100B514000   # Super Mario Bros. Wonder: the profile the host and gfx tests are built for (any profile does; the tests are about code, not the game)
+
+defaults:
+  run:
+    shell: bash
+
+# Actions are pinned to commit SHAs (the tag in the comment): a tag can be moved, a SHA cannot. Dependabot (github-actions) can raise them.
+jobs:
+  host-tests:
+    name: Host unit tests and CPU-only gfx tests
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 33d756828fd294ea435e676b5bb25b34bf26c820
+          persist-credentials: false
+      - name: Verify immutable source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = 33d756828fd294ea435e676b5bb25b34bf26c820
+          test "$(git rev-parse HEAD^{tree})" = 1169c0e983e21583da1386d636d005d17d667d69
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+      - name: Host unit tests (dm/host/tests)
+        run: |
+          mkdir -p logs
+          make -C dm/host/tests GAME="$GAME" -j3 run 2>&1 | tee logs/host-tests.log
+      - name: CPU-only gfx tests (dm/gfx/tests)
+        run: |
+          mkdir -p logs
+          cd dm/gfx/tests
+          tests="t_dirty_slots t_dirty_race t_pace t_fstep t_hmap t_cover t_pso_skey t_refl t_rt_range_ro t_imga_layout"
+          make GAME="$GAME" -j3 $tests 2>&1 | tee ../../../logs/gfx-build.log
+          failed=0
+          for t in $tests; do
+            echo "::group::$t"
+            ./$t 2>&1 | tee "../../../logs/$t.log" && rc=0 || rc=1   # pipefail: the test's status
+            echo "::endgroup::"
+            if [ "$rc" != 0 ]; then echo "::error::$t failed"; failed=1; fi
+          done
+          exit $failed
+      - name: Image-atomic admission with ASan and UBSan
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/gfx/tests GAME="$GAME" imga-layout-sanitize \
+            2>&1 | tee logs/image-atomic-layout-sanitize.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-host-tests
+          path: logs
+          retention-days: 7
+
+  tool-tests:
+    name: Tool tests
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 33d756828fd294ea435e676b5bb25b34bf26c820
+          persist-credentials: false
+      - name: Verify immutable source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = 33d756828fd294ea435e676b5bb25b34bf26c820
+          test "$(git rev-parse HEAD^{tree})" = 1169c0e983e21583da1386d636d005d17d667d69
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: .github/workflows/tests.yml   # no requirements file: the packages are listed in the step below
+      - name: Install the Python packages the tools import
+        run: python -m pip install lz4 capstone fonttools   # backports.zstd is for Python before 3.14 only
+      - name: Run the test files
+        env:
+          DM_GAME: ${{ env.GAME }}   # test_tbdr_budget runs a tool that needs a profile
+        run: |
+          mkdir -p logs
+          failed=0
+          for f in dm/tools/tests/test_*.py dm/ios/tests/test_*.py dm/gfx/tests/test_*.py; do
+            echo "::group::$f"
+            python -m unittest -v "$f" 2>&1 | tee "logs/$(basename "$f").log" || { echo "::error::$f failed"; failed=1; }
+            echo "::endgroup::"
+          done
+          exit $failed
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-tool-tests
+          path: logs
+          retention-days: 7
+
+  build:
+    name: Build check (Mac host, gfx tests, iOS sources)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 33d756828fd294ea435e676b5bb25b34bf26c820
+          persist-credentials: false
+      - name: Verify immutable source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = 33d756828fd294ea435e676b5bb25b34bf26c820
+          test "$(git rev-parse HEAD^{tree})" = 1169c0e983e21583da1386d636d005d17d667d69
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+      - name: Mac host for four profiles (Vulkan, NVN, OpenGL and target profile)
+        run: |
+          mkdir -p logs
+          # Wonder: NVN; Hades: Vulkan; Digimon Story Cyber Sleuth: OpenGL. The second and third reuse the libvpx build in dm/host/gen/vpx.
+          for g in 010015100B514000 0100535012974000 010014E00DB56000 0100F43008C44000; do
+            echo "::group::dmhost $g"
+            make -C dm/host GAME=$g -j3 dmhost 2>&1 | tee "logs/dmhost-$g.log"
+            test -x dm/host/dmhost
+            echo "::endgroup::"
+          done
+      - name: Every gfx test compiled, not run
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          cd dm/gfx/tests
+          tests=$(sed -n 's/^\(t_[a-z0-9_]*\):.*/\1/p' Makefile | sort -u)
+          echo "$tests" | tr '\n' ' '; echo
+          make GAME="$GAME" -j3 $tests 2>&1 | tee ../../../logs/gfx-tests-build.log
+      - name: iOS host sources compiled for the iPhone SDK (no signing, no Xcode project)
+        if: ${{ !cancelled() }}
+        run: GAME=0100F43008C44000 python3 dm/ios/tools/compile_check.py 2>&1 | tee logs/ios-compile.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-build
+          path: logs
+          retention-days: 7
+
+  image-atomic-shaders:
+    name: Synthetic image atomics (bundled/rebuilt translator, Mac+iOS Metal)
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      DMSH_TEST_METAL: '1'
+      DMSH_TEST_METAL_SDKS: macosx,iphoneos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 33d756828fd294ea435e676b5bb25b34bf26c820
+          persist-credentials: false
+      - name: Verify immutable source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = 33d756828fd294ea435e676b5bb25b34bf26c820
+          test "$(git rev-parse HEAD^{tree})" = 1169c0e983e21583da1386d636d005d17d667d69
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+          { uname -a; sw_vers; xcodebuild -version; } | tee logs/platform.txt
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.402'
+      - name: Install public SPIR-V validation/compiler tools and Apple Metal compiler if needed
+        run: |
+          brew install spirv-cross spirv-tools
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          {
+            dotnet --info
+            spirv-cross --revision
+            spirv-val --version
+            brew list --versions spirv-cross spirv-tools
+            xcrun -sdk macosx metal --version
+            xcrun -sdk iphoneos metal --version
+            shasum -a 256 "$(command -v spirv-cross)" "$(command -v spirv-val)"
+          } 2>&1 | tee logs/shader-tool-identities.txt
+      - name: Verify committed managed bundle and source fingerprint without changing tool lock
+        run: |
+          python3 - <<'PY' 2>&1 | tee logs/translator-lock-check.txt
+          import hashlib, pathlib, shutil, subprocess, sys
+          sys.path.insert(0, 'dm/gfx/tools')
+          import dmsh_chain as chain
+          bundle = pathlib.Path('dm/gfx/tools/dmsh_xlate_bin')
+          lock = dict(line.split('\t', 1) for line in pathlib.Path(chain.LOCK).read_text().splitlines() if '\t' in line and not line.startswith('#'))
+          for dll in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll'):
+              actual = chain.sha16(bundle / dll)
+              print(dll, actual)
+              assert actual == lock[dll], (dll, actual, lock[dll])
+          actual = subprocess.check_output([str(bundle / 'dmsh_xlate'), '--source-sha'], text=True).strip()
+          print('xlate_source', actual)
+          assert actual == lock['xlate_source'] == chain.xlate_source_sha()
+          compiler = pathlib.Path(shutil.which('spirv-cross'))
+          actual = chain.sha16(compiler)
+          print('Cross CI binary:', actual, 'recorded production binary:', lock['spirv-cross'])
+          print('Cross exact binary identity:', actual == lock['spirv-cross'])
+          print('Different Cross binaries are tested for the exact accepted helper ABI, not claimed identical.')
+          print('chain:', chain.version())
+          assert pathlib.Path(chain.HEADER).read_text() == chain.header_text(chain.version())
+          PY
+      - name: Bundled production launcher and managed dependencies through exact helper regression
+        run: |
+          DMSH_TEST_XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate" \
+            python3 -m unittest discover -s dm/tools/tests -p test_image_atomic_bounds.py -v \
+            2>&1 | tee logs/image-atomics-bundled.log
+          ! grep -E 'skipped|SKIP:' logs/image-atomics-bundled.log
+          test "$(grep -c 'synthetic Metal compile/link passed:' logs/image-atomics-bundled.log)" = 96
+      - name: Independently rebuild the translator from the same immutable source
+        id: rebuild
+        if: ${{ !cancelled() }}
+        run: |
+          dotnet build dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release \
+            --artifacts-path "$RUNNER_TEMP/atomic-translator-build" \
+            -p:GeneratePackageOnBuild=false --disable-build-servers -m:1 \
+            2>&1 | tee logs/translator-rebuild.log
+          dll="$RUNNER_TEMP/atomic-translator-build/bin/dmsh_xlate/release/dmsh_xlate.dll"
+          test -s "$dll"
+          printf '#!/bin/sh\nexec dotnet "%s" "$@"\n' "$dll" > "$RUNNER_TEMP/atomic-translator-rebuilt"
+          chmod +x "$RUNNER_TEMP/atomic-translator-rebuilt"
+          "$RUNNER_TEMP/atomic-translator-rebuilt" --source-sha | tee logs/rebuilt-source-sha.txt
+          test "$(cat logs/rebuilt-source-sha.txt)" = "$(awk '$1 == "xlate_source" {print $2}' dm/gfx/tools/dmsh_chain.lock)"
+          shasum -a 256 "$RUNNER_TEMP/atomic-translator-build/bin/dmsh_xlate/release/"*.dll > logs/rebuilt-dll-sha256.txt
+      - name: Independently rebuilt translator through exact helper regression
+        if: ${{ !cancelled() && steps.rebuild.outcome == 'success' }}
+        run: |
+          DMSH_TEST_XLATE="$RUNNER_TEMP/atomic-translator-rebuilt" \
+            python3 -m unittest discover -s dm/tools/tests -p test_image_atomic_bounds.py -v \
+            2>&1 | tee logs/image-atomics-rebuilt.log
+          ! grep -E 'skipped|SKIP:' logs/image-atomics-rebuilt.log
+          test "$(grep -c 'synthetic Metal compile/link passed:' logs/image-atomics-rebuilt.log)" = 96
+          git diff --exit-code
+      - name: Upload synthetic-only shader validation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: image-atomic-synthetic-compilers
+          path: logs
+          retention-days: 14
