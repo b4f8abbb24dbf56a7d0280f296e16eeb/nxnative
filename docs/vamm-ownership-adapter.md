@@ -77,6 +77,49 @@ real heap/image/alias usage under the SVC source guard. StandardAllocator can
 consume this owner through the same trusted current-owner callback interface;
 its 62 GiB logical capacity does not reserve 62 GiB.
 
+## Native SVC bridge
+
+`hle_vamm_native.[ch]` now supplies real callbacks instead of relying on the
+synthetic fixture to drive the SVC dispatcher. `dm_vamm_native_configure` obtains
+its base from GetInfo type 2 and its **exact** size from type 3 minus type 28.
+It rejects zero, misaligned, underflowed or wrapping raw domains without
+publishing configuration. Type 28 is currently zero in this host, but the
+owner does not hard-code that assumption; nonzero deductions are tested.
+Preparing configuration does not initialize an owner or transfer reservations.
+
+The page callback and the public MapPhysicalMemory/UnmapPhysicalMemory SVCs
+share one native transaction. It acquires source ownership, physical accounting
+and address-manager locks in that order, rejects borrowed source overlap before
+calling the backend, and retains the existing atomic page/accounting failure
+contract. No guest callbacks or dispatcher reentry occur. Limited profiles
+still enforce the application pool; ordinary legacy-unlimited callers remain
+unlimited. Only the existing provider's thread-local allocation scope adds the
+strict current heap/image/alias budget, atomically at commit.
+
+The callback explicitly implements the independently checked operation-specific
+result policy of the inspected SDK, not the old fixture's generic guess:
+
+| SVC result | Map/combined allocation | Unmap/free |
+| --- | --- | --- |
+| success | success | success |
+| `0xce01` (OutOfResource) | `0x1203` | `0x1203` |
+| `0xd001` (OutOfMemory) | `0x1003` | `0x1003` |
+| `0x10801` (LimitReached) | `0x1003` | `0x1003` |
+| `0xd401` (InvalidCurrentMemory) | fatal | `0x803` |
+| other nonzero result | fatal | fatal |
+
+Upper result-context bits are masked for error comparisons, not for detecting
+success. In particular, `0xd001` and `0xd401` are different results. A native
+map backend failure currently returns `0xd401`: its SVC transaction rolls back,
+but the nn::os boundary then aborts rather than reporting a recoverable failure.
+Unmap with that same result returns `0x803` and keeps the Vamm reservation live.
+This is an observed contract for the inspected SDK, not activation proof for
+arbitrary SDK versions. There is no guest abort callback under native locks.
+
+The resource callback returns GetInfo 16/17 **unmodified**. The Vamm owner alone
+adds and bounds the 512 KiB headroom; no alias reservations or committed bytes
+are substituted for system resources. Tests include zero and tiny totals.
+
 ## All-or-none dispatch, with no shipping activation
 
 `hle_vamm_adapter.[ch]` includes all 18 signatures, including constructor aliases,
@@ -107,9 +150,10 @@ into memory the host previously owned.
 2. Proven original constructor-only bootstrap and a handoff before **any** SDK
    node owner or conflicting reservation is created. Existing live reservations
    are not imported or migrated by this prototype.
-3. Complete native callback result/abort policy and exact alias-domain bootstrap
-   (including SDK address-space deductions), plus the loader's atomic group
-   installation transaction and native AArch64 signature validation.
+3. Verify the native callback/result and exact-domain contracts against every
+   supported SDK, then implement the loader's atomic group installation
+   transaction and native AArch64 signature validation. The native bridge above
+   does not establish a safe owner handoff.
 4. Real target-device, unpatched initialization and exhaustion/rollback tests,
    concurrency/teardown, GPU pointer registration, rendering and gameplay.
 
@@ -124,6 +168,7 @@ single contiguous region inside a smaller native alias domain.
 make -C dm/host/tests vamm vamm-gate vamm-abi
 make -C dm/host/tests vamm-sanitize
 make -C dm/host/tests vamm-tsan
+make -C dm/host/tests vamm-native vamm-native-sanitize vamm-native-tsan
 ```
 
 The normal, ASan/UBSan and TSan targets each execute 12 combinations: 4/16 KiB
@@ -138,3 +183,13 @@ On the current x86 host the AArch64 fixture explicitly skips rather than claimin
 native ABI validation. ASan/UBSan passed with `ASAN_OPTIONS=detect_leaks=0` because
 LeakSanitizer cannot run under the harness's ptrace; no leak-check pass is claimed.
 The expected failure-injection tests log SVC backend errors deliberately.
+
+The native bridge targets additionally run six configurations: 4/16 KiB host
+pages with limited/unlimited maps, and disabled/tiny system-resource totals.
+They use production native callbacks with the actual SVC manager and provider,
+checking exact-domain validation, operation-specific result/abort behavior,
+borrowed sources, strict nested budgets/image floor, exhaustion, rollback,
+raw SVC compatibility, resource totals and concurrent allocation/free. Expected
+fatal-policy cases run in child processes and must terminate with SIGABRT;
+these deliberate aborts do not claim target-device SDK execution. The old
+synthetic Vamm fixture now shares this checked result translator too.

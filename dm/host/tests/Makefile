@@ -38,7 +38,7 @@ $(GAME_H):
 	$(MAKE) -C .. game_profile GAME=$(GAME)
 # The fail-fast regression uses the synthetic profile and production manager,
 # so it covers initialization/accounting without a game header or Apple SDK.
-HEAP_SIZE_DEPS = t_heap_size.c address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
+HEAP_SIZE_DEPS = t_heap_size.c address_space_profile/game_profile.h ../hle_svc.c ../hle_vamm_native.h ../hle_vamm.h ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_heap_size: $(HEAP_SIZE_DEPS) | $(B)
 	$(CC) $(AS_SVC_FLAGS) -Wno-unused-function -fsanitize=undefined -o $@ t_heap_size.c ../hle_address_space.c
 $(B)/t_heap_size_sanitize: $(HEAP_SIZE_DEPS) | $(B)
@@ -122,7 +122,7 @@ run: address-space
 # profiles must retain their accounting policy. Existing Darwin printf formats
 # use %llx for uint64_t, so suppress that platform-only warning in this harness.
 AS_SVC_FLAGS = $(AS_FLAGS) -std=gnu11 -Wno-format -Iaddress_space_profile
-AS_SVC_DEPS = t_address_space_svc.c heap_failure_test.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
+AS_SVC_DEPS = t_address_space_svc.c heap_failure_test.h address_space_profile/game_profile.h ../hle_svc.c ../hle_vamm_native.h ../hle_vamm.h ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_address_space_svc: $(AS_SVC_DEPS) | $(B)
 	$(CC) $(AS_SVC_FLAGS) -o $@ t_address_space_svc.c ../hle_address_space.c
 $(B)/t_address_space_svc_unlimited: $(AS_SVC_DEPS) | $(B)
@@ -145,7 +145,7 @@ run: address-space-svc
 # 16 KiB host pages exercise neighboring 4 KiB source/destination lifetimes on
 # Linux as well; this is not a hardware-isolation or Apple-device test.
 MAP_MEMORY_FLAGS = -Imap_memory_profile $(AS_SVC_FLAGS)
-MAP_MEMORY_DEPS = t_map_memory.c heap_failure_test.h map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
+MAP_MEMORY_DEPS = t_map_memory.c heap_failure_test.h map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../hle_vamm_native.h ../hle_vamm.h ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_map_memory: $(MAP_MEMORY_DEPS) | $(B)
 	$(CC) $(MAP_MEMORY_FLAGS) -o $@ t_map_memory.c ../hle_address_space.c
 $(B)/t_map_memory_unlimited: $(MAP_MEMORY_DEPS) | $(B)
@@ -242,7 +242,7 @@ standard-allocator-adapter-tsan: $(B)/t_standard_allocator_adapter_tsan
 # Existing-owner leases through the actual portable SVC dispatcher. Stub only
 # original SDK operations with a synthetic reservation ledger; no binary input.
 SA_PROVIDER_SRCS = t_standard_allocator_provider.c ../hle_address_space.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
-SA_PROVIDER_DEPS = $(SA_PROVIDER_SRCS) map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
+SA_PROVIDER_DEPS = $(SA_PROVIDER_SRCS) map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../hle_vamm_native.h ../hle_vamm.h ../dm.h ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_standard_allocator_provider: $(SA_PROVIDER_DEPS) | $(B)
 	$(CC) $(MAP_MEMORY_FLAGS) -o $@ $(SA_PROVIDER_SRCS)
 $(B)/t_standard_allocator_provider_unlimited: $(SA_PROVIDER_DEPS) | $(B)
@@ -294,8 +294,8 @@ standard-allocator-check-tsan: standard-allocator-tsan standard-allocator-adapte
 
 # Reservation-only Vamm owner, complete synthetic ABI dispatch, existing span
 # provider and real external-mode SVC manager; no proprietary inputs or hooks.
-VAMM_SRCS = t_vamm.c ../hle_vamm.c ../hle_vamm_adapter.c ../hle_address_space.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
-VAMM_DEPS = $(VAMM_SRCS) ../hle_vamm.h ../hle_vamm_adapter.h $(SA_PROVIDER_DEPS)
+VAMM_SRCS = t_vamm.c ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c ../hle_address_space.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+VAMM_DEPS = $(VAMM_SRCS) ../hle_vamm_native.h ../hle_vamm.h ../hle_vamm_adapter.h $(SA_PROVIDER_DEPS)
 VAMM_FLAGS = $(MAP_MEMORY_FLAGS) -DDM_VAMM_ADAPTER_TESTING
 $(B)/t_vamm: $(VAMM_DEPS) | $(B)
 	$(CC) $(VAMM_FLAGS) -o $@ $(VAMM_SRCS)
@@ -359,3 +359,54 @@ guest-thread-stack-sanitize: $(B)/t_guestthread_stack_sanitize $(B)/t_guestthrea
 	$(B)/t_guestthread_stack_sanitize
 	$(B)/t_guestthread_stack_16k_sanitize
 run: guest-thread-stack
+
+# Actual native Vamm callbacks, shared production SVC transaction, raw GetInfo
+# resources, operation-specific result policy. No guest or proprietary inputs.
+VAMM_NATIVE_SRCS = t_vamm_native.c ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c ../hle_address_space.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+VAMM_NATIVE_DEPS = $(VAMM_NATIVE_SRCS) ../hle_vamm_native.h $(VAMM_DEPS)
+$(B)/t_vamm_native: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_unlimited: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_16k: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_16k_unlimited: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_disabled: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_SYS_RESOURCE=0 -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_small_resource: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_SYS_RESOURCE=0x1000 -o $@ $(VAMM_NATIVE_SRCS)
+.PHONY: vamm-native
+vamm-native: $(B)/t_vamm_native $(B)/t_vamm_native_unlimited $(B)/t_vamm_native_16k $(B)/t_vamm_native_16k_unlimited $(B)/t_vamm_native_disabled $(B)/t_vamm_native_small_resource
+	@set -e; for test in $^; do $$test; done
+run: vamm-native
+$(B)/t_vamm_native_sanitize: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS)  -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_sanitize_unlimited: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_sanitize_16k: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_sanitize_16k_unlimited: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_sanitize_disabled: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_SYS_RESOURCE=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_sanitize_small_resource: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_SYS_RESOURCE=0x1000 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+.PHONY: vamm-native-sanitize
+vamm-native-sanitize: $(B)/t_vamm_native_sanitize $(B)/t_vamm_native_sanitize_unlimited $(B)/t_vamm_native_sanitize_16k $(B)/t_vamm_native_sanitize_16k_unlimited $(B)/t_vamm_native_sanitize_disabled $(B)/t_vamm_native_sanitize_small_resource
+	@set -e; for test in $^; do $$test; done
+$(B)/t_vamm_native_tsan: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS)  -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_tsan_unlimited: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_tsan_16k: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_tsan_16k_unlimited: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_tsan_disabled: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_SYS_RESOURCE=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+$(B)/t_vamm_native_tsan_small_resource: $(VAMM_NATIVE_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_SYS_RESOURCE=0x1000 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_NATIVE_SRCS)
+.PHONY: vamm-native-tsan
+vamm-native-tsan: $(B)/t_vamm_native_tsan $(B)/t_vamm_native_tsan_unlimited $(B)/t_vamm_native_tsan_16k $(B)/t_vamm_native_tsan_16k_unlimited $(B)/t_vamm_native_tsan_disabled $(B)/t_vamm_native_tsan_small_resource
+	@set -e; for test in $^; do $$test; done
