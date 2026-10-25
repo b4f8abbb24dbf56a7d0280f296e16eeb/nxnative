@@ -1,0 +1,137 @@
+name: Grouped head regressions
+
+on:
+  push:
+    branches: [ci/grouped-head-regressions-20261025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GAME: 010015100B514000
+  ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+  TSAN_OPTIONS: halt_on_error=1
+
+jobs:
+  focused-regressions:
+    name: Exact-head CPU and sanitizer regressions
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - name: Check out GPU pool changes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 689c5105620f2d82aee93a145e2df295efa039c5
+          path: pools
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out ReportValue changes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 7527c95776771820edd2f5e63018556d7ad45396
+          path: report
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out native memory changes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ac5372846a168efbc6d98b95fd63ca378c75c13b
+          path: native
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact heads and upstream parents
+        run: |
+          mkdir -p logs
+          test "$(git -C pools rev-parse HEAD)" = 689c5105620f2d82aee93a145e2df295efa039c5
+          test "$(git -C report rev-parse HEAD)" = 7527c95776771820edd2f5e63018556d7ad45396
+          test "$(git -C native rev-parse HEAD)" = ac5372846a168efbc6d98b95fd63ca378c75c13b
+          for dir in pools report native; do
+            test "$(git -C "$dir" rev-parse HEAD^)" = 0f99c353d3abc334c39855d691afdfab40f4639f
+            git -C "$dir" show -s --format=fuller HEAD | tee "logs/$dir-head.txt"
+          done
+          sw_vers | tee logs/platform.txt
+          clang --version | tee -a logs/platform.txt
+      - name: Pool bounds, exact registration identity, and index lifetime
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          for mode in normal address undefined; do
+            echo "::group::GPU portable regressions ($mode)"
+            flags="-std=c11 -O1 -g -Wall -Wextra -Werror -pedantic"
+            extra=""
+            if [ "$mode" != normal ]; then extra="-fsanitize=$mode -fno-omit-frame-pointer"; fi
+            clang $flags $extra pools/dm/gfx/tests/t_pool_range.c -o "$RUNNER_TEMP/pool-range-$mode"
+            "$RUNNER_TEMP/pool-range-$mode" 2>&1 | tee "logs/pool-range-$mode.log"
+            clang $flags $extra pools/dm/gfx/nvn/tests/t_pool_registration.c -o "$RUNNER_TEMP/pool-registration-$mode"
+            "$RUNNER_TEMP/pool-registration-$mode" 2>&1 | tee "logs/pool-registration-$mode.log"
+            CC=clang CFLAGS="-O1 -g $extra" python3 pools/dm/gfx/tests/test_index_cache_lifetime.py 2>&1 | tee "logs/index-lifetime-$mode.log"
+            echo "::endgroup::"
+          done
+      - name: CPU-only native dirty registration and fault regressions
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          for mode in normal undefined; do
+            echo "::group::Native dirty regressions ($mode)"
+            flags="-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/$GAME"
+            if [ "$mode" != normal ]; then flags="$flags -fsanitize=$mode -fno-omit-frame-pointer"; fi
+            make -C pools/dm/gfx/tests GAME="$GAME" -B CFLAGS="$flags" t_dirty_registration t_dirty_slots t_dirty_race 2>&1 | tee "logs/native-dirty-build-$mode.log"
+            for test in t_dirty_registration t_dirty_slots t_dirty_race; do
+              "pools/dm/gfx/tests/$test" 2>&1 | tee "logs/$test-$mode.log"
+            done
+            echo "::endgroup::"
+          done
+      - name: CPU-only Objective-C production pool bounds
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          for mode in normal address undefined; do
+            echo "::group::Production pool bounds ($mode)"
+            flags="-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/$GAME"
+            if [ "$mode" != normal ]; then flags="$flags -fsanitize=$mode -fno-omit-frame-pointer"; fi
+            make -C pools/dm/gfx/tests GAME="$GAME" -B CFLAGS="$flags" t_pool_bounds 2>&1 | tee "logs/pool-bounds-build-$mode.log"
+            pools/dm/gfx/tests/t_pool_bounds 2>&1 | tee "logs/pool-bounds-$mode.log"
+            echo "::endgroup::"
+          done
+      - name: ReportValue record format
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          for mode in normal address undefined; do
+            flags="-std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -Ireport/dm/gfx/nvn/include"
+            if [ "$mode" != normal ]; then flags="$flags -fsanitize=$mode -fno-omit-frame-pointer"; fi
+            clang $flags report/dm/gfx/tests/t_report_value.c -o "$RUNNER_TEMP/report-value-$mode"
+            "$RUNNER_TEMP/report-value-$mode" 2>&1 | tee "logs/report-value-$mode.log"
+          done
+      - name: Native address manager, SVC policy, and MapMemory full matrix
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          for mode in normal address undefined thread; do
+            echo "::group::Native memory full matrix ($mode)"
+            flags="-std=c11 -O1 -g -Wall -Wextra -Werror -pthread -I.."
+            if [ "$mode" != normal ]; then flags="$flags -fsanitize=$mode -fno-omit-frame-pointer"; fi
+            make -C native/dm/host/tests CC=clang B="build/grouped-$mode" AS_FLAGS="$flags" address-space address-space-svc map-memory 2>&1 | tee "logs/native-memory-$mode.log"
+            echo "::endgroup::"
+          done
+          python3 -m unittest -v native/dm/tools/tests/test_address_regions.py 2>&1 | tee logs/native-profiles.log
+      - name: Compile Metal 4 fixtures without running them
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          make -C pools/dm/gfx/tests GAME="$GAME" t_pool_registration t_index_cache_lifetime 2>&1 | tee logs/pool-metal-fixtures-build.log
+          make -C report/dm/gfx/tests GAME="$GAME" t_nvn 2>&1 | tee logs/report-metal-fixture-build.log
+          echo 'GPU-dependent fixtures compiled only: hosted macOS does not provide Metal 4.' | tee logs/hardware-limit.txt
+      - name: Upload all validation logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: grouped-exact-head-regressions
+          path: logs
+          retention-days: 7
