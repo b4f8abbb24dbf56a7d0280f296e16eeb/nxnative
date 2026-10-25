@@ -535,6 +535,50 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md): 2,084 such shaders (Unreal's GPU particles); three ran in the first 100 seconds. [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md): in the 64 KB dummy buffer used before, its atomic max into a 480x270 r32ui 2D array (fragment shader `2bd5037003980716`, the scene after the story opening's first cutscene) ran about 1.4 MB past its end, writing into zero-copy pools over the game's heap and into unmapped addresses (GitHub issue #101).
 - **Note:** Metal shader validation (`MTL_SHADER_VALIDATION=1`) stops out-of-bounds accesses, so under it the scene played.
 
+#### Bounded MSL 2.3 atomic emulation
+
+Sizing the backing buffer does not make an out-of-range image coordinate safe.
+The offline translator now preserves the Maxwell surface instruction's bounds
+mode and explicitly discarded result. Its Metal-only lowering accepts `IGN`
+reductions and non-CAS atomics writing `RZ`; returning, predicate-returning,
+`TRAP`, and unknown modes fail translation rather than acquiring invented
+out-of-bounds semantics. This path supports non-indexed 32-bit buffer, 2D and
+2D-array images. Other translator callers do not enable it. Source 1D and
+1D-array instructions retain the existing one-row normalization to 2D `(x, 0)`
+and 2D-array `(x, 0, layer)`; buffer coordinates stay scalar, and buffer MSL is
+not rewritten by the 2D helper. Source 64-bit, floating-point and half2 atomics
+are rejected before descriptor-format resolution can erase their original size.
+Indexed, 3D, multisample and other unsupported effective image shapes fail
+closed on this opt-in path; this is not a native-image-atomic implementation.
+
+The SPIR-V queries the bound image's dimensions and tests every original
+coordinate (including the layer) before forming the texel pointer or executing
+the atomic. Negative coordinates fail an unsigned comparison. Coordinates are
+not clamped, flattened for the bounds check, or changed in SPIR-V.
+`dmsh_atomic.py` recognizes the exact standalone SPIRV-Cross MSL 2.3 coordinate
+helper and replaces only that definition with typed, layer-aware helpers using
+64-bit address arithmetic; shader statements and call sites are untouched.
+An unrecognized helper or default alignment fails the build. This is a packed
+emulation layout, not proof that an arbitrary native pool's row pitch, layer
+stride or texture-view offset matches it. The host checks the matched IMG/IMGA
+[layout and capacity contract](../image-atomic-binding-contract.md) before
+binding; block-linear scratch still discards results and does not implement
+image read/write coherence.
+
+Changing this path invalidates the chain and shader cache. Rebuild the translator
+and record its actual fingerprints before preparing shaders again; a host-only
+rebuild is insufficient. The synthetic regression is
+`dm/tools/tests/test_image_atomic_bounds.py`: portable helper/algebra checks plus
+an opt-in rebuilt-translator → SPIR-V validation → MSL 2.3 check. Set
+`DMSH_TEST_XLATE` to the rebuilt translator, with `spirv-val` and `spirv-cross` on
+`PATH`; `DMSH_TEST_METAL=1` also compiles and links with Apple's Metal compiler.
+Set `DMSH_TEST_METAL_SDKS=macosx,iphoneos` to check both SDKs.
+The dimension fixture covers both instruction families for source 1D, buffer,
+1D array, 2D, 2D array and rejected 3D; accepted forms pass SPIR-V validation,
+Cross/helper lowering and the optional Metal checks. Shader acceptance does not
+imply admission of every native host layout. None of these tests executes a
+shader on a GPU.
+
 ## Shaders compiled at run time
 
 ### Built-in shaders compiled with the game's own GLSLC
