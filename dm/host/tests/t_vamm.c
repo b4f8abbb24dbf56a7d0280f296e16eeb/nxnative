@@ -96,7 +96,8 @@ static dm_vamm_resource_usage resources(void *context) {
     return (dm_vamm_resource_usage){info(I_SysResTotal), info(I_SysResUsed)};
 }
 static dm_vamm_config config(fixture *f, size_t max_regions) {
-    return (dm_vamm_config){info(I_AliasAddr), info(I_AliasSize), max_regions, f, change, resources};
+    return (dm_vamm_config){.base = info(I_AliasAddr), .size = info(I_AliasSize),
+        .max_regions = max_regions, .context = f, .change_pages = change, .resources = resources};
 }
 static dm_vamm_stats vstats(fixture *f) {
     dm_vamm_stats s; assert(!dm_vamm_get_stats(f->v, SMALL, &s)); return s;
@@ -412,8 +413,9 @@ static void aligned_tests(void) {
 }
 
 static unsigned original_calls;
+static void *bootstrap_expected;
 static void original_never(void) { ++original_calls; abort(); }
-static void bootstrap(void *self) { assert(self); ++original_calls; memset(self, 0, 72); }
+static void bootstrap(void *self) { assert(self && self == bootstrap_expected); ++original_calls; memset(self, 0, 72); }
 static dm_vamm_guest_fn hook(unsigned index) {
     return dm_vamm_adapter_lookup(dm_vamm_adapter_symbol_name(index));
 }
@@ -443,7 +445,12 @@ static void adapter_tests(int disabled, int c2) {
     assert(!dm_vamm_adapter_install(&c));
     assert(dm_vamm_adapter_install(&c) == DM_VAMM_INVALID);
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i) assert(hook(i));
-    unsigned char self[72]; ((void (*)(void *))hook(c2 ? 9 : 8))(self);
+    // Different synthetic enclosing layouts, deliberately unrelated to SDK
+    // offsets. Public hooks must use constructor identity, never decode them.
+    unsigned char enclosing[256]; memset(enclosing, 0xa5, sizeof enclosing);
+    size_t position = c2 ? 128 : 16;
+    void *self = enclosing + position; bootstrap_expected = self;
+    ((void (*)(void *))hook(c2 ? 9 : 8))(self);
     assert(original_calls == 1 && !f.page_calls);
     ((void (*)(void))hook(0))(); ((void (*)(void *))hook(10))(self);
     assert(((int (*)(void))hook(7))() == !disabled);
@@ -471,6 +478,8 @@ static void adapter_tests(int disabled, int c2) {
         assert(!((uint32_t (*)(void *, uintptr_t))hook(15))(self, other));
     }
     assert(original_calls == 1 && !alias_mapped());
+    for (size_t i = 0; i < sizeof enclosing; ++i)
+        assert(enclosing[i] == (i >= position && i < position + 72 ? 0 : 0xa5));
     assert(!dm_vamm_adapter_shutdown());
     // Shutdown never silently enables an SDK owner; table remains intercepted.
     assert(hook(0) && dm_vamm_adapter_install(&c) == DM_VAMM_INVALID);

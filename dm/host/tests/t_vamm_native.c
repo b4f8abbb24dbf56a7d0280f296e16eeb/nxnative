@@ -174,8 +174,15 @@ static dm_sa_result reservation_stats(void *context, size_t alignment, dm_sa_pro
 static int context_active(void *context) { (void)context; return 1; }
 static void native_tests(void) {
     dm_vamm_config c; assert(!dm_vamm_native_configure(&c, 128));
+    assert(c.placement == DM_VAMM_PLACEMENT_MODERN);
     assert(c.base == info(2) && c.size == info(3) - info(28) && !c.context);
     assert(c.max_regions == 128 && !alias_mapped() && !g_nmap);
+    dm_vamm_config raw_config;
+    assert(!dm_vamm_native_configure_domain(&raw_config, 128, DM_VAMM_DOMAIN_RAW_ALIAS));
+    assert(raw_config.base == info(2) && raw_config.size == info(3) && !raw_config.context);
+    assert(raw_config.placement == DM_VAMM_PLACEMENT_MODERN && raw_config.max_regions == 128);
+    assert(raw_config.change_pages == c.change_pages && raw_config.resources == c.resources);
+    assert(!alias_mapped() && !g_nmap); // configuration never creates an owner
     dm_vamm *v; assert(!dm_vamm_create(&v, &c));
     assert(!dm_vamm_adapter_lookup(dm_vamm_adapter_symbol_name(0)));
     uintptr_t base = 7;

@@ -5,6 +5,10 @@ experiment, not a general SDK compatibility claim or permission to remove game
 or SDK patches. It joins the existing native runtime to the actual startup
 loader transaction; it does not use fixture activation macros or `PROOF_ALL`.
 
+This page describes the full 40-hook mode. The separate
+[SDK-only mode](bounded-sdk-memory-experiment.md) retains original StandardAllocator
+and does not solve its contiguous 12 GiB arena request. Its authority is separate.
+
 ## Deliberate opt-in
 
 For a Mac development host:
@@ -18,7 +22,8 @@ Do not run this command on unreviewed input. Rebuild with
 `EXPERIMENTAL_SHARED_MEMORY=0` for production. The build stamp tracks this switch,
 so switching back cannot silently reuse an experimental executable. A missing,
 empty, or `0` runtime request leaves ownership with the SDK even in an
-experimental binary. Any other requested value fails explicitly rather than
+experimental binary. The separately reviewed `za-base-sdk-v1` value selects
+SDK-only mode; any other requested value fails explicitly rather than
 silently falling back. iOS packaging does not opt in automatically.
 
 Only these **full 32-byte NSO build IDs** are eligible:

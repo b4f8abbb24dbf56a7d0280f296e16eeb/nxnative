@@ -4,6 +4,28 @@
 #include <string.h>
 
 enum { PAGE = 0x1000, SMALL_ALIGNMENT = 0x10000, LARGE_ALIGNMENT = 0x200000 };
+typedef struct { size_t minimum, alignment; } placement_tier;
+// One definition drives actual placement AND realizable free-space queries.
+// No policy is assigned to an unreviewed SDK by these tables. The reduced
+// legacy policy reproduces only the six existing alignment cuts, not a claim
+// that all older bootstrap/layout/result contracts match this owner.
+static const placement_tier modern[] = {{PAGE, SMALL_ALIGNMENT}, {LARGE_ALIGNMENT, LARGE_ALIGNMENT}};
+static const placement_tier legacy[] = {
+    {PAGE, SMALL_ALIGNMENT}, {LARGE_ALIGNMENT, LARGE_ALIGNMENT},
+    {0x400000, 0x400000}, {0x2000000, 0x2000000}, {0x40000000, 0x40000000}
+};
+static const placement_tier reduced[] = {
+    {PAGE, SMALL_ALIGNMENT}, {LARGE_ALIGNMENT, LARGE_ALIGNMENT},
+    {0x400000, 0x400000}, {0x2000000, 0x2000000}
+};
+static const placement_tier *placement(dm_vamm_placement policy, size_t *count) {
+    switch (policy) {
+    case DM_VAMM_PLACEMENT_MODERN: *count = sizeof modern / sizeof *modern; return modern;
+    case DM_VAMM_PLACEMENT_LEGACY: *count = sizeof legacy / sizeof *legacy; return legacy;
+    case DM_VAMM_PLACEMENT_LEGACY_REDUCED: *count = sizeof reduced / sizeof *reduced; return reduced;
+    }
+    *count = 0; return NULL;
+}
 typedef struct { uintptr_t base; size_t size; } region;
 struct dm_vamm {
     pthread_mutex_t mutex;
@@ -41,18 +63,24 @@ static size_t gap(const dm_vamm *v, size_t i, size_t alignment, uintptr_t *base)
     return (hi - lo) & ~(size_t)(PAGE - 1);
 }
 static size_t largest_gap(const dm_vamm *v, size_t i, size_t alignment) {
-    uintptr_t ignored;
-    size_t small = gap(v, i, alignment > SMALL_ALIGNMENT ? alignment : SMALL_ALIGNMENT, &ignored);
-    if (small >= LARGE_ALIGNMENT) small = LARGE_ALIGNMENT - PAGE;
-    size_t large = gap(v, i, alignment > LARGE_ALIGNMENT ? alignment : LARGE_ALIGNMENT, &ignored);
-    if (large < LARGE_ALIGNMENT) large = 0;
-    return small > large ? small : large;
+    uintptr_t ignored; size_t count, largest = 0;
+    const placement_tier *tiers = placement(v->config.placement, &count);
+    for (size_t j = 0; j < count; ++j) {
+        size_t a = alignment > tiers[j].alignment ? alignment : tiers[j].alignment;
+        size_t n = gap(v, i, a, &ignored);
+        // A candidate must remain inside the same size tier that produced its
+        // alignment, or the advertised largest allocation may not actually fit.
+        if (j + 1 < count && n >= tiers[j + 1].minimum) n = tiers[j + 1].minimum - PAGE;
+        if (n >= tiers[j].minimum && n > largest) largest = n;
+    }
+    return largest;
 }
 uint32_t dm_vamm_create(dm_vamm **out, const dm_vamm_config *c) {
+    size_t ignored;
     if (!out || !c || !c->base || c->base % PAGE || !c->size || c->size % PAGE ||
         c->size > UINTPTR_MAX - c->base || !c->max_regions ||
         c->max_regions > (SIZE_MAX - sizeof(dm_vamm)) / sizeof(region) ||
-        !c->change_pages || !c->resources) return DM_VAMM_INVALID;
+        !c->change_pages || !c->resources || !placement(c->placement, &ignored)) return DM_VAMM_INVALID;
     dm_vamm *v = calloc(1, sizeof *v);
     if (!v) return DM_VAMM_NO_MEMORY;
     v->regions = calloc(c->max_regions, sizeof *v->regions);
@@ -97,8 +125,11 @@ dm_vamm_resource_usage dm_vamm_resources(dm_vamm *v) {
     pthread_mutex_unlock(&v->mutex); return r;
 }
 uint32_t dm_vamm_allocate(dm_vamm *v, uintptr_t *out, size_t size, int commit) {
-    return dm_vamm_allocate_aligned(v, out, size,
-                                   size < LARGE_ALIGNMENT ? SMALL_ALIGNMENT : LARGE_ALIGNMENT, commit);
+    if (!v) return DM_VAMM_INVALID;
+    size_t count, alignment = SMALL_ALIGNMENT;
+    const placement_tier *tiers = placement(v->config.placement, &count);
+    for (size_t i = 0; i < count && size >= tiers[i].minimum; ++i) alignment = tiers[i].alignment;
+    return dm_vamm_allocate_aligned(v, out, size, alignment, commit);
 }
 uint32_t dm_vamm_allocate_aligned(dm_vamm *v, uintptr_t *out, size_t size,
                                   size_t alignment, int commit) {
