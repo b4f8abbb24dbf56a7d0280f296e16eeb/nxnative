@@ -110,7 +110,8 @@ static dm_sa_result make_config(void *c,void *self,size_t capacity,unsigned cach
     if(mode==FACTORY_OTHER) assert(HASH(other).block_count==0);
     if(mode==FACTORY_REENTER) (void)ALLOC(self,16);
     if(mode==FACTORY_FAIL) return DM_SA_PROVIDER_FAILED;
-    *out=(dm_sa_config){.provider={NULL,4096,begin,end,acquire,release,available,query},.capacity=capacity,.pool_size=4096};
+    *out=(dm_sa_config){.provider={.granule=4096,.begin=begin,.end=end,.acquire=acquire,
+        .release=release,.available=available,.query=query},.capacity=capacity,.pool_size=4096};
     if(mode==FACTORY_BAD_CAPACITY) out->capacity++;
     if(mode==FACTORY_BAD_CORE) out->provider.granule=3;
     configs_made++;

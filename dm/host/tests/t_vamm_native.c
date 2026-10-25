@@ -167,6 +167,11 @@ static uint32_t acquire(void *context, uintptr_t *out, size_t size) {
     return dm_vamm_allocate(context, out, size, 1);
 }
 static uint32_t release(void *context, uintptr_t base) { return dm_vamm_free(context, base); }
+static dm_sa_result owner_pages(void *context, uintptr_t base, size_t size, int commit) {
+    uint32_t result = dm_vamm_pages(context, base, size, commit);
+    return !result ? DM_SA_OK : result == DM_VAMM_NO_MEMORY ? DM_SA_NO_MEMORY :
+        result == 0x803 ? DM_SA_BUSY : DM_SA_PROVIDER_FAILED;
+}
 static dm_sa_result reservation_stats(void *context, size_t alignment, dm_sa_provider_stats *out) {
     dm_vamm_stats s;
     if (dm_vamm_get_stats(context, alignment, &s)) return DM_SA_PROVIDER_FAILED;
@@ -266,7 +271,9 @@ static void native_tests(void) {
     assert(!alias_mapped() && !stats(v).regions);
 
     // Complete StandardAllocator -> current owner -> native callbacks -> SVC.
-    dm_sa_sdk_owner callbacks = {v, acquire, release, reservation_stats, context_active, SMALL, NULL};
+    dm_sa_sdk_owner callbacks = {.context = v, .allocate_memory = acquire,
+        .free_address_region = release, .query_reservations = reservation_stats,
+        .guest_context_active = context_active, .guaranteed_alignment = SMALL};
     dm_sa_sdk_provider *provider;
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
     dm_sa_config sc = {.provider = dm_sa_sdk_provider_interface(provider), .capacity = (size_t)62 << 30};
@@ -274,6 +281,30 @@ static void native_tests(void) {
     void *p = NULL; assert(dm_sa_allocate(a, 100, 16, &p) == DM_SA_OK);
     memset(p, 0x5a, 100);
     assert(dm_sa_free(a, p) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+    assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
+    // Direct opt-in page capability over the real native reservation owner.
+    // Production runtime and allocator operations do not install/use it yet.
+    callbacks.change_pages = owner_pages;
+    assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
+    dm_sa_provider pp = dm_sa_sdk_provider_interface(provider);
+    dm_sa_span lease;
+    pp.begin(pp.context);
+    assert(pp.acquire(pp.context, SMALL, SMALL, &lease) == DM_SA_OK);
+    memset(lease.base, 0x6b, SMALL);
+    assert(pp.pages.change(pp.context, &lease, PAGE, SMALL - 2 * PAGE, 0) == DM_SA_OK);
+    dm_sa_page_run run;
+    assert(pp.pages.query_run(pp.context, &lease, PAGE, SMALL - PAGE, &run) == DM_SA_OK);
+    assert(run.size == SMALL - 2 * PAGE && !run.flags && alias_mapped() == 2 * PAGE);
+    pp.end(pp.context);
+    assert(stats(v).regions == 1 && stats(v).reserved_bytes == SMALL);
+    pp.begin(pp.context);
+    assert(pp.pages.change(pp.context, &lease, 0, SMALL, 1) == DM_SA_OK);
+    for (size_t i = 0; i < SMALL; ++i)
+        assert(((unsigned char *)lease.base)[i] == (i < PAGE || i >= SMALL - PAGE ? 0x6b : 0));
+    assert(pp.pages.change(pp.context, &lease, 0, SMALL, 0) == DM_SA_OK);
+    assert(pp.release(pp.context, &lease) == DM_SA_OK);
+    pp.end(pp.context);
+    assert(!stats(v).regions && !alias_mapped());
     assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
     pthread_t threads[4];
     for (unsigned i = 0; i < 4; ++i) assert(!pthread_create(&threads[i], NULL, worker, v));

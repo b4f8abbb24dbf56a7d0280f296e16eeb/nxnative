@@ -20,6 +20,32 @@ typedef struct {
     size_t largest_span;    // largest contiguous lease at the requested alignment
 } dm_sa_provider_stats;
 
+enum { DM_SA_PAGE_COMMITTED = 1, DM_SA_PAGE_BORROWED = 2 };
+typedef struct {
+    size_t size; // nonzero prefix of the requested interval, in bytes
+    unsigned flags; // DM_SA_PAGE_*; describes every byte in this prefix
+} dm_sa_page_run;
+typedef struct {
+    size_t granule; // zero disables the entire optional capability
+    // Same context/scope as the lease provider. Query callbacks never suspend
+    // that scope, dereference payload bytes, or infer backing from mprotect.
+    // query_run returns a bounded committed/borrowed-state run inside the exact
+    // lease. budget is physical commit headroom, NOT free reservation space.
+    // Outputs remain unchanged on failure.
+    dm_sa_result (*query_run)(void *context, const dm_sa_span *span,
+        size_t offset, size_t maximum, dm_sa_page_run *out);
+    dm_sa_result (*budget)(void *context, size_t *out);
+    // The caller owns suballocation lifetimes: decommit only complete granules
+    // containing no live bytes. The provider additionally rejects borrowed
+    // bytes. Commit preserves already committed bytes, including borrowed ones.
+    // Both operations retain the exact lease/token/reservation; a returning
+    // failure preserves all pre-call pages/accounting. Idempotent operations
+    // succeed. This callback may suspend the source guard like acquire: callers
+    // MUST revalidate allocation and realloc-source availability on return.
+    dm_sa_result (*change)(void *context, const dm_sa_span *span,
+        size_t offset, size_t size, int commit);
+} dm_sa_page_provider;
+
 typedef struct {
     void *context;
     size_t granule; // power of two >= 16; acquire sizes are exact multiples
@@ -27,7 +53,7 @@ typedef struct {
     // locks. All callbacks below run inside this scope and must not re-enter
     // this allocator. A disjoint provider may use no-op begin/end callbacks.
     // MapMemory/source-borrow changes MUST use the same scope (no TOCTOU).
-    // The core mutex remains held. acquire/release/query may temporarily suspend
+    // The core mutex remains held. acquire/release/query/pages.change may suspend
     // their external source guard to call the current owner (whose SVC takes
     // that guard), but must restore it before returning and serialize lease
     // metadata, e.g. with protected in-flight states. Do not hold a provider lock
@@ -47,12 +73,17 @@ typedef struct {
     dm_sa_result (*acquire)(void *context, size_t size, size_t alignment, dm_sa_span *out);
     // Release the exact lease. Failure MUST leave backing and ownership intact.
     dm_sa_result (*release)(void *context, const dm_sa_span *span);
-    // Nonzero only when the entire byte interval is owned by this lease and is
-    // not borrowed/pinned by another consumer. Used before reuse, free, resize,
-    // memcpy and release, not just before page decommit. Must not dereference
+    // Nonzero only when the entire byte interval is owned by this lease, fully
+    // backed and not borrowed/pinned by another consumer. Used before reuse,
+    // free, resize and memcpy. Page-capable release separately checks ownership
+    // and borrows so holes do not prevent teardown. Must not dereference
     // the interval. A provider must not infer access from host page protection.
     int (*available)(void *context, const dm_sa_span *span, size_t offset, size_t size);
     dm_sa_result (*query)(void *context, size_t alignment, dm_sa_provider_stats *out);
+    // All-zero for whole-lease/malloc providers. Partial capabilities are
+    // invalid. This low-level capability is not yet consumed by allocator
+    // operations; never change commitment beneath a live core allocation.
+    dm_sa_page_provider pages;
 } dm_sa_provider;
 
 typedef struct {

@@ -247,6 +247,29 @@ int dm_sa_svc_available_locked(uintptr_t base, size_t size) {
     return dm_sa_svc_alias_range_locked(base, size) && !map_source_busy(base, size) &&
         dm_sa_svc_backed_locked(base, size);
 }
+int dm_sa_svc_unborrowed_locked(uintptr_t base, size_t size) {
+    return dm_sa_svc_alias_range_locked(base, size) && !map_source_busy(base, size);
+}
+dm_sa_result dm_sa_svc_page_run_locked(uintptr_t base, size_t maximum, dm_sa_page_run *out) {
+    if (!out || !dm_sa_svc_alias_range_locked(base, maximum)) return DM_SA_INVALID;
+    uint64_t p = (base - (uintptr_t)g_alias) >> 12;
+    int mapped = (atomic_load(&g_alias_bits[p >> 6]) >> (p & 63)) & 1;
+    uintptr_t end = base + maximum;
+    uint64_t last = ((end - 1 - (uintptr_t)g_alias) >> 12) + 1;
+    uintptr_t run_end = (uintptr_t)g_alias + (alias_run_end(p, last, mapped) << 12);
+    if (run_end < end) end = run_end;
+    int borrowed = 0;
+    for (int i = 0; i < g_nmap; ++i) {
+        uintptr_t lo = g_map[i].src, hi = lo + g_map[i].size;
+        if (base >= lo && base < hi) {
+            borrowed = 1;
+            if (hi < end) end = hi;
+        } else if (base < lo && lo < end) end = lo;
+    }
+    *out = (dm_sa_page_run){end - base,
+        (mapped ? DM_SA_PAGE_COMMITTED : 0) | (borrowed ? DM_SA_PAGE_BORROWED : 0)};
+    return DM_SA_OK;
+}
 size_t dm_sa_svc_physical_budget_locked(void) {
     size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
     if (image > floor) floor = image;
