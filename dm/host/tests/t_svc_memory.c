@@ -30,6 +30,7 @@ static int memory_getpagesize(void) {
 module_t g_mod[MAX_MOD];
 int g_nmod;
 struct dm_flags g_flag;
+pthread_key_t g_keytlr;
 void hlecount_svc(int num) { (void)num; }
 int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; return 0; }
 void dm_backtrace(uint64_t fp) { (void)fp; }
@@ -37,6 +38,7 @@ void guest_clock_read_wait(void) {}
 uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
+void dm_entropy_bytes(void *out, size_t size) { (void)out; (void)size; assert(!"unexpected IPC entropy request"); }
 int dm_ue_heap_owns(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; } // No Unreal allocator is installed in this fixture.
 module_t *module_of(const void *p) {
     uintptr_t a = (uintptr_t)p;
