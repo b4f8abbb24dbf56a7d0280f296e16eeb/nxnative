@@ -8,7 +8,7 @@ typedef struct sdk_lease {
     int in_flight;
     struct sdk_lease *next;
 } sdk_lease;
-enum { LEASE_ACTIVE, LEASE_ACQUIRING, LEASE_RELEASING };
+enum { LEASE_ACTIVE, LEASE_ACQUIRING, LEASE_RELEASING, LEASE_CHANGING };
 struct dm_sa_sdk_provider {
     dm_sa_sdk_owner owner;
     sdk_lease *leases;
@@ -36,6 +36,53 @@ static int available(void *context, const dm_sa_span *span, size_t offset, size_
     if (!l || l->in_flight || !size || offset > span->size || size > span->size - offset)
         return 0;
     return dm_sa_svc_available_locked((uintptr_t)span->base + offset, size);
+}
+static int unborrowed(dm_sa_sdk_provider *p, const dm_sa_span *span, size_t offset, size_t size) {
+    sdk_lease *l = find(p, span);
+    return l && !l->in_flight && size && offset <= span->size && size <= span->size - offset &&
+        dm_sa_svc_unborrowed_locked((uintptr_t)span->base + offset, size);
+}
+static dm_sa_result page_run(void *context, const dm_sa_span *span,
+                              size_t offset, size_t maximum, dm_sa_page_run *out) {
+    dm_sa_sdk_provider *p = context;
+    sdk_lease *l = find(p, span);
+    if (!l) return DM_SA_NOT_FOUND;
+    if (l->in_flight) return DM_SA_BUSY;
+    if (!out || !maximum || offset > span->size || maximum > span->size - offset)
+        return DM_SA_INVALID;
+    return dm_sa_svc_page_run_locked((uintptr_t)span->base + offset, maximum, out);
+}
+static dm_sa_result page_budget(void *context, size_t *out) {
+    (void)context;
+    if (!out) return DM_SA_INVALID;
+    *out = dm_sa_svc_physical_budget_locked() & ~(size_t)0xfff;
+    return DM_SA_OK;
+}
+static dm_sa_result change_pages(void *context, const dm_sa_span *span,
+                                  size_t offset, size_t size, int commit) {
+    dm_sa_sdk_provider *p = context;
+    sdk_lease *l = find(p, span);
+    if (!l) return DM_SA_NOT_FOUND;
+    if (l->in_flight) return DM_SA_BUSY;
+    if (!p->owner.change_pages || !size || ((offset | size) & 0xfff) ||
+        offset > span->size || size > span->size - offset || (commit != 0 && commit != 1))
+        return DM_SA_INVALID;
+    if (!commit && !unborrowed(p, span, offset, size)) return DM_SA_BUSY;
+    l->in_flight = LEASE_CHANGING;
+    dm_sa_svc_scope_end();
+    dm_sa_result result = DM_SA_PROVIDER_FAILED;
+    if (p->owner.guest_context_active(p->owner.context)) {
+        if (commit) dm_sa_svc_owner_allocation_begin();
+        result = p->owner.change_pages(p->owner.context, (uintptr_t)span->base + offset, size, commit);
+        if (commit) dm_sa_svc_owner_allocation_end();
+    }
+    dm_sa_svc_scope_begin();
+    l->in_flight = LEASE_ACTIVE;
+    // A successful commit can already be borrowed on return. Keep the exact
+    // lease and committed pages; callers revalidate before publishing payload.
+    if (result == DM_SA_OK && commit &&
+        !dm_sa_svc_backed_locked((uintptr_t)span->base + offset, size)) abort();
+    return result;
 }
 static dm_sa_result acquire(void *context, size_t size, size_t alignment, dm_sa_span *out) {
     dm_sa_sdk_provider *p = context;
@@ -82,7 +129,10 @@ static dm_sa_result release(void *context, const dm_sa_span *span) {
     dm_sa_sdk_provider *p = context;
     sdk_lease *l = find(p, span);
     if (!l) return DM_SA_NOT_FOUND;
-    if (l->in_flight || !available(p, span, 0, span->size)) return DM_SA_BUSY;
+    // Optional page-capable leases can contain holes. Missing commitment is
+    // not a borrow and must never prevent releasing their exact reservation.
+    if (l->in_flight || !(p->owner.change_pages ? unborrowed(p, span, 0, span->size) :
+                         available(p, span, 0, span->size))) return DM_SA_BUSY;
     l->in_flight = LEASE_RELEASING;
     dm_sa_svc_scope_end();
     int guest = p->owner.guest_context_active(p->owner.context);
@@ -94,7 +144,9 @@ static dm_sa_result release(void *context, const dm_sa_span *span) {
         // UnmapPhysicalMemory fails (including a newly borrowed source). Keep
         // the EXACT token/base/size, not a guessed replacement or partial free.
         l->in_flight = 0;
-        return available(p, span, 0, span->size) ? DM_SA_PROVIDER_FAILED : DM_SA_BUSY;
+        int can_release = p->owner.change_pages ? unborrowed(p, span, 0, span->size) :
+                                                  available(p, span, 0, span->size);
+        return can_release ? DM_SA_PROVIDER_FAILED : DM_SA_BUSY;
     }
     erase(p, l);
     return DM_SA_OK;
@@ -130,7 +182,11 @@ dm_sa_result dm_sa_sdk_provider_create(dm_sa_sdk_provider **out, const dm_sa_sdk
 }
 dm_sa_provider dm_sa_sdk_provider_interface(dm_sa_sdk_provider *p) {
     if (!p) return (dm_sa_provider){0};
-    return (dm_sa_provider){p, 0x1000, begin, end, acquire, release, available, query};
+    dm_sa_provider result = {.context = p, .granule = 0x1000, .begin = begin, .end = end,
+        .acquire = acquire, .release = release, .available = available, .query = query};
+    if (p->owner.change_pages)
+        result.pages = (dm_sa_page_provider){0x1000, page_run, page_budget, change_pages};
+    return result;
 }
 dm_sa_result dm_sa_sdk_provider_destroy(dm_sa_sdk_provider *p) {
     if (!p) return DM_SA_INVALID;

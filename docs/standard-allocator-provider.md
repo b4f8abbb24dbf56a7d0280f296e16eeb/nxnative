@@ -31,6 +31,44 @@ Queries remain snapshots rather than a promise that the SDK reservation topology
 
 Requests above the callback's guaranteed absolute alignment fail before calling the owner. This slice does not hide padded physical mappings, claim unsupported alignment, or return fragmented memory as one contiguous span.
 
+## Optional page capability: provider layer only
+
+An explicitly supplied `change_pages` owner callback exposes an optional
+`dm_sa_provider.pages` capability. It inspects runs from the authoritative SVC
+commit bitmap and source-borrow registry, reads physical headroom independently
+of reservation gaps, and changes aligned pages inside an exact existing lease.
+There is no second bitmap, reservation owner, or hidden malloc-page operation.
+The production runtime does **not** supply this callback. Core Shrink, Free,
+Trim, reuse, allocation statistics and activation gates remain unchanged; the
+core currently validates only the capability's complete shape.
+
+Queries run without dropping the source guard and never read payload bytes.
+Page changes mark the lease in-flight, drop the guard before the owner callback,
+and restore it afterward. Recommit applies the existing strict physical-budget
+scope even under legacy-unlimited profiles. A returning failure preserves page
+state and accounting; host-protection failures retain the backend's fatal policy.
+Decommit rejects borrowed bytes, while recommit preserves previously committed
+bytes. Successful recommit can already be borrowed when the guard is restored:
+a future core caller must revalidate before exposing or copying any allocation.
+
+The caller must prove that decommitted pages contain no live allocations; the
+provider owns lease/budget/borrow validation, not block lifetime metadata. Direct
+tests therefore operate on leases not published to a core. Full release of a
+page-capable lease checks ownership and source borrows independently of backing,
+so holes cannot strand its reservation. Failed release retains its exact token
+and sparse commitment for retry. Providers without the callback remain entirely
+whole-lease-backed, including malloc fixtures and existing original-SDK routes.
+
+Synthetic provider tests cover page-run clipping and bitmap-word boundaries,
+generation/range validation, preserved live neighbors on simulated 16 KiB hosts,
+idempotent accounting, failure retention, in-flight serialization, borrow races,
+zero-reservation-gap recommit, stale-budget rejection and release through holes.
+The native Vamm fixture also exercises the capability through `dm_vamm_pages`
+and the real SVC backend without wiring it into production. Core reclamation,
+recommit-on-reuse, accounting integration and transactional Shrink policy still
+require a separate implementation/review. This establishes no SDK policy parity,
+new admission, gameplay result or permission to remove an existing cut.
+
 ## Verification and remaining boundary
 
 `make -C dm/host/tests standard-allocator-provider` runs the actual production bitmap-backed SVC dispatcher, provider, and allocator core with a synthetic owner. Variants cover 4 KiB and simulated 16 KiB host pages, plus limited and legacy-unlimited profiles. Sanitizer and thread-sanitizer targets use the same matrix. The fixture contains no proprietary code or binary input.

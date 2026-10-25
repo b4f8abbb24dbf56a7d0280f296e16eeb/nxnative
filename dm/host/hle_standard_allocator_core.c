@@ -104,9 +104,15 @@ static dm_sa_result release_span(dm_sa_allocator *a, span *s) {
 dm_sa_result dm_sa_create(dm_sa_allocator **out, const dm_sa_config *config) {
     if (!out || !config) return DM_SA_INVALID;
     const dm_sa_provider *p = &config->provider;
+    const dm_sa_page_provider *pages = &p->pages;
     if (!power2(p->granule) || p->granule < 16 || !config->capacity ||
         !p->begin || !p->end || !p->acquire || !p->release || !p->available || !p->query ||
         (!!config->metadata_alloc != !!config->metadata_free)) return DM_SA_INVALID;
+    if (pages->granule || pages->query_run || pages->budget || pages->change) {
+        if (!power2(pages->granule) || pages->granule < 16 ||
+            pages->granule > p->granule || !pages->query_run || !pages->budget ||
+            !pages->change) return DM_SA_INVALID;
+    }
     size_t pool;
     if (!rounded(config->pool_size ? config->pool_size : 65536, p->granule, &pool)) return DM_SA_INVALID;
     dm_sa_config c = *config;
