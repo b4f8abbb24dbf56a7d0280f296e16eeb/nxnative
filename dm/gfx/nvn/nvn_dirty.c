@@ -3,6 +3,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "nvn_pool_registration.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -25,9 +26,10 @@ enum { BUSY_WAIT_MS = 2000 };
 // shrine. The scans only cover slots in use, so the capacity itself costs nothing
 enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK };
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
-// So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
+// So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write releases every range covering that page. Ordinary pool destruction uses its exact registration token:
+// CPU starts (even with equal sizes) are not unique. The legacy/sparse pointer API matches only zero-token ranges, by exact start mem rather than rounded base.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; } range_t;
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; uint64_t registration; _Atomic int live; } range_t;
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -117,7 +119,7 @@ static void prep_write(void *addr, size_t len) {
     }
 }
 
-void nvn_dirty_add_range(const void *mem, size_t size) {
+static void add_range(uint64_t registration, const void *mem, size_t size) {
     static int inited;
     if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
     atomic_fetch_add(&g_adds_total, 1);
@@ -151,19 +153,23 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
     }
-    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
+    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->registration = registration;
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
 }
+void nvn_dirty_add_range(const void *mem, size_t size) { add_range(0, mem, size); }
+void nvn_dirty_add_registration(uint64_t registration, const void *mem, size_t size) { if (registration) add_range(registration, mem, size); }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
-void nvn_dirty_remove_range(const void *mem) {
+static void remove_range(uint64_t registration, const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = NULL; int n = atomic_load(&g_nr);
-    for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
+    for (int i = 0; i < n && !r; i++) if (live_at(i) && nvn_pool_registration_match(rg(i)->registration, (const void *)rg(i)->mem, registration, mem)) r = rg(i);
     if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
     pthread_mutex_unlock(&g_slot_mu);
 }
+void nvn_dirty_remove_range(const void *mem) { remove_range(0, mem); }
+void nvn_dirty_remove_registration(uint64_t registration) { if (registration) remove_range(registration, NULL); }
 int nvn_dirty_tracked(const void *addr, size_t len) {
     return find_span((uintptr_t)addr, len) != NULL;
 }

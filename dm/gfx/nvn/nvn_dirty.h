@@ -4,8 +4,12 @@
 #include <stdint.h>
 
 void nvn_dirty_add_range(const void *mem, size_t size);           // Register a memory pool as a tracked range (the first call registers the page-fault hook and the host pre-write hook)
+// Ordinary pools use the same unique, nonzero registration token as the Metal
+// registry. Zero is reserved for the legacy/sparse pointer-keyed APIs above/below.
+void nvn_dirty_add_registration(uint64_t registration, const void *mem, size_t size);
+void nvn_dirty_remove_registration(uint64_t registration);
 void nvn_dirty_stat(int *live, int *peak, int *cap);                // number of registered memory pools, peak, tracking table capacity (for the memory readout line)
-void nvn_dirty_remove_range(const void *mem);                     // Pool destruction: restore protected pages to writable and mark invalid
+void nvn_dirty_remove_range(const void *mem);                     // Legacy/sparse only: restore protected pages to writable and mark invalid
 int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
 uint64_t nvn_dirty_now(void);                                      // Current generation: taken before upload, as the stamp of that content
