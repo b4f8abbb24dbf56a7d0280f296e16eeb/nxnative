@@ -12,6 +12,7 @@
 #include "../dm.h"
 #include "../hle_standard_allocator_provider.h"
 #include "../hle_vamm_adapter.h"
+#include "../hle_vamm_native.h"
 
 #ifndef __APPLE__
 static void *pthread_get_stackaddr_np(pthread_t thread) { (void)thread; return NULL; }
@@ -83,12 +84,8 @@ typedef struct {
 } fixture;
 static uint32_t change(void *context, uintptr_t base, size_t size, int commit) {
     fixture *f = context; ++f->page_calls;
-    // These are synthetic native callbacks, not a reconstructed SDK function.
-    uint32_t rc = (uint32_t)pages(commit, base, size);
-    if (!rc) return 0;
-    if (rc == 0xd401) return 0x803;
-    if (rc == 0x10801) return DM_VAMM_NO_MEMORY;
-    abort();
+    // Synthetic context/counters, but the verified native result policy.
+    return dm_vamm_native_svc_result((uint32_t)pages(commit, base, size), commit);
 }
 static dm_vamm_resource_usage resources(void *context) {
     fixture *f = context;
@@ -159,10 +156,11 @@ static void core_tests(void) {
     assert(!dm_vamm_pages(f.v, base, PAGE, 1) && *(unsigned char *)base == 0x6b);
     assert(!dm_vamm_free(f.v, base) && !dm_vamm_free(f.v, other)); empty(&f);
 
-    // Combined-map failure leaves output, ledger and physical usage unchanged.
+    // The raw SVC map failure is atomic. Its nn::os translation is fatal,
+    // covered separately by the native bridge fixture, not a returning 0x803.
     dm_vamm_stats before = vstats(&f); base = 9;
     atomic_store(&fail_protect, 1);
-    assert(dm_vamm_allocate(f.v, &base, SMALL, 1) == 0x803 && base == 9);
+    assert(pages(1, c.base + SMALL, SMALL) == 0xd401 && base == 9);
     assert(vstats(&f).available_bytes == before.available_bytes); empty(&f);
     assert(dm_vamm_allocate(f.v, &base, (size_t)62 << 30, 0) == DM_VAMM_NO_SPACE && base == 9);
     assert(dm_vamm_allocate(f.v, &base, SIZE_MAX, 0) == DM_VAMM_INVALID);

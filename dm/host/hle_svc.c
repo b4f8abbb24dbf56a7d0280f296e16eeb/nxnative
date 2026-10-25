@@ -3,6 +3,7 @@
 #include "dm.h"
 #include "hle_address_space.h"
 #include "hle_standard_allocator_provider.h"
+#include "hle_vamm_native.h"
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
@@ -315,6 +316,81 @@ static void *alias_windows_thread(void *arg) {
     return NULL;
 }
 
+// The Vamm bridge consumes these same raw values as SVC GetInfo. In
+// particular AliasRegionExtraSize is queried, not assumed zero by the owner.
+uint64_t dm_vamm_svc_info(unsigned id) {
+    mem_init();
+    switch (id) {
+    case I_AliasAddr: return (uintptr_t)g_alias;
+    case I_AliasSize: return g_alias_cap;
+    case 28: return 0; // AliasRegionExtraSize: no extra alias reservation today
+    case I_SysResTotal: return DM_GAME_SYS_RESOURCE;
+    case I_SysResUsed: return DM_GAME_SYS_RESOURCE ? 0x400000 : 0;
+    default: abort(); // internal narrow bridge, not a guest-facing GetInfo API
+    }
+}
+
+// Shared native page transaction: no guest callbacks or dispatch reentry.
+// Vamm holds its reservation lock before this source -> physical -> manager
+// sequence. Ordinary SVC and strict provider allocations use identical policy.
+uint32_t dm_vamm_svc_change_pages(uintptr_t a, size_t size, int commit) {
+    if (commit != 0 && commit != 1) return 0xD401;
+    mem_init();
+    unsigned num = commit ? 0x2C : 0x2D;
+    uintptr_t alias = (uintptr_t)g_alias;
+    // Subtraction after lower-bound/size checks avoids wrapping a+size.
+    if (!size || (a & 0xfff) || (size & 0xfff) || a < alias ||
+        size > g_alias_cap || a - alias > g_alias_cap - size) {
+        LOG("SVC %#x invalid alias range %p+%#zx", num, (void *)a, size); return 0xD401;
+    }
+    // Profile mem_map_limit is unchanged: only enabled profiles charge alias
+    // commits to the application pool. Repeated/overlapping maps charge only
+    // newly committed pages. All map/unmap/backend/accounting steps serialize.
+    pthread_mutex_lock(&g_map_lock);
+    pthread_mutex_lock(&g_phys_mu);
+    // Neither recommit nor decommit may modify pages borrowed by a stack.
+    // Reject the entire request before the manager/backend sees it.
+    if (map_source_busy(a, size)) {
+        pthread_mutex_unlock(&g_phys_mu); pthread_mutex_unlock(&g_map_lock);
+        return 0xD401;
+    }
+    size_t before = alias_mapped(), limit = SIZE_MAX;
+    if (DM_GAME_MEM_MAP_LIMIT) {
+        uint64_t used = (uint64_t)atomic_load(&g_heap_cur) + DM_GAME_MEM_USED + big_bss_bytes();
+        limit = used < APP_POOL ? (size_t)(APP_POOL - used) : 0;
+    }
+    if (g_sa_owner_allocation_depth) {
+        size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
+        if (image > floor) floor = image;
+        size_t strict = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
+        size_t heap = atomic_load(&g_heap_cur);
+        strict = heap < strict ? strict - heap : 0;
+        if (strict < limit) limit = strict;
+    }
+    dm_as_result result = num == 0x2C ? dm_as_commit(g_alias_space, a, size, limit)
+                                     : dm_as_decommit(g_alias_space, a, size);
+    size_t after = alias_mapped();
+    pthread_mutex_unlock(&g_phys_mu);
+    pthread_mutex_unlock(&g_map_lock);
+    if (result != DM_AS_OK) {
+        if (result == DM_AS_LIMIT) {
+            static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
+                                                                   size, before / 1073741824.0);
+            return 0x10801;
+        } else {
+            LOG("[RED] SVC %#x alias mapping failed %p+%#zx (manager=%d errno=%d)", num, (void *)a, size, result, errno);
+            return 0xD401;
+        }
+    }
+    if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", (void *)a, size);
+    // High-water address and actual physical use remain separate diagnostics.
+    if (num == 0x2C) { static _Atomic uint64_t hw; uint64_t end = a - alias + size, old = atomic_load(&hw);
+        while (end > old && !atomic_compare_exchange_weak(&hw, &old, end)) {}
+        if (end > old && end >> 28 != old >> 28) LOG("[mem] alias region mapped up to +%.2f GB (alias region %.2f GB)", end / 1073741824.0, g_alias_cap / 1073741824.0); }
+    if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0);
+    return 0;
+}
+
 int svc_thread(int num, uint64_t *regs);   // hle_thread.c: thread and synchronization kind
 
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
@@ -502,62 +578,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         regs[0] = 0; regs[1] = 0; return 0;
     }
-    case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
-        uintptr_t a = (uintptr_t)regs[0]; size_t size = regs[1];
-        uintptr_t alias = (uintptr_t)g_alias;
-        // Subtraction after lower-bound/size checks avoids wrapping a+size.
-        if (!size || (a & 0xfff) || (size & 0xfff) || a < alias ||
-            size > g_alias_cap || a - alias > g_alias_cap - size) {
-            LOG("SVC %#x invalid alias range %p+%#zx", num, (void *)a, size); regs[0] = 0xD401; return 0;
-        }
-        // Profile mem_map_limit is unchanged: only enabled profiles charge alias
-        // commits to the application pool. Repeated/overlapping maps charge only
-        // newly committed pages. All map/unmap/backend/accounting steps serialize.
-        pthread_mutex_lock(&g_map_lock);
-        pthread_mutex_lock(&g_phys_mu);
-        // Neither recommit nor decommit may modify pages borrowed by a stack.
-        // Reject the entire request before the manager/backend sees it.
-        if (map_source_busy(a, size)) {
-            pthread_mutex_unlock(&g_phys_mu); pthread_mutex_unlock(&g_map_lock);
-            regs[0] = 0xD401; return 0;
-        }
-        size_t before = alias_mapped(), limit = SIZE_MAX;
-        if (DM_GAME_MEM_MAP_LIMIT) {
-            uint64_t used = (uint64_t)atomic_load(&g_heap_cur) + DM_GAME_MEM_USED + big_bss_bytes();
-            limit = used < APP_POOL ? (size_t)(APP_POOL - used) : 0;
-        }
-        if (g_sa_owner_allocation_depth) {
-            size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
-            if (image > floor) floor = image;
-            size_t strict = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
-            size_t heap = atomic_load(&g_heap_cur);
-            strict = heap < strict ? strict - heap : 0;
-            if (strict < limit) limit = strict;
-        }
-        dm_as_result result = num == 0x2C ? dm_as_commit(g_alias_space, a, size, limit)
-                                         : dm_as_decommit(g_alias_space, a, size);
-        size_t after = alias_mapped();
-        pthread_mutex_unlock(&g_phys_mu);
-        pthread_mutex_unlock(&g_map_lock);
-        if (result != DM_AS_OK) {
-            if (result == DM_AS_LIMIT) {
-                static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
-                                                                       size, before / 1073741824.0);
-                regs[0] = 0x10801;
-            } else {
-                LOG("[RED] SVC %#x alias mapping failed %p+%#zx (manager=%d errno=%d)", num, (void *)a, size, result, errno);
-                regs[0] = 0xD401;
-            }
-            return 0;
-        }
-        if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", (void *)a, size);
-        // High-water address and actual physical use remain separate diagnostics.
-        if (num == 0x2C) { static _Atomic uint64_t hw; uint64_t end = a - alias + size, old = atomic_load(&hw);
-            while (end > old && !atomic_compare_exchange_weak(&hw, &old, end)) {}
-            if (end > old && end >> 28 != old >> 28) LOG("[mem] alias region mapped up to +%.2f GB (alias region %.2f GB)", end / 1073741824.0, g_alias_cap / 1073741824.0); }
-        if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0);
-        regs[0] = 0; return 0;
-    }
+    case 0x2C: case 0x2D: // MapPhysicalMemory / UnmapPhysicalMemory
+        regs[0] = dm_vamm_svc_change_pages((uintptr_t)regs[0], regs[1], num == 0x2C);
+        return 0;
     case 0x26: {  // Break(reason, ptr, size): SDK fatal abort
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
         module_t *mm = module_of((void *)regs[30]);
@@ -577,7 +600,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         switch (id) {
         case I_CoreMask: v = 7; break;
         case I_PriorityMask: v = 0; break;
-        case I_AliasAddr: v = (uint64_t)g_alias; break;   case I_AliasSize: v = g_alias_cap; break;
+        case I_AliasAddr: case I_AliasSize: case 28: v = dm_vamm_svc_info((unsigned)id); break;
         case I_HeapAddr:  v = (uint64_t)g_heap;  break;   case I_HeapSize:  v = g_heap_cap;  break;
         case I_AslrAddr:  v = (uint64_t)g_as;    break;   case I_AslrSize:  v = RESERVE;     break;
         case I_StackAddr: v = (uint64_t)g_stack; break;   case I_StackSize: v = g_stack_cap; break;
@@ -590,7 +613,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             break;
         // the system resource the NPDM declares (profile sys_resource; 32 MB without the key). The SDK's IsVirtualAddressMemoryEnabled is "total != 0": Big Brain Academy's nninitStartup
         // asks StandardAllocator for 60 GB of virtual address memory when it is, and sets a heap only when it is not (its NPDM declares none)
-        case I_SysResTotal: v = DM_GAME_SYS_RESOURCE; break; case I_SysResUsed: v = DM_GAME_SYS_RESOURCE ? 0x400000 : 0; break;
+        case I_SysResTotal: case I_SysResUsed: v = dm_vamm_svc_info((unsigned)id); break;
         case I_DebuggerAttached: v = 0; break;
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // a deterministic stream when DM_DETCLOCK is on (hle_os.c)
         case I_ProgramId: { static uint64_t pid; if (!pid) { const char *e = getenv("DM_PROGRAM_ID"); pid = e ? strtoull(e, NULL, 16) : DM_GAME_PROGRAM_ID; } v = pid; break; }   // default from the game profile's program_id; DM_PROGRAM_ID=hex overrides
