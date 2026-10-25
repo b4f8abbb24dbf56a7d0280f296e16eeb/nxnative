@@ -158,14 +158,19 @@ int main(void) {
         P(nvnMemoryPoolBuilderSetStorage)(&pb, poolmem, sizeof poolmem);
     }
 
-    // 5. Command buffer: record uniform updates / events / counters / buffer copies / nested calls, with memory in 256 B segments to force multi-segment linking
+    // 5. Command buffer: record uniform updates / events / value reports / counters / buffer copies / nested calls, with memory in 256 B segments to force multi-segment linking
     NVNcommandBuffer cb; P(nvnCommandBufferInitialize)(&cb, &dev);
     NVNmemoryPoolBuilder cpb; P(nvnMemoryPoolBuilderSetDefaults)(&cpb); P(nvnMemoryPoolBuilderSetStorage)(&cpb, g_cmdmem, sizeof g_cmdmem);
     P(nvnMemoryPoolInitialize)(&g_cmdpool, &cpb);
     P(nvnCommandBufferSetMemoryCallback)(&cb, mem_cb); P(nvnCommandBufferSetMemoryCallbackData)(&cb, NULL);
     NVNeventBuilder eb; NVNevent ev; P(nvnEventBuilderSetDefaults)(&eb); P(nvnEventBuilderSetStorage)(&eb, &pool, 0x1000);
     P(nvnEventInitialize)(&ev, &eb);
+    // CPU-only fixture: SignalEvent's captured pointer must not require a GPU-pool lookup.
+    volatile uint32_t cpu_event_word = 0; NVNevent cpu_ev = {0}; ((ev_t *)&cpu_ev)->val = &cpu_event_word;
     uint8_t *ub = poolmem + 0x2000, *cnt = poolmem + 0x3000, *src = poolmem + 0x4000, *dst = poolmem + 0x5000;
+    uint32_t *report = (uint32_t *)(poolmem + 0x3100);
+    report[0] = 0x12345678; report[1] = 0; report[2] = 0x87654321; report[3] = 0xabcdef01;
+    uint32_t *event_guard = (uint32_t *)(poolmem + 0xffc); event_guard[0] = 0x11223344; event_guard[2] = 0x55667788;
     for (int i = 0; i < 64; i++) src[i] = (uint8_t)(i * 3 + 1);
     uint32_t data[16];
 
@@ -177,17 +182,23 @@ int main(void) {
         memset(data, 0xEE, sizeof data);                  // modify the original data after recording: the submit must use the values copied in at record time
     }
     P(nvnCommandBufferSignalEvent)(&cb, &ev, NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 7);
+    P(nvnCommandBufferReportValue)(&cb, 11, P(nvnMemoryPoolGetBufferAddress)(&pool) + 0x1000);
     P(nvnCommandBufferSignalEvent)(&cb, &ev, NVN_EVENT_SIGNAL_MODE_ADD, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 5);
+    P(nvnCommandBufferReportValue)(&cb, 0xfedcba98, P(nvnMemoryPoolGetBufferAddress)(&pool) + 0x3104);
+    P(nvnCommandBufferSignalEvent)(&cb, &cpu_ev, NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 9);
+    P(nvnCommandBufferSignalEvent)(&cb, &cpu_ev, NVN_EVENT_SIGNAL_MODE_ADD, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 4);
     P(nvnCommandBufferReportCounter)(&cb, NVN_COUNTER_TYPE_TIMESTAMP, (NVNbufferAddress)cnt);
     NVNcommandHandle h1 = P(nvnCommandBufferEndRecording)(&cb);
     EXPECT("not recording after EndRecording", 0, P(nvnCommandBufferIsRecording)(&cb));
     P(nvnCommandBufferBeginRecording)(&cb);
     P(nvnCommandBufferCopyBufferToBuffer)(&cb, (NVNbufferAddress)src, (NVNbufferAddress)dst, 64, 0);
-    P(nvnCommandBufferCopyCommands)(&cb, 1, &h1);         // nested: execute h1 once more (event 7 → +5 → write 7 again → +5)
+    P(nvnCommandBufferCopyCommands)(&cb, 1, &h1);         // nested: execute h1 once more (event write 7 → GPU-address write 11 → event +5)
     NVNcommandHandle h2 = P(nvnCommandBufferEndRecording)(&cb);
     printf("(command memory callback called %d times, %zu B used)\n", g_cb_calls, g_cmdoff);
     EXPECT("command memory callback at least twice (multi-segment)", 1, g_cb_calls >= 2);
     EXPECT("event value still 0 before submit", 0, P(nvnEventGetValue)(&ev));
+    EXPECT("ReportValue destination still 0 before submit", 0, report[1]);
+    EXPECT("CPU-only event still 0 before submit", 0, cpu_event_word);
 
     NVNqueueBuilder qb; NVNqueue q; static uint8_t qmem[1 << 19];
     P(nvnQueueBuilderSetDevice)(&qb, &dev); P(nvnQueueBuilderSetDefaults)(&qb);
@@ -203,10 +214,27 @@ int main(void) {
     int ub_ok = 1;
     for (int k = 0; k < 20; k++) for (int i = 0; i < 16; i++) { uint32_t w; memcpy(&w, ub + k * 64 + i * 4, 4); ub_ok &= w == (uint32_t)(k * 100 + i); }
     EXPECT("uniform buffer 20×16 words equal the recorded values", 1, ub_ok);
-    EXPECT("event value: h1(7,+5), then h2 copies and runs h1(7,+5) again = 12", 12, P(nvnEventGetValue)(&ev));
+    EXPECT("event/report/event FIFO through nested CALL and JUMP", 16, P(nvnEventGetValue)(&ev));
+    EXPECT("ReportValue separate destination preserves 32 bits", 0xfedcba98u, report[1]);
+    EXPECT("ReportValue only writes its 4-byte destination", 1, report[0] == 0x12345678 && report[2] == 0x87654321 && report[3] == 0xabcdef01);
+    EXPECT("mixed event/report writes preserve event guards", 1, event_guard[0] == 0x11223344 && event_guard[2] == 0x55667788);
+    EXPECT("CPU-only event WRITE/ADD bypasses GPU resolver", 13, cpu_event_word);
     EXPECT("buffer copy 64 B identical", 0, memcmp(src, dst, 64));
     uint64_t ts[2]; memcpy(ts, cnt, 16);
     EXPECT("counter timestamp written (non-zero)", 1, ts[0] != 0 && ts[0] == ts[1]);
+
+    // Encoding the post-ops must not write either destination before commit.
+    report[1] = 0; cpu_event_word = 0;
+    mtl_sub_begin();
+    mtl_sub_report_value(P(nvnMemoryPoolGetBufferAddress)(&pool) + 0x3104, 11);
+    mtl_sub_event((volatile uint32_t *)&report[1], NVN_EVENT_SIGNAL_MODE_ADD, 5);
+    mtl_sub_event(&cpu_event_word, NVN_EVENT_SIGNAL_MODE_WRITE, 9);
+    mtl_sub_event(&cpu_event_word, NVN_EVENT_SIGNAL_MODE_ADD, 4);
+    EXPECT("encoded ReportValue remains pending before commit", 0, report[1]);
+    EXPECT("encoded CPU event remains pending before commit", 0, cpu_event_word);
+    EXPECT("post-op completion wait succeeds", 1, mtl_wait(mtl_sub_commit(), 5000000000ull));
+    EXPECT("completed report/event FIFO", 16, report[1]);
+    EXPECT("completed CPU-only event WRITE/ADD", 13, cpu_event_word);
 
     // 5a. Command memory per recording, as GetCommandMemoryUsed reports it (games size prerecorded command blocks by it: Breath of the Wild records one scratch draw per mesh):
     //     no BEGIN record, a plain indexed draw without the indirect / multi-draw fields, and the handle is the first record; an indirect draw keeps its address
@@ -239,6 +267,20 @@ int main(void) {
         uint32_t patched = 0x1ff00000u | 1235; memcpy(m + at + 0x10, &patched, 4);
         memcpy(&rh, m, sizeof rh); p_bind_handles bt; const p_bind_handles *bh = bind_rec(rh.op, m + 8, &bt);
         EXPECT("the bind reads the handle patched at its start + 0x10: slot 3, texture 1235, sampler 511", 1, rh.op == OP_BIND_TEX1 && bh->n == 1 && bh->first == 3 && bh->stage == NVN_SHADER_STAGE_FRAGMENT && bh->h[0] == patched);
+        // Record-only: this synthetic address is deliberately not a CPU mapping. It must survive as a GPU-address operand, never dereferenced here.
+        P(nvnCommandBufferAddCommandMemory)(&c2, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&c2);
+        P(nvnCommandBufferSignalEvent)(&c2, &ev, NVN_EVENT_SIGNAL_MODE_ADD, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 3);
+        const NVNbufferAddress report_addr = UINT64_C(0xfedcba9876543210);
+        P(nvnCommandBufferReportValue)(&c2, UINT32_MAX, report_addr);
+        P(nvnCommandBufferEndRecording)(&c2);
+        memcpy(&rh, m, sizeof rh); volatile uint32_t *event_ptr; uint32_t event_mode, event_v;
+        memcpy(&event_ptr, m + 8, 8); memcpy(&event_mode, m + 16, 4); memcpy(&event_v, m + 20, 4);
+        EXPECT("SignalEvent retains its CPU-pointer record", 1, rh.op == OP_SIGNAL_EVENT && rh.size == 24 && event_ptr == ((ev_t *)&ev)->val && event_mode == NVN_EVENT_SIGNAL_MODE_ADD && event_v == 3);
+        memcpy(&rh, m + 24, sizeof rh); p_report_value rv; memcpy(&rv, m + 32, sizeof rv);
+        EXPECT("ReportValue uses its distinct 24-byte record", 1, rh.op == OP_REPORT_VALUE && rh.op != OP_SIGNAL_EVENT && rh.size == 24);
+        EXPECT("ReportValue retains all GPU-address/value bits", 1, rv.addr == report_addr && rv.value == UINT32_MAX && rv._pad == 0);
+        memcpy(&rh, m + 48, sizeof rh);
+        EXPECT("event/report recording size and END unchanged", 1, P(nvnCommandBufferGetCommandMemoryUsed)(&c2) == 56 && rh.op == OP_END && rh.size == 8);
         P(nvnCommandBufferFinalize)(&c2); P(nvnMemoryPoolFinalize)(&mp);
     }
     // 5b'. Fixed slots sized by GetCommandMemoryUsed, as Tears of the Kingdom gives each model's prerecorded lists (GitHub issue #61): a list measured at S bytes is recorded
