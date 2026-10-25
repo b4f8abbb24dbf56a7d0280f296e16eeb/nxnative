@@ -26,7 +26,12 @@ typedef struct {
     unsigned flags; // DM_SA_PAGE_*; describes every byte in this prefix
 } dm_sa_page_run;
 typedef struct {
-    size_t granule; // zero disables the entire optional capability
+    // Logical commitment/decommit unit, NOT host protection-page alignment.
+    // COMMITTED must be uniform throughout each granule of every lease;
+    // BORROWED boundaries may be finer. Query prefixes may still be clipped.
+    // Zero disables the entire optional capability. Native SVC uses 4 KiB
+    // even on a 16 KiB host. Finer commitment states are unsupported.
+    size_t granule;
     // Same context/scope as the lease provider. Query callbacks never suspend
     // that scope, dereference payload bytes, or infer backing from mprotect.
     // query_run returns a bounded committed/borrowed-state run inside the exact
@@ -81,8 +86,8 @@ typedef struct {
     int (*available)(void *context, const dm_sa_span *span, size_t offset, size_t size);
     dm_sa_result (*query)(void *context, size_t alignment, dm_sa_provider_stats *out);
     // All-zero for whole-lease/malloc providers. Partial capabilities are
-    // invalid. Statistics and lease draining consume this capability; allocation
-    // reuse/growth do not yet recommit. Never decommit live allocation bytes.
+    // invalid. Statistics, lease draining and allocation reuse/growth consume
+    // this capability. Core operations never initiate decommit of free runs.
     dm_sa_page_provider pages;
 } dm_sa_provider;
 
@@ -101,8 +106,8 @@ typedef struct {
     // backing_bytes is the exact outstanding lease extent/capacity charge,
     // including reserved holes; committed_bytes is actual logical commitment.
     size_t capacity, backing_bytes, allocated_bytes, allocation_count, span_count;
-    // Page-capable configurations include budgeted recommit potential. Runtime
-    // wiring remains disabled until allocation reuse/growth implements recommit.
+    // Page-capable configurations include budgeted recommit potential; these
+    // are snapshots, not a promise against concurrent physical-budget changes.
     size_t total_free, largest_free; // backed free bytes + once-budgeted recommit/new leases
     size_t metadata_bytes;
     int closed;
@@ -120,6 +125,10 @@ typedef struct {
 // a pointer and retains that exact lease as free-but-guarded backing for retry.
 // This unavoidable rollback deferral is visible in backing_bytes, not leaked
 // ownership. trim/finalize release it once the source borrow ends.
+// With optional page backing, reuse/growth stages metadata before recommit and
+// revalidates both the candidate and old realloc source afterward. A postcommit
+// borrow returns BUSY with unchanged output/live allocation; newly committed
+// pages stay owned free backing, visible in committed_bytes, for safe retry.
 // Lifecycle destruction
 // requires exclusive caller ownership; ordinary operations are thread-safe.
 dm_sa_result dm_sa_create(dm_sa_allocator **out, const dm_sa_config *config);

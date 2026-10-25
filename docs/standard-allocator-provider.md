@@ -38,10 +38,16 @@ An explicitly supplied `change_pages` owner callback exposes an optional
 commit bitmap and source-borrow registry, reads physical headroom independently
 of reservation gaps, and changes aligned pages inside an exact existing lease.
 There is no second bitmap, reservation owner, or hidden malloc-page operation.
-The production runtime does **not** supply this callback. Core allocation/reuse,
-Shrink and activation gates remain unchanged. Sparse commitment statistics and
-whole-lease draining are implemented as the next staged core layer below; no
-core operation initiates a page decommit or recommit yet.
+The capability's granule is its **logical commitment/decommit unit**: COMMITTED
+state must be uniform within each granule, while BORROWED boundaries may be
+finer and query prefixes may be clipped. It is not merely a minimum callback
+alignment or the host protection-page size. The native capability remains
+4 KiB on both 4 KiB and 16 KiB hosts. Finer existing commitment states are not
+supported by an advertised coarser capability.
+The production runtime does **not** supply this callback. Shrink and activation
+gates remain unchanged. Sparse commitment statistics, whole-lease draining and
+recommit-on-reuse/growth are implemented as staged core layers below. No core
+operation initiates decommit of free runs.
 
 Queries run without dropping the source guard and never read payload bytes.
 Page changes mark the lease in-flight, drop the guard before the owner callback,
@@ -66,7 +72,7 @@ idempotent accounting, failure retention, in-flight serialization, borrow races,
 zero-reservation-gap recommit, stale-budget rejection and release through holes.
 The native Vamm fixture also exercises the capability through `dm_vamm_pages`
 and the real SVC backend without wiring it into production. Core reclamation,
-recommit-on-reuse and transactional Shrink policy still
+runtime wiring and transactional Shrink policy still
 require a separate implementation/review. This establishes no SDK policy parity,
 new admission, gameplay result or permission to remove an existing cut.
 
@@ -86,11 +92,11 @@ scan of authoritative runs to bound a contiguous candidate by its missing-page
 cost; borrowed runs are barriers. No persistent residency ledger is introduced.
 Query failures leave the entire caller output unchanged.
 
-**This is a staged capability, not completed allocation support.** Page-capable
-free-space statistics describe budgeted recommit potential; existing allocation
-reuse/growth cannot consume holes until the next layer. Production callbacks
-stay absent. Tests create holes only through exact captured leases and only in
-known wholly free granules; no automatic Shrink/Trim reclamation is enabled.
+Page-capable free-space statistics describe budgeted recommit potential, not a
+promise against a competing physical commit after a snapshot. Production
+callbacks stay absent. Tests create holes only through exact captured leases
+and only in known wholly free granules; no automatic Shrink/Trim reclamation is
+enabled.
 
 Sparse release and finalize preflight validate lease ownership and borrowed
 ranges independently of commitment. Missing pages are not a reason for `BUSY`.
@@ -98,6 +104,43 @@ Finalize still checks every lease before closing or releasing any one of them;
 a later release failure retains the exact sparse lease for retry. Providers
 without page capabilities retain the original control flow, with committed
 bytes equal to their fully backed lease extent.
+
+### Recommit before allocation publication
+
+Page-capable allocation first searches already-committed, unborrowed intervals,
+including later aligned portions of mixed free blocks. A second pass searches
+contiguous intervals whose missing-page cost fits current physical headroom;
+an unaffordable leading hole does not hide a later feasible candidate. The
+bounded run cursor retains no persistent bitmap. Alignment opportunities are
+checked at missing-granule boundaries, with cached left-run boundaries rather
+than repeated whole-bitmap scans.
+
+All split metadata is staged before recommit. The core charges only missing
+logical pages in the page-rounded candidate, not existing committed boundary
+pages. The provider still enforces the actual budget atomically in its owner
+transaction. Failure before commitment leaves allocation metadata, caller
+output and page state unchanged. Successful recommit preserves existing live
+boundary bytes and initializes only holes.
+
+The source guard can be suspended during that transaction. Before publishing a
+new block or enlarging an in-place realloc, the core rechecks candidate backing
+and borrowed state; growth additionally rechecks the old live prefix. A moving
+realloc retains its existing old-source revalidation before copying. If a borrow
+wins after recommit, `BUSY` leaves the old allocation and caller output intact;
+newly committed pages remain owned free backing, reflected in `committed_bytes`.
+There is no unsafe compensating decommit of a rounded range that may contain
+pre-existing live bytes. Whole-lease release/finalize can later drain it safely.
+
+Synthetic cases cover both split-metadata failures before the page callback,
+owner rejection, exact missing-only budgets across live page boundaries,
+zero-budget selection of a later backed run, protected-old-prefix growth races,
+postcommit target borrows and retained-page retry. Providers without page
+capabilities retain their original allocation/growth path. Runtime opt-in,
+automatic reclamation policy and gameplay validation remain separate work.
+A synthetic coarser-capability fixture also rejects unsupported finer holes in
+stats, allocation and in-place growth without changing pages, outputs or the
+old allocation. A separate valid case keeps commitment uniform while borrowing
+a finer boundary neighbor; rounded recommit preserves that borrow and its bytes.
 
 ## Verification and remaining boundary
 

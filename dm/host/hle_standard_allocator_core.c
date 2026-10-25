@@ -88,6 +88,48 @@ static dm_sa_result releasable(dm_sa_allocator *a, const span *s) {
     }
     return DM_SA_OK;
 }
+// Prepare backing only after all fallible allocation metadata is staged. Page
+// callbacks may drop the source guard: success is not publication permission.
+// A postcommit borrow retains owned pages and returns BUSY without rolling back
+// a rounded interval that may also contain pre-existing live boundary bytes.
+static dm_sa_result prepare_backing(dm_sa_allocator *a, span *s, size_t offset, size_t size) {
+    if (available(a, s, offset, size)) return DM_SA_OK;
+    const dm_sa_provider *p = &a->config.provider;
+    if (!p->pages.granule) return DM_SA_BUSY;
+    size_t end = offset + size;
+    for (size_t at = offset; at < end;) {
+        dm_sa_page_run run;
+        dm_sa_result r = page_run(a, s, at, end - at, &run);
+        if (r != DM_SA_OK) return r;
+        if (run.flags & DM_SA_PAGE_BORROWED) return DM_SA_BUSY;
+        at += run.size;
+    }
+    size_t granule = p->pages.granule, lo = offset & ~(granule - 1), hi;
+    if (!rounded(end, granule, &hi) || hi > s->lease.size) return DM_SA_INVALID;
+    size_t missing = 0;
+    for (size_t at = lo; at < hi;) {
+        dm_sa_page_run run;
+        dm_sa_result r = page_run(a, s, at, hi - at, &run);
+        if (r != DM_SA_OK) return r;
+        if (!(run.flags & DM_SA_PAGE_COMMITTED)) {
+            // This scan covers a granule-rounded interval, so a partial hole
+            // violates the provider's uniform logical commitment contract.
+            // Finer BORROWED boundaries on committed neighbors are valid.
+            if ((at | run.size) & (granule - 1)) return DM_SA_PROVIDER_FAILED;
+            missing += run.size;
+        }
+        at += run.size;
+    }
+    if (missing) {
+        size_t budget;
+        dm_sa_result r = p->pages.budget(p->context, &budget);
+        if (r != DM_SA_OK) return r;
+        if (missing > budget) return DM_SA_NO_MEMORY;
+        r = p->pages.change(p->context, &s->lease, lo, hi - lo, 1);
+        if (r != DM_SA_OK) return r;
+    }
+    return available(a, s, offset, size) ? DM_SA_OK : DM_SA_BUSY;
+}
 static void *address(const span *s, const block *b) {
     return (void *)((uintptr_t)s->lease.base + b->offset);
 }
@@ -178,6 +220,13 @@ static dm_sa_result take_free(dm_sa_allocator *a, span *s, block *b,
         if (before) metadata_delete(a, allocated, sizeof *allocated);
         return DM_SA_NO_MEMORY;
     }
+    dm_sa_result prepared = a->config.provider.pages.granule ?
+        prepare_backing(a, s, offset, size) : DM_SA_OK;
+    if (prepared != DM_SA_OK) {
+        if (tail) metadata_delete(a, tail, sizeof *tail);
+        if (before) metadata_delete(a, allocated, sizeof *allocated);
+        return prepared;
+    }
     if (before) { b->size = before; insert_after(b, allocated); }
     allocated->offset = offset; allocated->size = size;
     allocated->alignment = alignment; allocated->live = 1;
@@ -185,12 +234,84 @@ static dm_sa_result take_free(dm_sa_allocator *a, span *s, block *b,
     a->used += size; a->count++; s->live_count++; s->free_bytes -= size;
     *out = address(s, allocated); return DM_SA_OK;
 }
+static int window_candidate(const span *s, size_t left, size_t right,
+                              size_t size, size_t alignment, size_t *out) {
+    uintptr_t base = (uintptr_t)s->lease.base + left;
+    if (base > UINTPTR_MAX - (alignment - 1)) return 0;
+    size_t skip = (size_t)((-(uintptr_t)base) & (alignment - 1));
+    if (skip > right - left || size > right - left - skip) return 0;
+    *out = left + skip; return 1;
+}
+// Find an aligned subinterval, not merely the first address of a mixed run.
+// Budget zero is the backed-first pass. Missing-page steps preserve alignment
+// opportunities while the left cursor advances; cached left runs avoid scanning
+// the same bitmap suffix for each step. No payload or metadata is changed here.
+static dm_sa_result sparse_candidate(dm_sa_allocator *a, span *s, block *b,
+                                       size_t size, size_t alignment, size_t budget, size_t *out) {
+    size_t left = b->offset, right = left, limit = left + b->size, cost = 0;
+    size_t left_end = left, granule = a->config.provider.pages.granule;
+    unsigned left_flags = 0;
+    while (right < limit) {
+        dm_sa_page_run run;
+        dm_sa_result r = page_run(a, s, right, limit - right, &run);
+        if (r != DM_SA_OK) return r;
+        size_t end = right + run.size;
+        if (run.flags & DM_SA_PAGE_BORROWED) {
+            left = right = left_end = end; cost = 0; continue;
+        }
+        if (run.flags & DM_SA_PAGE_COMMITTED) {
+            right = end;
+            if (window_candidate(s, left, right, size, alignment, out)) return DM_SA_OK;
+            continue;
+        }
+        if ((right | run.size) & (granule - 1)) return DM_SA_PROVIDER_FAILED;
+        if (!budget) { left = right = left_end = end; cost = 0; continue; }
+        while (right < end) {
+            right += granule; cost += granule;
+            while (cost > budget) {
+                if (left == left_end) {
+                    dm_sa_page_run old;
+                    r = page_run(a, s, left, limit - left, &old);
+                    if (r != DM_SA_OK) return r;
+                    left_end = left + old.size; left_flags = old.flags;
+                }
+                size_t remove = left_flags & DM_SA_PAGE_COMMITTED ? left_end - left :
+                    lesser(left_end - left, cost - budget);
+                if (!(left_flags & DM_SA_PAGE_COMMITTED)) cost -= remove;
+                left += remove;
+            }
+            if (window_candidate(s, left, right, size, alignment, out)) return DM_SA_OK;
+        }
+    }
+    return DM_SA_NOT_FOUND;
+}
 static dm_sa_result allocate_locked(dm_sa_allocator *a, size_t size, size_t alignment, void **out) {
     if (a->closed) return DM_SA_CLOSED;
     if (!power2(alignment) || alignment < 16) return DM_SA_INVALID;
     size_t n;
     if (!rounded(size ? size : 1, 16, &n) || n > a->config.capacity) return DM_SA_NO_MEMORY;
-    for (span *s = a->spans; s; s = s->next) {
+    const dm_sa_provider *p = &a->config.provider;
+    if (p->pages.granule) {
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            size_t budget = 0;
+            if (pass) {
+                dm_sa_result r = p->pages.budget(p->context, &budget);
+                if (r != DM_SA_OK) return r;
+                budget &= ~(p->pages.granule - 1);
+                if (!budget) break;
+            }
+            for (span *s = a->spans; s; s = s->next) {
+                if (s->free_bytes < n) continue;
+                for (block *b = s->blocks; b; b = b->next) {
+                    if (b->live || b->size < n) continue;
+                    size_t offset = 0;
+                    dm_sa_result r = sparse_candidate(a, s, b, n, alignment, budget, &offset);
+                    if (r == DM_SA_OK) return take_free(a, s, b, offset, n, alignment, out);
+                    if (r != DM_SA_NOT_FOUND) return r;
+                }
+            }
+        }
+    } else for (span *s = a->spans; s; s = s->next) {
       if (s->free_bytes < n) continue; // do not scan every block of full pools
       for (block *b = s->blocks; b; b = b->next) {
         if (b->live) continue;
@@ -202,7 +323,6 @@ static dm_sa_result allocate_locked(dm_sa_allocator *a, size_t size, size_t alig
         return take_free(a, s, b, b->offset + skip, n, alignment, out);
       }
     }
-    const dm_sa_provider *p = &a->config.provider;
     size_t minimum;
     if (!rounded(n, p->granule, &minimum)) return DM_SA_NO_MEMORY;
     size_t lease_alignment = alignment > p->granule ? alignment : p->granule;
@@ -308,11 +428,24 @@ dm_sa_result dm_sa_reallocate(dm_sa_allocator *a, void *pointer, size_t size, vo
         else if (n <= b->size) { r = shrink_locked(a, s, b, n); if (r == DM_SA_OK) *out = pointer; }
         else {
             block *tail = b->next; size_t extra = n - b->size;
-            if (tail && !tail->live && extra <= tail->size && available(a, s, tail->offset, extra)) {
+            int grow = 0;
+            dm_sa_result growth = DM_SA_OK;
+            if (tail && !tail->live && extra <= tail->size) {
+                if (a->config.provider.pages.granule) {
+                    growth = prepare_backing(a, s, tail->offset, extra);
+                    // Committing the tail can suspend the source guard. The
+                    // already-live prefix can become borrowed independently.
+                    if (!available(a, s, b->offset, b->size) ||
+                        (growth == DM_SA_OK && !available(a, s, b->offset, n))) growth = DM_SA_BUSY;
+                    grow = growth == DM_SA_OK;
+                } else grow = available(a, s, tail->offset, extra);
+            }
+            if (grow) {
                 tail->offset += extra; tail->size -= extra; b->size = n; a->used += extra; s->free_bytes -= extra;
                 if (!tail->size) { b->next = tail->next; if (tail->next) tail->next->prev = b; metadata_delete(a, tail, sizeof *tail); }
                 *out = pointer; r = DM_SA_OK;
-            } else {
+            } else if (growth != DM_SA_OK && growth != DM_SA_NO_MEMORY) r = growth;
+            else {
                 void *replacement;
                 r = allocate_locked(a, n, b->alignment, &replacement);
                 if (r == DM_SA_OK) {
