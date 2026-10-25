@@ -24,8 +24,10 @@ static void hc_write(void) {
 }
 void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     if (!hc_on() || !fn) return fn;
-    if (g_hsealed) { static int once; if (!once++) LOG("[RED] DM_HLECOUNT: resolution after the pages were sealed (%s), later entries are not counted", name); return fn; }
+    // Resolution must keep the same identity as already-relocated slots, even
+    // after sealing. Cached stubs are immutable; only new entries need writes.
     for (unsigned i = 0; i < g_nhc; i++) if (g_hc[i].fn == fn && !strcmp(g_hc[i].name, name)) return g_hcode + 12 * i;   // Same name and same implementation reuse one stub
+    if (g_hsealed) { static int once; if (!once++) LOG("[RED] DM_HLECOUNT: resolution after the pages were sealed (%s), later entries are not counted", name); return fn; }
     if (g_nhc == HC_MAX) die("DM_HLECOUNT more than %d entries", HC_MAX);
     if (!g_hcode) { g_hcode = mmap(NULL, HC_MAX * 48, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (g_hcode == MAP_FAILED) die("DM_HLECOUNT mmap"); atexit(hc_write); }
     unsigned i = g_nhc++; g_hc[i].kind = kind; g_hc[i].name = name; g_hc[i].fn = fn;
@@ -40,7 +42,8 @@ void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     return w;
 }
 void hlecount_seal(void) {
-    if (!hc_on() || !g_hcode) return;
+    if (!hc_on()) return;
+    if (!g_hcode) { g_hsealed = 1; return; }   // An empty load also closes stub creation
     if (mprotect(g_hcode, HC_MAX * 48, PROT_READ | PROT_EXEC)) die("DM_HLECOUNT mprotect");
     g_hsealed = 1;
     sys_icache_invalidate(g_hcode, HC_MAX * 48);

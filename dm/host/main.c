@@ -1,6 +1,7 @@
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
 #include "front.h"
+#include "hle_memory_hooks.h"
 #include <stdatomic.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -14,6 +15,7 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
 
 static void guest_main(void) {
+    if (!dm_memory_hooks_enter_guest()) die("guest entry during unfinished loading/transaction");
     guest_thread_init();
     { void dm_oodle_serve_maybe(int); dm_oodle_serve_maybe(0); }   // DM_OODLE_SERVE tool mode: the game's own Oodle decoder over stdin / stdout (hle_oodle.c, exits when the input ends)
     uint32_t hmain = svc_thread_main_init();   // Main thread handle: x0 of nnosInitialize (stored in an sdk global, used by ThreadManagerImplByHorizon); x1 = pointer to the argument area
