@@ -9,6 +9,7 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
+#include "hle_memory_hooks.h"
 
 module_t g_mod[MAX_MOD];
 int g_nmod;
@@ -271,7 +272,8 @@ static unsigned relr_apply(module_t *m, uint64_t relr, uint64_t relrsz, uint64_t
 // The address a symbol relocation of module m binds to, as Horizon's rtld would with the modules loaded now (forced take-over, then the loaded modules in load order, then HLE / stub).
 // *other: the module's own definition was taken over by an earlier module's; *weak0: an undefined weak symbol nothing defines, bound to 0
 static uint64_t bind_sym(module_t *m, const Elf64_Sym *s, int *other, int *weak0) {
-    uint64_t v = (uint64_t)force_lookup(m->strtab + s->st_name);
+    uint64_t v = (uint64_t)dm_memory_hooks_lookup(m->strtab + s->st_name);
+    if (!v) v = (uint64_t)force_lookup(m->strtab + s->st_name);
     *other = *weak0 = 0;
     // Symbols the module defines itself are also looked up globally in load order (the ELF default; Horizon's rtld does the same): the definition of an earlier-loaded module overrides a later one; only local / non-default visibility binds to itself.
     // Engage's main defines its own operator new / delete (Unity's memory manager) and sdk has a copy too (forwarding to malloc / free): previously sdk bound its own delete,
@@ -288,6 +290,13 @@ static uint64_t bind_sym(module_t *m, const Elf64_Sym *s, int *other, int *weak0
     *weak0 = !v && !s->st_shndx && ELF64_ST_BIND(s->st_info) == STB_WEAK && !loaded_sym(nm) && !hle_implements(nm);
     if (!v && !*weak0) v = resolve_sym(m, nm);
     return v;
+}
+
+static uint64_t memory_hook_resolve(module_t *m, const Elf64_Sym *s) {
+    int other, weak0; return bind_sym(m, s, &other, &weak0);
+}
+int loader_install_memory_hooks(const dm_sa_adapter_config *sa, const dm_vamm_adapter_config *va) {
+    return dm_memory_hooks_install(g_mod, (size_t)g_nmod, sa, va, memory_hook_resolve);
 }
 
 typedef struct { const Elf64_Rela *tab[2]; uint64_t n[2]; uint64_t relr, relrsz; } relocs_t;
@@ -394,6 +403,7 @@ static unsigned rebind(module_t *k, module_t *nm, int load) {
 }
 
 void nro_load(module_t *m) {
+    if (dm_memory_hooks_active()) die("memory ownership hooks do not support late modules");
     pthread_rwlock_wrlock(&g_modules_mu);
     if (m->loads) memcpy(m->base + m->data_off, m->pristine, m->pristine_len);
     m->loads++; m->loaded = 1; g_loaded[g_nloaded++] = m;
@@ -405,6 +415,7 @@ void nro_load(module_t *m) {
 }
 
 void nro_unload(module_t *m) {
+    if (dm_memory_hooks_active()) die("memory ownership hooks do not support module unload");
     pthread_rwlock_wrlock(&g_modules_mu);
     m->loaded = 0;
     for (int i = 0; i < g_nloaded; i++) if (g_loaded[i] == m) { memmove(g_loaded + i, g_loaded + i + 1, (size_t)(--g_nloaded - i) * sizeof *g_loaded); break; }
@@ -579,6 +590,7 @@ void load_modules(const char *dir, const char **names, int n) {
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
     preload_nros(dir);   // mapped now, relocated when the game loads them (hle_ro.c)
+    if (!dm_memory_hooks_open_startup()) die("memory-hook startup window already used");
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK: %lu symbol lookups at load time, hash and linear disagree %lu", g_symchk_n, g_symchk_bad);
     if (g_flag.bootprof) LOG("① breakdown: mapping (read + copy + seal pages) %.1f ms, dynamic section parsing %.1f ms, gate registration %.1f ms, relocation + forced takeover %.1f ms, total %.1f ms",
@@ -588,6 +600,7 @@ void load_modules(const char *dir, const char **names, int n) {
 // Plays the role of rtld's InitModules (rtld+0x830): call each module's DT_INIT in forward order of the load list.
 // The timing is decided by nn::init::Start: after nninitStartup and _init_libc2, before nnMain (the 4th argument callback of Start).
 void run_module_inits(void) {
+    if (!dm_memory_hooks_enter_guest()) die("module initialization during unfinished loading/transaction");
     for (int i = 0; i < g_nmod; i++) {
         module_t *m = &g_mod[i];
         if (!m->init || m->nro) continue;   // an NRO's init runs when the game loads it (hle_ro.c)

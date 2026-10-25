@@ -9,33 +9,70 @@
 typedef int (*create_fn)(void *tt, void (*fn)(void *), void *arg, void *stack, size_t size, int prio);
 typedef void (*tt_fn)(void *tt);
 static void *need(const char *n) { void *p = guest_sym(n); if (!p) die("host guest thread: missing symbol %s", n); return p; }
-// an entry shim: first register the thread as host-created (hle_thread.c dm_yield_to_core_peers does not wait for them), then run fn
-typedef struct { void (*fn)(void *); void *arg; } spawn_arg;
-typedef struct { _Alignas(16) uint8_t tt[0x200]; void *stack_alloc; } host_thread;
+// The handle keeps ThreadType first, but also owns its source allocation. Only
+// join consumes it; resident workers intentionally retain it for their lifetime.
+// Use the guest's matched C malloc/free family, not host aligned_alloc: the SDK
+// borrows these pages with MapMemory, whose sources must have guest backing.
+typedef struct {
+    _Alignas(16) uint8_t tt[0x200];       // ThreadType (0x1c0 bytes, with headroom)
+    void *storage;
+    tt_fn release, wait, destroy;
+    void (*fn)(void *);
+    void *arg;
+} spawn_owner;
+static _Thread_local spawn_owner *current_owner;
 void dm_thread_mark_host(void);
-static void spawn_tramp(void *p) { spawn_arg a = *(spawn_arg *)p; free(p); dm_thread_mark_host(); a.fn(a.arg); }
+uint32_t thr_cur_handle(void);
+int dm_guest_map_source_available(const void *source, size_t size);
+static void spawn_tramp(void *p) {
+    spawn_owner *owner = p;
+    dm_thread_mark_host();
+    current_owner = owner;
+    owner->fn(owner->arg);
+    current_owner = NULL;
+}
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size) {
-    spawn_arg *sa = malloc(sizeof *sa); if (!sa) die("host guest thread: allocation failed"); sa->fn = fn; sa->arg = arg; fn = spawn_tramp; arg = sa;
+    if (!thr_cur_handle()) die("host guest thread: creation requires a guest thread");
+    // Round the mapped span, then reserve enough extra bytes to align its start.
+    // Both full pages and their padding stay inside this one guest allocation.
+    if (!fn || !stack_size || stack_size > SIZE_MAX - 0xfff) die("host guest thread: invalid stack size or entry");
     stack_size = (stack_size + 0xfff) & ~(size_t)0xfff;
-    host_thread *t = calloc(1, sizeof *t);                       // ThreadType is first, 0x1c0 bytes with headroom
-    if (!t) die("host guest thread: allocation failed");
-    // CreateThread borrows this range through MapMemory. Host malloc has no
-    // guest backing/state (the audio worker failed here in Tears of the Kingdom).
-    // Use SDK malloc, retaining the raw pointer until DestroyThread copies back.
-    t->stack_alloc = ((void *(*)(size_t))need("malloc"))(stack_size + 0xfff);
-    if (!t->stack_alloc) die("host guest thread: stack allocation failed");
-    void *stack = (void *)(((uintptr_t)t->stack_alloc + 0xfff) & ~(uintptr_t)0xfff);
-    int rc = ((create_fn)need("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi"))(t->tt, fn, arg, stack, stack_size, prio);
-    if (rc) die("host guest thread: CreateThread failed %#x", rc);
-    ((tt_fn)need("_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE"))(t->tt);
-    return t;
+    void *(*allocate)(size_t) = need("malloc");
+    tt_fn release = need("free");
+    create_fn create = need("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi");
+    tt_fn start = need("_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE");
+    tt_fn wait = need("_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE");
+    tt_fn destroy = need("_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE");
+    spawn_owner *owner = calloc(1, sizeof *owner);
+    if (!owner) die("host guest thread: allocation failed");
+    owner->storage = allocate(stack_size + 0xfff);
+    owner->release = release; owner->wait = wait; owner->destroy = destroy;
+    owner->fn = fn; owner->arg = arg;
+    if (!owner->storage) { free(owner); die("host guest thread: guest stack allocation failed"); }
+    uintptr_t raw = (uintptr_t)owner->storage;
+    uintptr_t aligned = (raw + 0xfff) & ~(uintptr_t)0xfff;
+    // This is an ownership/state check, not a host-readability test or a
+    // reservation. SDK MapMemory remains the authoritative atomic borrow.
+    if (raw > UINTPTR_MAX - 0xfff || !dm_guest_map_source_available((void *)aligned, stack_size)) {
+        release(owner->storage); free(owner);
+        die("host guest thread: allocator returned an ineligible stack source");
+    }
+    int rc = create(owner->tt, spawn_tramp, owner, (void *)aligned, stack_size, prio);
+    if (rc) {
+        release(owner->storage); free(owner);
+        die("host guest thread: CreateThread failed %#x", rc);
+    }
+    start(owner->tt);
+    return owner;
 }
 void dm_guest_thread_join(void *tt) {
-    ((tt_fn)need("_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE"))(tt);
-    ((tt_fn)need("_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE"))(tt);
-    host_thread *t = tt;
-    ((void (*)(void *))need("free"))(t->stack_alloc);
-    free(t);
+    if (!thr_cur_handle()) die("host guest thread: join requires a guest thread");
+    spawn_owner *owner = tt;
+    if (owner == current_owner) die("host guest thread: cannot join itself");
+    owner->wait(owner->tt);
+    owner->destroy(owner->tt);           // SDK has exited and released its alias stack
+    owner->release(owner->storage);     // free the original base, never the aligned interior
+    free(owner);
 }
 
 static struct { int malloc_ok, lock_owned, handle; } g_st;

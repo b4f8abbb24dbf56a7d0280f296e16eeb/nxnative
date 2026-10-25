@@ -1,5 +1,6 @@
 // Exercise the production dispatcher with real backing, including protection
 // failures and concurrent operations. No alternate allocator implementation.
+#define _GNU_SOURCE
 #include "../dm.h"
 #include <assert.h>
 #include <errno.h>
@@ -8,6 +9,11 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef __APPLE__
+static void *pthread_get_stackaddr_np(pthread_t thread) { (void)thread; return NULL; }
+static size_t pthread_get_stacksize_np(pthread_t thread) { (void)thread; return 0; }
+#endif
 
 static int memory_mprotect(void *addr, size_t size, int prot);
 static _Noreturn void memory_abort(void);
@@ -196,7 +202,8 @@ static void ownership(void) {
     assert(!pages(0, alias, P) && !pages(1, alias, P));
     assert(*(uint8_t *)(alias + P) == 0x34);
     memset((void *)(stack + P), 0x76, 2 * P);
-    readonly_base = alias; readonly_size = memory_getpagesize();
+    readonly_size = memory_getpagesize();
+    readonly_base = (alias + P) & ~(uintptr_t)(readonly_size - 1);
     assert(!mprotect((void *)readonly_base, readonly_size, PROT_READ));
     assert(!unmap(stack + P, alias + P, 2 * P) && !readonly_size);
     for (size_t i = P; i < 3 * P; ++i) assert(((uint8_t *)alias)[i] == 0x76);
@@ -323,11 +330,18 @@ static void fragmented_queries(void) {
 }
 static void lazy_commit(void) {
     size_t n = DM_GAME_APP_POOL - DM_GAME_MEM_USED, pg = memory_getpagesize();
-    char *resident = malloc(n / pg); assert(resident);
+    // mincore reports real host pages, even in the simulated 16 KiB fixture.
+    size_t native_page = (size_t)getpagesize();
+#ifdef __APPLE__
+    char *resident = malloc(n / native_page);
+#else
+    unsigned char *resident = malloc(n / native_page);
+#endif
+    assert(resident);
     assert(!pages(1, alias, n));
     assert(!mincore((void *)alias, n, resident));
     size_t count = 0;
-    for (size_t i = 0; i < n / pg; ++i) count += !!(resident[i] & MINCORE_INCORE);
+    for (size_t i = 0; i < n / native_page; ++i) count += !!(resident[i] & 1);
     assert(count < 32); // metadata scans must not fault the anonymous backing in
     ((uint8_t *)alias)[0] = 0x98;
     assert(!pages(0, alias, pg) && !pages(1, alias, pg));
