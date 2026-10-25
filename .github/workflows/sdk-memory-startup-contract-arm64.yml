@@ -1,0 +1,372 @@
+# Tests that need no game files, keys or GPU. GitHub's macOS runners are virtual Macs without Metal 4 (issue #112), so the tests that go through mtl_init
+# (t_nvn, t_mip_extent, t_rt_range and the rest of dm/gfx/tests' run list) stay local: run `make -C dm/gfx/tests GAME=<id> run` on an Apple-silicon Mac.
+# `profile_guess.py --check` stays local too: it compares the guesses with the extractions of the games (it needs their files).
+name: SDK-memory startup contract exact-head ARM64 validation
+
+on:
+  push:
+    branches: [ci/sdk-memory-startup-contract-arm64-20261025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-startup-contract-exact-head-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+  TSAN_OPTIONS: halt_on_error=1
+  GAME: 010015100B514000   # Super Mario Bros. Wonder: the profile the host and gfx tests are built for (any profile does; the tests are about code, not the game)
+
+defaults:
+  run:
+    shell: bash
+
+# Actions are pinned to commit SHAs (the tag in the comment): a tag can be moved, a SHA cannot. Dependabot (github-actions) can raise them.
+jobs:
+  host-tests:
+    name: Host unit tests and CPU-only gfx tests
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          persist-credentials: false
+      - name: Verify exact source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
+          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+          { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
+      - name: Host unit tests (dm/host/tests)
+        run: |
+          mkdir -p logs
+          make -C dm/host/tests GAME="$GAME" -j3 run 2>&1 | tee logs/host-tests.log
+      - name: ThreadSanitizer (audio and guest memory)
+        run: |
+          make -C dm/host/tests GAME="$GAME" -j3 tsan memory-tsan 2>&1 | tee logs/tsan.log
+      - name: CPU texture layout and deswizzle tests
+        run: |
+          make -C dm/gfx/tex/tests t_tex 2>&1 | tee logs/texture-build.log
+          dm/gfx/tex/tests/t_tex 2>&1 | tee logs/texture-tests.log
+      - name: CPU-only gfx tests (dm/gfx/tests)
+        run: |
+          mkdir -p logs
+          cd dm/gfx/tests
+          tests="t_dirty_slots t_dirty_race t_pace t_fstep t_hmap t_cover t_pso_skey t_refl t_rt_range_ro"
+          make GAME="$GAME" -j3 $tests 2>&1 | tee ../../../logs/gfx-build.log
+          failed=0
+          for t in $tests; do
+            echo "::group::$t"
+            ./$t 2>&1 | tee "../../../logs/$t.log" && rc=0 || rc=1   # pipefail: the test's status
+            echo "::endgroup::"
+            if [ "$rc" != 0 ]; then echo "::error::$t failed"; failed=1; fi
+          done
+          exit $failed
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-host-tests
+          path: logs
+          retention-days: 7
+
+  tool-tests:
+    name: Tool tests
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          persist-credentials: false
+      - name: Verify exact source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
+          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+          { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: .github/workflows/tests.yml   # no requirements file: the packages are listed in the step below
+      - name: Install the Python packages the tools import
+        run: python -m pip install lz4 capstone fonttools   # backports.zstd is for Python before 3.14 only
+      - name: Run the test files
+        env:
+          DM_GAME: ${{ env.GAME }}   # test_tbdr_budget runs a tool that needs a profile
+        run: |
+          mkdir -p logs
+          failed=0
+          for f in dm/tools/tests/test_*.py dm/ios/tests/test_*.py dm/gfx/tests/test_*.py; do
+            echo "::group::$f"
+            python -m unittest -v "$f" 2>&1 | tee "logs/$(basename "$f").log" || { echo "::error::$f failed"; failed=1; }
+            echo "::endgroup::"
+          done
+          exit $failed
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-tool-tests
+          path: logs
+          retention-days: 7
+
+  build:
+    name: Build check (Mac host, gfx tests, iOS sources)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          persist-credentials: false
+      - name: Verify exact source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
+          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+          { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
+      - name: Mac host for three profiles (Vulkan, NVN, OpenGL)
+        run: |
+          mkdir -p logs
+          # Wonder: NVN; Hades: Vulkan; Digimon Story Cyber Sleuth: OpenGL. The second and third reuse the libvpx build in dm/host/gen/vpx.
+          for g in 010015100B514000 0100535012974000 010014E00DB56000; do
+            echo "::group::dmhost $g"
+            make -C dm/host GAME=$g -j3 dmhost 2>&1 | tee "logs/dmhost-$g.log"
+            test -x dm/host/dmhost
+            echo "::endgroup::"
+          done
+      - name: Experimental switch compiles on Mac and iOS, then restores default
+        run: |
+          mkdir -p logs
+          make -C dm/host GAME=0100F43008C44000 EXPERIMENTAL_SHARED_MEMORY=1 -j3 dmhost 2>&1 | tee logs/dmhost-experiment-enabled.log
+          test "$(cat dm/host/gen/shared-memory-experiment.stamp)" = 1
+          GAME=0100F43008C44000 EXPERIMENTAL_SHARED_MEMORY=1 python3 dm/ios/tools/compile_check.py 2>&1 | tee logs/ios-experiment-enabled-compile.log
+          make -C dm/host GAME=0100F43008C44000 EXPERIMENTAL_SHARED_MEMORY=0 -j3 dmhost 2>&1 | tee logs/dmhost-experiment-disabled.log
+          test "$(cat dm/host/gen/shared-memory-experiment.stamp)" = 0
+          GAME=0100F43008C44000 EXPERIMENTAL_SHARED_MEMORY=0 python3 dm/ios/tools/compile_check.py 2>&1 | tee logs/ios-experiment-disabled-compile.log
+      - name: Every gfx test compiled, not run
+        run: |
+          mkdir -p logs
+          cd dm/gfx/tests
+          tests=$(sed -n 's/^\(t_[a-z0-9_]*\):.*/\1/p' Makefile | sort -u)
+          echo "$tests" | tr '\n' ' '; echo
+          make GAME="$GAME" -j3 $tests 2>&1 | tee ../../../logs/gfx-tests-build.log
+      - name: iOS host sources compiled for the iPhone SDK (no signing, no Xcode project)
+        run: python3 dm/ios/tools/compile_check.py 2>&1 | tee logs/ios-compile.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-build
+          path: logs
+          retention-days: 7
+
+  ios-build:
+    name: Unsigned iOS app (synthetic modules, Swift and link)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          persist-credentials: false
+      - name: Verify exact source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
+          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+          { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
+      - name: Install XcodeGen
+        run: command -v xcodegen || brew install xcodegen
+      - name: Build the production iOS project with synthetic inputs
+        run: |
+          mkdir -p logs
+          python3 dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke" 2>&1 | tee logs/ios-build.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-ios-build
+          path: logs
+          retention-days: 7
+
+  memory-matrix:
+    name: Startup contracts and SDK-memory ARM64 (${{ matrix.mode }})
+    runs-on: macos-26
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, address, undefined, thread]
+    env:
+      MODE: ${{ matrix.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          persist-credentials: false
+      - name: Verify exact source and native ARM64 platform
+        run: |
+          mkdir -p logs
+          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
+          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(uname -m)" = arm64
+          git show -s --format=fuller HEAD | tee logs/source.txt
+          { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
+          flags="-std=c11 -O1 -g -Wall -Wextra -Werror -pthread -I.."
+          if [ "$MODE" != normal ]; then flags="$flags -fsanitize=$MODE -fno-omit-frame-pointer"; fi
+          echo "FLAGS=$flags" >> "$GITHUB_ENV"
+          native_flags="-O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations"
+          if [ "$MODE" != normal ]; then native_flags="$native_flags -fsanitize=$MODE -fno-omit-frame-pointer"; fi
+          echo "NATIVE_FLAGS=$native_flags" >> "$GITHUB_ENV"
+      - name: Regenerate typed guest-thread descriptors with native Apple clang++
+        if: ${{ !cancelled() && matrix.mode == 'normal' }}
+        run: |
+          python3 dm/tools/generate_guest_thread_imports.py --check --cxx "$(xcrun --find clang++)" 2>&1 | tee logs/guest-thread-imports-generated.log
+      - name: Typed import binding and native C/C++ AArch64 call ABI
+        if: ${{ !cancelled() }}
+        run: |
+          extra=""
+          if [ "$MODE" != normal ]; then extra="-fsanitize=$MODE -fno-omit-frame-pointer"; fi
+          # CXX carries sanitizer flags through the final link as well as C++ compilation.
+          make -C dm/host/tests CC=clang CXX="clang++ $extra" B="build/ci-typed-$MODE" \
+            AS_FLAGS="$FLAGS" GUEST_ABI_FLAGS="-DDM_REQUIRE_AARCH64 $extra" \
+            guest-thread-abi guest-thread-imports 2>&1 | tee logs/guest-thread-typed.log
+      - name: Core and complete synthetic adapter surface
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" \
+            standard-allocator standard-allocator-adapter standard-allocator-events 2>&1 | tee logs/core-adapter.log
+      - name: Provider matrix (native/forced-16K, limited/unlimited)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            standard-allocator-provider 2>&1 | tee logs/provider.log
+      - name: Vamm matrix (page/limit, C1/C2/disabled)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            vamm 2>&1 | tee logs/vamm.log
+      - name: Actual native Vamm callbacks and SVC transaction (six-case matrix)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            vamm-native 2>&1 | tee logs/vamm-native.log
+      - name: Owned shared-memory runtime and closed production gate (six variants)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" SA_FLAGS="$FLAGS" \
+            memory-runtime 2>&1 | tee logs/memory-runtime.log
+      - name: Combined startup relocation to actual shared runtime (six variants)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            memory-runtime-startup 2>&1 | tee logs/memory-runtime-startup.log
+      - name: Bounded native experiment authorization without fixture activation
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            memory-experiment 2>&1 | tee logs/memory-experiment.log
+      - name: Whole-memory ownership transaction and production gate
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" \
+            memory-hooks 2>&1 | tee logs/memory-hooks.log
+      - name: SDK placement/domain, selective transaction, owner-only and bounded startup matrices
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" AS_FLAGS="$FLAGS" \
+            vamm-placement vamm-native-domain memory-hooks-vamm-only memory-runtime-vamm-only \
+            memory-runtime-owner-only sdk-memory-experiment 2>&1 | tee logs/sdk-memory-compatibility.log
+      - name: Actual Apple loader relocation, rollback and binding precedence
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang GAME="$GAME" B="build/ci-$MODE" \
+            MEMORY_HOOK_NATIVE_FLAGS="$NATIVE_FLAGS" memory-hooks-loader 2>&1 | tee logs/memory-hooks-loader.log
+          grep -Fq 'sealed counters (disabled), rollback and binding precedence passed' logs/memory-hooks-loader.log
+          grep -Fq 'sealed counters (enabled), rollback and binding precedence passed' logs/memory-hooks-loader.log
+          grep -Fq 'sealing an empty counter pool refuses later code generation' logs/memory-hooks-loader.log
+          cp dm/host/tests/build/ci-$MODE/memory-hooks-count*.tsv logs/
+      - name: Actual Apple SDK-only loader and unchanged original allocator bindings
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang GAME="$GAME" B="build/ci-$MODE" \
+            MEMORY_HOOK_NATIVE_FLAGS="$NATIVE_FLAGS" memory-hooks-loader-vamm-only 2>&1 | tee logs/memory-hooks-loader-vamm-only.log
+          grep -Fq 'sealed counters (disabled), rollback, Vamm precedence and original SA preservation passed' logs/memory-hooks-loader-vamm-only.log
+          grep -Fq 'sealed counters (enabled), rollback, Vamm precedence and original SA preservation passed' logs/memory-hooks-loader-vamm-only.log
+          grep -Fq 'SDK-only loader: sealing an empty counter pool refuses later code generation' logs/memory-hooks-loader-vamm-only.log
+          cp dm/host/tests/build/ci-$MODE/memory-hooks-vamm-only-count*.tsv logs/
+      - name: Native AArch64 x8 hash and x0/x1 result ABI plus disabled gates
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" \
+            standard-allocator-abi vamm-abi standard-allocator-gate vamm-gate 2>&1 | tee logs/abi-gates.log
+          ! grep -q 'SKIP:' logs/abi-gates.log
+          grep -q 'AArch64 x0/self + x8/24-byte result fixture passed' logs/abi-gates.log
+          grep -q 'AArch64 x0/self + x0/x1 resource result fixture passed' logs/abi-gates.log
+      - name: Actual guest-thread helper with production SVC ownership
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            guest-thread-stack 2>&1 | tee logs/guest-thread-stack.log
+      - name: Combined ASan and UBSan stack, Vamm, runtime and transaction targets
+        if: ${{ !cancelled() && matrix.mode == 'normal' }}
+        run: |
+          make -C dm/host/tests CC=clang B=build/ci-combined \
+            guest-thread-stack-sanitize vamm-native-sanitize memory-runtime-sanitize memory-runtime-startup-sanitize memory-hooks-sanitize guest-thread-imports-sanitize memory-experiment-sanitize standard-allocator-events-sanitize 2>&1 | tee logs/stack-native-vamm-combined.log
+      - name: Combined ASan and UBSan SDK-memory compatibility targets
+        if: ${{ !cancelled() && matrix.mode == 'normal' }}
+        run: |
+          make -C dm/host/tests CC=clang B=build/ci-sdk-combined \
+            vamm-placement-sanitize vamm-native-domain-sanitize memory-hooks-vamm-only-sanitize \
+            memory-runtime-vamm-only-sanitize memory-runtime-owner-only-sanitize sdk-memory-experiment-sanitize \
+            2>&1 | tee logs/sdk-memory-combined.log
+      - name: Exact native-Vamm, runtime and transaction TSan targets
+        if: ${{ !cancelled() && matrix.mode == 'thread' }}
+        run: |
+          make -C dm/host/tests CC=clang B=build/ci-native-tsan \
+            vamm-native-tsan memory-runtime-tsan memory-hooks-tsan guest-thread-imports-tsan standard-allocator-events-tsan 2>&1 | tee logs/native-vamm-transaction-tsan.log
+      - name: Authoritative upstream SVC and extended MapMemory full matrix
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            address-space-svc map-memory 2>&1 | tee logs/native-memory.log
+      - name: Original upstream bitmap memory, real dirty tracking, profile and heap fail-fast
+        if: ${{ !cancelled() && matrix.mode == 'normal' }}
+        run: |
+          make -C dm/host/tests CC=clang PYTHON=python3 GAME="$GAME" B=build \
+            memory memory-dirty memory-profile heap_size 2>&1 | tee logs/upstream-memory.log
+      - name: Original upstream memory TSan target
+        if: ${{ !cancelled() && matrix.mode == 'thread' }}
+        run: |
+          make -C dm/host/tests CC=clang B=build/ci-upstream-tsan \
+            memory-tsan 2>&1 | tee logs/upstream-memory-tsan.log
+      - name: Descriptor selection, synthetic construction and explicit runtime contracts
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" AS_FLAGS="$FLAGS" \
+            memory-startup-contract memory-runtime-contract 2>&1 | tee logs/memory-startup-contract.log
+          grep -Fq 'startup contracts: exact registry, malformed/order/identity rejection, raw/legacy construction, mode separation, cleanup: PASS' logs/memory-startup-contract.log
+      - name: Combined ASan and UBSan descriptor and runtime contracts
+        if: ${{ !cancelled() && matrix.mode == 'normal' }}
+        run: |
+          make -C dm/host/tests CC=clang B=build/ci-contract-combined \
+            memory-startup-contract-sanitize memory-runtime-contract-sanitize 2>&1 | tee logs/memory-contracts-combined.log
+      - name: Upload exact-head ARM64 evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: memory-startup-contract-arm64-${{ matrix.mode }}
+          path: logs
+          retention-days: 14
