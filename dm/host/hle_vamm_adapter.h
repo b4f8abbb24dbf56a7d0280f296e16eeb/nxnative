@@ -1,5 +1,5 @@
 // Complete synthetic Vamm dispatch group. No HLE registrations. Production
-// installation is hard-disabled until all modules' call/inline paths are proven.
+// installation is disabled; the separately reviewed experiment is narrowly gated.
 #pragma once
 #include "hle_vamm.h"
 #define DM_VAMM_SYMBOL_COUNT 18u
@@ -14,7 +14,10 @@ enum {
     DM_VAMM_PROOF_BEHAVIOR = 1u << 5,
     DM_VAMM_PROOF_ALL = (1u << 6) - 1
 };
+struct dm_memory_experiment_authorization;
 typedef struct {
+    // Only the bounded startup policy can issue this opaque authorization.
+    const struct dm_memory_experiment_authorization *experimental_startup;
     unsigned proofs;
     const dm_vamm_symbol *symbols; // complete original symbol census, aliases included
     size_t symbol_count;
@@ -33,7 +36,8 @@ typedef struct {
 } dm_vamm_adapter_config;
 // Prepare copies and validates the entire immutable method table, reserving one
 // startup-only lifecycle lease. It does NOT publish lookup or run guest code.
-// Production preparation is hard-disabled; proof flags are not evidence.
+// Default production preparation is disabled; proof flags are not evidence.
+// The separate bounded experiment requires its live opaque startup permit.
 // Hooks obtained from a prepared table are for relocation only: calling one
 // before publish aborts, including original-forwarding/constructor paths.
 typedef struct dm_vamm_adapter_prepared dm_vamm_adapter_prepared;
@@ -44,7 +48,7 @@ dm_vamm_guest_fn dm_vamm_adapter_prepared_hook(const dm_vamm_adapter_prepared *p
 // reuse of a consumed lease. Never restore SDK methods after publication.
 void dm_vamm_adapter_publish(dm_vamm_adapter_prepared *prepared);
 void dm_vamm_adapter_cancel(dm_vamm_adapter_prepared *prepared);
-// Fixture convenience only. Production always rejects; loader uses prepare,
+// Fixture convenience only. Production always rejects without a live experimental permit; loader uses prepare,
 // journals actual relocations, then publishes. No asserted binding masks.
 uint32_t dm_vamm_adapter_install(const dm_vamm_adapter_config *config);
 const char *dm_vamm_adapter_symbol_name(size_t index);

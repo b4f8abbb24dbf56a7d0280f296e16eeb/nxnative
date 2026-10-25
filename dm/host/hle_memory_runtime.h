@@ -17,7 +17,8 @@ dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_region
 // Fill fresh adapter settings with this runtime's explicit shared owner,
 // lifetime callbacks, lazy config factory and the existing host alignment shim.
 // Census/proofs/transaction evidence are intentionally zero. The caller fills
-// them independently; production adapter preparation remains hard-disabled.
+// them independently; default production adapter preparation stays disabled.
+// The bounded experiment supplies a startup-only authorization, not proof bits.
 // Keep context and all lifetime/factory/policy fields unchanged. The runtime
 // must outlive both prepared/active adapter tables and every successful config.
 dm_sa_result dm_memory_runtime_configs(dm_memory_runtime *runtime,

@@ -4,6 +4,10 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
+// Kept independent of dm.h so portable adapter fixtures need no game profile.
+extern int dm_memory_experiment_authorized(const struct dm_memory_experiment_authorization *, const void *);
+#endif
 
 _Static_assert(sizeof(dm_sa_hash) == 24, "Hash is an AArch64 indirect x8 result");
 _Static_assert(sizeof(size_t) == 8, "StandardAllocator ABI requires 64-bit size_t");
@@ -42,7 +46,7 @@ typedef struct instance {
     dm_sa_allocator *allocator;
     dm_sa_config configuration;
     unsigned users;
-    uint64_t generation;
+    uint64_t generation, diagnostic_failures;
     int initializing, finalizing;
     struct instance *next;
 } instance;
@@ -89,6 +93,33 @@ static void drop(instance *i) {
     pthread_mutex_lock(&mutex);
     if (!--i->users) pthread_cond_broadcast(&idle);
     pthread_mutex_unlock(&mutex);
+}
+// Snapshot while an in-flight reference or exclusive lifecycle protects the
+// core, then notify only after releasing it. Never touch the instance in notify.
+static dm_sa_adapter_event event_snapshot(instance *i, dm_sa_allocator *allocator,
+                                          dm_sa_adapter_event_kind kind,
+                                          dm_sa_result result, size_t size, size_t alignment) {
+    dm_sa_adapter_event event = {.kind = kind, .self = i->self,
+        .generation = i->generation, .requested_size = size, .alignment = alignment,
+        .result = result, .stats_result = DM_SA_CLOSED};
+    if (allocator) event.stats_result = dm_sa_get_stats(allocator, &event.stats);
+    return event;
+}
+static int failure_snapshot(instance *i, dm_sa_adapter_event_kind kind,
+                            dm_sa_result result, size_t size, size_t alignment,
+                            dm_sa_adapter_event *out) {
+    if (!settings.event || result == DM_SA_OK) return 0;
+    pthread_mutex_lock(&mutex);
+    uint64_t count = i->diagnostic_failures;
+    if (count != UINT64_MAX) count = ++i->diagnostic_failures;
+    pthread_mutex_unlock(&mutex);
+    if (count > 4 && (count & (count - 1))) return 0;
+    *out = event_snapshot(i, i->allocator, kind, result, size, alignment);
+    out->failure_count = count;
+    return 1;
+}
+static void event_notify(const dm_sa_adapter_event *event) {
+    settings.event(settings.context, event);
 }
 int dm_sa_adapter_is_managed(const void *self) {
     if (!atomic_load_explicit(&active, memory_order_acquire)) return 0;
@@ -144,6 +175,7 @@ static void initialize(void *self, void *buffer, size_t capacity, unsigned cache
     i->self = self;
     i->initializing = 1;
     i->generation = ++next_generation;
+    i->diagnostic_failures = 0;
     if (fresh) { i->next = instances; instances = i; }
     pthread_mutex_unlock(&mutex);
     // Factory/provider creation may call other allocator instances. Publish an
@@ -159,6 +191,9 @@ static void initialize(void *self, void *buffer, size_t capacity, unsigned cache
     if (r == DM_SA_OK) r = dm_sa_create(&allocator, &config);
     if (r != DM_SA_OK && configured && settings.release_config)
         settings.release_config(settings.context, self, &config);
+    dm_sa_adapter_event event;
+    int notify = settings.event && r == DM_SA_OK;
+    if (notify) event = event_snapshot(i, allocator, DM_SA_EVENT_INITIALIZED, r, capacity, 0);
     pthread_mutex_lock(&mutex);
     i->initializing = 0;
     if (r == DM_SA_OK) {
@@ -175,6 +210,7 @@ static void initialize(void *self, void *buffer, size_t capacity, unsigned cache
     // failed first initialization removes its provisional ownership record.
     pthread_mutex_unlock(&mutex);
     if (r != DM_SA_OK) fail("Initialize", r);
+    if (notify) event_notify(&event);
 }
 static void ctor1(void *self) { forget_finalized(self); ORIGINAL(CTOR1, void (*)(void *))(self); }
 static void ctor2(void *self) { forget_finalized(self); ORIGINAL(CTOR2, void (*)(void *))(self); }
@@ -207,12 +243,19 @@ static void finalize(void *self) {
     while (i->users) pthread_cond_wait(&idle, &mutex);
     pthread_mutex_unlock(&mutex);
     dm_sa_result r = dm_sa_destroy(i->allocator);
+    dm_sa_adapter_event event;
+    int notify = settings.event != NULL;
+    // On success the core is already gone. On failure finalizing still guards
+    // its retained ownership, so a best-effort snapshot is safe before unlock.
+    if (notify) event = event_snapshot(i, r == DM_SA_OK ? NULL : i->allocator,
+        DM_SA_EVENT_FINALIZED, r, i->configuration.capacity, 0);
     if (r == DM_SA_OK && settings.release_config)
         settings.release_config(settings.context, self, &i->configuration);
     pthread_mutex_lock(&mutex);
     if (r == DM_SA_OK) { i->allocator = NULL; memset(&i->configuration, 0, sizeof i->configuration); ((unsigned char *)self)[0] = 0; }
     i->finalizing = 0;
     pthread_mutex_unlock(&mutex);
+    if (notify) event_notify(&event);
     if (r != DM_SA_OK) fail("Finalize", r);
     // Keep an ownership tombstone until explicit constructor/reinitialization.
     // A stale method cannot suddenly reach an uninitialized SDK CentralHeap.
@@ -228,7 +271,10 @@ static void *managed_allocate(instance *i, size_t size, size_t alignment) {
     if (!size) { drop(i); return NULL; }
     if (size <= INT64_MAX && alignment && alignment <= INT64_MAX && !(alignment & (alignment - 1)))
         r = dm_sa_allocate(i->allocator, size, alignment < 16 ? 16 : alignment, &out);
+    dm_sa_adapter_event event;
+    int notify = failure_snapshot(i, DM_SA_EVENT_ALLOCATE_FAILED, r, size, alignment, &event);
     drop(i);
+    if (notify) event_notify(&event);
     if (r != DM_SA_OK) return NULL;
     return out;
 }
@@ -261,7 +307,10 @@ static void *reallocate(void *self, void *pointer, size_t size) {
     if (!i) return ORIGINAL(REALLOCATE, void *(*)(void *, void *, size_t))(self,pointer,size);
     void *out = NULL;
     dm_sa_result r = !pointer && !size ? DM_SA_OK : size <= INT64_MAX ? dm_sa_reallocate(i->allocator, pointer, size, &out) : DM_SA_INVALID;
+    dm_sa_adapter_event event;
+    int notify = failure_snapshot(i, DM_SA_EVENT_REALLOCATE_FAILED, r, size, 0, &event);
     drop(i);
+    if (notify) event_notify(&event);
     return r == DM_SA_OK ? out : NULL;
 }
 static size_t shrink(void *self, void *pointer, size_t size) {
@@ -323,6 +372,9 @@ static int collect(void *pointer, size_t size, void *context) {
 static int walk(const void *self, dm_sa_walk_fn callback, void *context) {
     instance *i = take(self, "WalkAllocatedBlocks");
     if (!i) return ORIGINAL(WALK, int (*)(const void *, dm_sa_walk_fn, void *))(self,callback,context);
+    if (settings.reject_managed_walk) {
+        drop(i); fail("WalkAllocatedBlocks is outside the reviewed experiment closure", DM_SA_INVALID);
+    }
     if (!callback) { drop(i); return 22; }
     snapshot s = {0};
     uint64_t generation = i->generation;
@@ -392,11 +444,18 @@ dm_sa_guest_fn dm_sa_adapter_lookup(const char *name) {
 dm_sa_result dm_sa_adapter_prepare(const dm_sa_adapter_config *config, dm_sa_adapter_prepared **out) {
     if (!out) return DM_SA_INVALID;
     *out = NULL;
-#ifndef DM_SA_ADAPTER_TESTING
+#if !defined(DM_SA_ADAPTER_TESTING) && (!defined(DM_EXPERIMENTAL_SHARED_MEMORY) || !DM_EXPERIMENTAL_SHARED_MEMORY)
     (void)config;
     return DM_SA_INVALID; // No global production activation on incomplete evidence.
 #else
-    if (!config || config->proofs != DM_SA_PROOF_ALL || !config->make_config || !config->forward_allocate || !config->allocation_alignment ||
+    int authorized = 0;
+#ifdef DM_SA_ADAPTER_TESTING
+    authorized = config && config->proofs == DM_SA_PROOF_ALL;
+#endif
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
+    authorized = config && !config->proofs && dm_memory_experiment_authorized(config->experimental_startup, config->context) && config->reject_managed_walk;
+#endif
+    if (!authorized || !config->make_config || !config->forward_allocate || !config->allocation_alignment ||
         !config->symbols || config->symbol_count != DM_SA_ADAPTER_SYMBOL_COUNT ||
         (!!config->retain_context != !!config->release_context)) return DM_SA_INVALID;
     for (size_t h = 0; h < DM_SA_ADAPTER_SYMBOL_COUNT; h++)
@@ -457,6 +516,9 @@ void dm_sa_adapter_cancel(dm_sa_adapter_prepared *p) {
 }
 dm_sa_result dm_sa_adapter_shutdown(void) {
     pthread_mutex_lock(&mutex);
+    // The bounded native policy has no stopped-guest teardown boundary. Its
+    // opaque authorization persists in the immutable table until process exit.
+    if (settings.experimental_startup) { pthread_mutex_unlock(&mutex); return DM_SA_BUSY; }
     if (!atomic_load_explicit(&active, memory_order_relaxed) || atomic_load_explicit(&stopped, memory_order_relaxed)) {
         pthread_mutex_unlock(&mutex); return DM_SA_INVALID;
     }

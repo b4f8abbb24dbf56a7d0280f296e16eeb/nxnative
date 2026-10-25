@@ -3575,7 +3575,7 @@ static void tex_mis_note(NvShader *sh, int stage, int slot, int tid, id<MTLTextu
 }
 // Alpha from red: the fragment shaders the game profile's alpha_from_red lists read a single-channel render target whose channel mapping is exactly (R, 0, 0, 1) as (R, 0, 0, R).
 // A workaround for NintendoWare layout captures (BotW, Odyssey): the game rebuilds each capture on the same storage with its own mapping ((1, 1, 1, R) for an A8 capture), which was lost while
-// nvnTextureCompare ignored the mapping and left the creation-time (R, 0, 0, 1), alpha always 1 (hard-edged prompt boxes, white coin cards). Since that fix it no longer fires (docs/agents/04-graphics.md).
+// nvnTextureCompare ignored the mapping and left the creation-time (R, 0, 0, 1), alpha always 1 (hard-edged prompt boxes, white coin cards). Since that fix it no longer fires (docs/reference/rendering.md, "`nvnTextureCompare` compares the channel mapping").
 // Only render targets qualify (captures always are; asset and CPU-written textures are not). DM_NVN_ALPHA_RED=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
 static char g_afr_keys[48][20]; static int g_afr_nk = -1;
 static int afr_want(NvShader *sh) {

@@ -1,4 +1,4 @@
-# Startup memory-hook transaction (production disabled)
+# Startup memory-hook transaction (default production disabled)
 
 This removes the circular requirement to claim installed bindings before an
 adapter exposes hook addresses. It does **not** remove patches, enable a profile,
@@ -34,8 +34,10 @@ change permissions, invent offsets, or accept a caller-supplied installed mask.
    execution. Tests inject a failure at this last prepublication point and verify
    reverse-order restoration of every original slot, with both adapters inactive.
 6. Once published, ownership cannot be rolled back to the SDK. Late NRO load or
-   unload is explicitly refused. Both adapters' production preparation gates
-   remain unconditional failures, and no production caller installs the group.
+   unload is explicitly refused. Default production preparation remains disabled.
+   The separate [bounded experiment](bounded-shared-memory-experiment.md) uses
+   explicit build/runtime opt-in and exact reviewed identities; proof flags alone
+   cannot authorize native startup.
 
 The coordinator is exclusive startup code, not a concurrent patching primitive.
 Prepared lease pointers are private to that transaction and are consumed by

@@ -10,6 +10,7 @@
 #include <mach-o/ldsyms.h>
 #include "hle.h"
 #include "hle_memory_hooks.h"
+#include "hle_memory_experiment.h"
 
 module_t g_mod[MAX_MOD];
 int g_nmod;
@@ -181,8 +182,25 @@ static void read_layout(module_t *m, const char *dir) {
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[32]; unsigned long v; unsigned seen = 0;
+    int seen_full_build = 0;
+    m->build_id[0] = m->full_build_id[0] = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
+        if (sscanf(line, "# %31s", key) != 1) die("%s: invalid rewriter header", path);
+        if (!strcmp(key, "BUILD_ID_FULL")) {
+            char id[66], extra;
+            // Reject overlong tokens, extra fields, uppercase/non-hex digits,
+            // and duplicates: an exact identity must never be truncated.
+            if (seen_full_build++ || sscanf(line, "# %*s %65s %c", id, &extra) != 1 ||
+                strlen(id) != 64 || strspn(id, "0123456789abcdef") != 64)
+                die("%s: invalid or duplicate BUILD_ID_FULL", path);
+            memcpy(m->full_build_id, id, sizeof m->full_build_id);
+            continue;
+        }
+        if (!strcmp(key, "BUILD_ID")) {
+            sscanf(line, "# %*s %32s", m->build_id);
+            continue;
+        }
+        if (sscanf(line, "# %*s %lx", &v) != 1) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
@@ -192,7 +210,6 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
-        else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
         else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
             if (!strncmp(key, "KEY_", 4) && !strncmp(key + 4, kn[k], n) && !strcmp(key + 4 + n, "_IDX")) {
@@ -201,6 +218,8 @@ static void read_layout(module_t *m, const char *dir) {
         }
     }
     fclose(f);
+    if (seen_full_build && (strlen(m->build_id) != 32 || strncmp(m->build_id, m->full_build_id, 32)))
+        die("%s: BUILD_ID and BUILD_ID_FULL disagree", path);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
@@ -568,6 +587,10 @@ static void map_image(module_t *m, const char *dir) {
 #endif
 
 void load_modules(const char *dir, const char **names, int n) {
+    static int started;
+    if (started || g_nmod || g_nloaded) die("module startup/restart is unsupported; start a new host process");
+    if (!names || n <= 0 || n > MAX_MOD) die("invalid initial module set");
+    started = 1;
     // Map everything and parse the symbol tables first, then relocate all at once (cross-module symbols must all be in place first)
     // DM_BOOTPROF: breakdown of ① host loading (milliseconds), to set the upper bound for ③ pre-relocation / mmap
     uint64_t t0 = now_ns(), tm = 0, tp = 0, tg = 0, tr = 0, t;
@@ -591,6 +614,9 @@ void load_modules(const char *dir, const char **names, int n) {
     force_check();
     preload_nros(dir);   // mapped now, relocated when the game loads them (hle_ro.c)
     if (!dm_memory_hooks_open_startup()) die("memory-hook startup window already used");
+    const char *experiment_failure = NULL;
+    if (dm_memory_experiment_startup(getenv("DM_EXPERIMENTAL_SHARED_MEMORY"), &experiment_failure) < 0)
+        die("[RED] experimental shared memory: %s", experiment_failure);
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK: %lu symbol lookups at load time, hash and linear disagree %lu", g_symchk_n, g_symchk_bad);
     if (g_flag.bootprof) LOG("① breakdown: mapping (read + copy + seal pages) %.1f ms, dynamic section parsing %.1f ms, gate registration %.1f ms, relocation + forced takeover %.1f ms, total %.1f ms",

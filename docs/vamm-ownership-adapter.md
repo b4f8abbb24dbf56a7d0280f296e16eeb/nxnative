@@ -1,7 +1,9 @@
 # Experimental Vamm ownership boundary
 
-**Private prototype; production installation is hard-disabled.** No game or SDK
-patch is removed, no guest binary is executed, and no live handoff is claimed.
+**Experimental integration; default production installation is disabled.**
+The separate [bounded native experiment](bounded-shared-memory-experiment.md)
+requires build/runtime opt-in and exact reviewed full identities. No game or SDK
+patch is removed; synthetic tests do not claim real-game handoff validation.
 This is a complementary boundary to the [StandardAllocator adapter](standard-allocator-adapter.md),
 not a replacement for the evidence required to activate either one.
 
@@ -144,15 +146,16 @@ The only original operation invoked after a synthetic handoff is the verified
 non-owning bootstrap constructor. The SDK tree initializer is never invoked.
 A mismatched detail object is fatal, never a fallback to another owner.
 
-Production preparation unconditionally rejects activation even if all proof flags
-are supplied. Only `DM_VAMM_ADAPTER_TESTING` enables synthetic preparation. There
+Default production preparation rejects activation even if all proof flags
+are supplied. `DM_VAMM_ADAPTER_TESTING` enables synthetic preparation; the bounded
+native experiment requires a separate opaque startup authorization. There
 are no new `HLE`/`HLE_FORCE` registrations. The old asserted binding mask is removed:
 the [bounded loader transaction](memory-hook-transaction.md) derives its actual
 census and journal from the mapped modules, replaces both complete groups before
 guest execution, and retains original slot values on failure. It rejects NROs,
 late installation, duplicate owners and unsupported relocation shapes. It does
 not prove the absence of private/direct/inline accesses or a prior owner, and no
-production startup path supplies an installation configuration. Shutdown keeps
+default production startup path supplies an installation configuration. Shutdown keeps
 the group intercepted: it cannot restore an SDK owner into previously host-owned
 memory.
 

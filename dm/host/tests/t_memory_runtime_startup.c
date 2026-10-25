@@ -214,7 +214,10 @@ static void stopped_slots(void) {
     }
 }
 #endif
-int main(void) {
+#ifndef MEMORY_STARTUP_MAIN
+#define MEMORY_STARTUP_MAIN main
+#endif
+int MEMORY_STARTUP_MAIN(void) {
     struct rlimit limit = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &limit));
     startup_images_create(); startup_create();
     assert(dm_memory_hooks_open_startup());

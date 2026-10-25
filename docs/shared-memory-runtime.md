@@ -2,8 +2,9 @@
 
 `dm/host/hle_memory_runtime.[ch]` connects the native Vamm reservation owner,
 the exact-lease StandardAllocator provider, both adapter tables, and the real
-upstream bitmap-backed SVC transaction. It is **not enabled for guest execution**: production adapter
-preparation still rejects every installation, including complete proof masks.
+upstream bitmap-backed SVC transaction. Default production adapter preparation **remains disabled**, including complete
+proof masks. A separate [bounded native experiment](bounded-shared-memory-experiment.md)
+requires both build/runtime opt-in and the exact reviewed full main+SDK identities.
 No SDK/game patch, profile, private structure offset or game binary is changed.
 
 ## One explicit owner, one lifetime
@@ -37,7 +38,9 @@ ownership. It refuses table pins, factory registrations (including zero-backing
 cores), provider leases and native reservations. A returning decommit rejection,
 such as a borrowed MapMemory source, cannot destroy the provider or forget its
 owner. Host protection failure instead follows upstream's fatal policy.
-The caller drains cores, shuts down both adapters, then destroys the runtime.
+Synthetic/exclusive-lifecycle callers drain cores, shut down both adapters, then
+destroy the runtime. The bounded native experiment does not have that teardown
+boundary: it retains ownership until process exit and refuses adapter shutdown.
 An initialization/census/relocation failure before publication instead cancels
 both prepared tables before destruction.
 

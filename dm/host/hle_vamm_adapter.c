@@ -3,6 +3,10 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
+// Kept independent of dm.h so portable adapter fixtures need no game profile.
+extern int dm_memory_experiment_authorized(const struct dm_memory_experiment_authorization *, const void *);
+#endif
 
 _Static_assert(sizeof(uintptr_t) == 8 && sizeof(size_t) == 8, "64-bit Vamm ABI");
 _Static_assert(sizeof(dm_vamm_resource_usage) == 16, "ResourceUsage result in x0/x1");
@@ -113,10 +117,17 @@ dm_vamm_guest_fn dm_vamm_adapter_lookup(const char *name) {
 uint32_t dm_vamm_adapter_prepare(const dm_vamm_adapter_config *c, dm_vamm_adapter_prepared **out) {
     if (!out) return DM_VAMM_INVALID;
     *out = NULL;
-#ifndef DM_VAMM_ADAPTER_TESTING
+#if !defined(DM_VAMM_ADAPTER_TESTING) && (!defined(DM_EXPERIMENTAL_SHARED_MEMORY) || !DM_EXPERIMENTAL_SHARED_MEMORY)
     (void)c; return DM_VAMM_INVALID;
 #else
-    if (!c || c->proofs != DM_VAMM_PROOF_ALL ||
+    int authorized = 0;
+#ifdef DM_VAMM_ADAPTER_TESTING
+    authorized = c && c->proofs == DM_VAMM_PROOF_ALL;
+#endif
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
+    authorized = c && !c->proofs && dm_memory_experiment_authorized(c->experimental_startup, c->context) && c->shared_owner;
+#endif
+    if (!authorized ||
         !c->symbols || c->symbol_count != DM_VAMM_SYMBOL_COUNT ||
         (!!c->shared_owner != !!c->retain_owner) || (!!c->shared_owner != !!c->release_owner)) return DM_VAMM_INVALID;
     dm_vamm_guest_fn captured[DM_VAMM_SYMBOL_COUNT] = {0};
@@ -187,6 +198,7 @@ uint32_t dm_vamm_adapter_install(const dm_vamm_adapter_config *c) {
 }
 uint32_t dm_vamm_adapter_shutdown(void) {
     pthread_mutex_lock(&lifecycle);
+    if (settings.experimental_startup) { pthread_mutex_unlock(&lifecycle); return DM_VAMM_INVALID; }
     uint32_t result = DM_VAMM_INVALID;
     dm_vamm *released = NULL;
     if (owner && !constructing) {

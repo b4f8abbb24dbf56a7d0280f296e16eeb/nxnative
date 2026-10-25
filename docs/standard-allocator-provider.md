@@ -1,6 +1,6 @@
 # Existing-owner StandardAllocator span provider
 
-`hle_standard_allocator_provider.c` is a testable owner-integration slice, **not an enabled replacement**. The production StandardAllocator adapter gate remains closed. All existing SDK/game cuts and reservation-ownership safeguards remain intact.
+`hle_standard_allocator_provider.c` is a testable owner-integration slice, **not a default-enabled replacement**. The default StandardAllocator adapter gate remains closed; the [bounded experiment](bounded-shared-memory-experiment.md) is a separate explicit startup opt-in. All existing SDK/game cuts and reservation-ownership safeguards remain intact.
 
 ## Ownership and callback contract
 

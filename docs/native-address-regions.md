@@ -9,7 +9,9 @@ production. Profiles, application-pool policy and existing patches are unchanged
 
 ## Rebase boundary
 
-This integration is based on upstream `b7dfba4` (2026-10-25), including `cae5ec2`
+This integration is rebased onto upstream `cdd5619` (2026-10-25), retaining its
+per-game notes, subsystem references and documentation checks. Its native memory
+baseline includes `cae5ec2`
 ("Keep guest memory queries, budgets and stack ownership consistent"). Those
 upstream fixes are retained, not reintroduced as a competing implementation:
 
@@ -52,9 +54,10 @@ Ordinary SVC policy and the SDK's ownership remain unchanged.
 [shared-memory runtime](shared-memory-runtime.md) connects that explicit owner,
 the provider and retained adapter lifetimes; the
 [startup hook transaction](memory-hook-transaction.md) journals complete method
-groups before guest execution. Both production adapter gates remain closed.
-No production startup path installs them, and no SDK node-area/alignment or
-per-game arena cut is removed.
+groups before guest execution. Default production adapter gates remain closed.
+A separate [bounded experiment](bounded-shared-memory-experiment.md) requires
+build/runtime opt-in and exact reviewed full main+SDK identities. No SDK
+node-area/alignment or per-game arena cut is removed.
 
 The host guest-thread helper retains upstream's matched guest malloc/free
 ownership and frees only after SDK Wait + Destroy/copyback. Additional lifecycle

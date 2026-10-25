@@ -597,7 +597,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
         notes.append('no BNSH / BAHS at the top level: the shaders are inside compressed or other containers or in main, and must be located first')
     major = {v.split('_')[0] for v in F['sdkver']}
     if not major: notes.append('no SDK version string found')
-    elif major != {'16'}: notes.append(f'SDK {"/".join(sorted(major))}, not Mario\'s 16: NVN object sizes, API version and service layouts differ by SDK (the host was converted from D2R\'s SDK 12 to SDK 16 sizes); check them one by one per docs/agents/03')
+    elif major != {'16'}: notes.append(f'SDK {"/".join(sorted(major))}, not Mario\'s 16: NVN object sizes, API version and service layouts differ by SDK (the host was converted from D2R\'s SDK 12 to SDK 16 sizes); check them one by one per docs/reference/nvn-objects.md')
     if any(l.split()[:1] == ['nn::ro'] for l in R):
         nro, nrr = rom['exts']['.nro'], rom['exts']['.nrr']
         # NRR files register NROs by hash; with none loose the NROs are inside an archive (Super Smash Bros. Ultimate: 14 NRRs, 98 NROs in data.arc, whose exports main imports)
@@ -607,7 +607,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     R += ['', '## What it means for a port', ''] + [f'- {n}' for n in notes or ['—']]
     R += ['', '## Provisional profile keys (dm/games/profile_guess.py)', '', 'What the game files decide; mem_used follows the rewrite, and a game with virtual address memory that sets a heap gets a heap check on the Mac (scripts/build_ipa_from_nsp.py heap_check).', '', '```']
     R += [f'{k}\t{v}' + (f'\t# {why}' if why else '') for k, (v, why) in G.items()] + ['```']
-    R += ['', 'Next steps: docs/agents (02 survey, 03 bring-up).']
+    R += ['', 'Next steps: docs/agents (02 survey, 03 bring-up, symptoms.md for each failure).']
     (work / 'survey.md').write_text('\n'.join(R) + '\n')
     for n in notes: say(n)
     say(f'survey report: {work / "survey.md"}')

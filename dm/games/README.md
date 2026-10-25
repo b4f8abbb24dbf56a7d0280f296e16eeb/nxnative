@@ -9,6 +9,7 @@ Each game the port knows has a folder `dm/games/<id>/`, named after the base gam
 - **`vk_capture.tsv`** (a Vulkan game that generates its shaders at run time, Super Mario Galaxy): the keys of the SPIR-V modules it generates.
 - **`gl_capture.tsv`** (an OpenGL game that puts its GLSL together at run time, Balatro): the files (`<key>.vert` / `<key>.frag`) of the shaders it compiles.
 - **`bf_want.tsv`**.
+- **`README.md`**: the game's notes: what its profile needs and why, what was found on it, how to reach a scene on the Mac, what is still open. Listed in [Games](#games).
 - **`patches.py`** (optional): the rewriter's patches of the game's own builds (`main`), keyed by NSO build ID: `CUTS` (byte cuts, each original asserted), `OBS` (observation gates) and `FRAME_STEP` (frame-step stubs). `dm/tools/patch_nso.py` loads every profile's file and applies those of a module's build, wherever it comes from; a build claimed twice stops the rewrite. Cuts of Nintendo's `sdk` modules, which several games ship, are in `dm/tools/sdk_patches.py`. A game without patches has no file, and a derived profile never has one. `dm/tools/tests/test_patches.py` checks that a file names only its own profile's builds.
 
 The chain version is not in the profile: one version serves every game (`dm/gfx/nvn/dmsh_chain.h`, written by `dmsh_chain.py --header`). Two more tables live in the profile folder but are not committed (git ignores them). A full `dmsh_build.py` run makes both from its Mac outputs, so each checkout makes its own, and stamps its libraries with the digest of the profile's inputs (`b-<V>/inputs.tsv`, `dmsh_chain.py --inputs`). The host takes a table only when its header names its library's chain version and that digest.
@@ -29,6 +30,73 @@ None of them has a default game: without one they stop and list the profiles. To
 - `python3 dm/games/game.py <id> <key>` prints one key.
 
 **Launcher settings.** `settings.tsv` lists the player-facing settings once (the environment variable each sets, its kind, default and the condition under which a game offers it; its header describes the columns). `build_ipa.sh` runs `settings.py <id> <rewritten modules> <control.nacp> <out.json>`, which keeps the rows that hold for the game: a profile macro (`DM_GAME_FPS_TARGET!=0`), a key in `main`'s rewriter table (`RENDER_SCALE`, written by `patch_nso.py` for the builds with a render-scale stub), the game's languages. It writes them into the app as `dm/launcher.json`, from which the iOS launcher (`dm/ios/Sources/Launcher.swift`) draws its screen. A new player setting is one row; diagnostic switches stay environment-only.
+
+## Games
+
+One row per profile; the notes are each profile's `README.md`.
+
+| Game | Title ID | Build | SDK | Engine | Graphics |
+|---|---|---|---|---|---|
+| [13 Sentinels: Aegis Rim](01003FC01670C000/README.md) | `01003FC01670C000` | 1.10 | 11.4.3 | Vanillaware's engine | NVN |
+| [Absolum](0100A83022A22000/README.md) | `0100A83022A22000` | 1.1.1 | 18.3.2 | FNA / .NET NativeAOT (FNA3D's NVN driver) | NVN |
+| [Ace Attorney Investigations Collection](010005501E68C000/README.md) | `010005501E68C000` | 1.0.0.2 | 17.5.3 | Unity 2022.3.17f1 IL2CPP | NVN |
+| [Advance Wars 1+2: Re-Boot Camp](0100300012F2A000/README.md) | `0100300012F2A000` | 1.0.0 (base) | 10.4.1 | Unity 2020.2.1f3 IL2CPP | NVN |
+| [AI: THE SOMNIUM FILES](010089B00D09C000/README.md) | `010089B00D09C000` | 1.0.1 | 6.4.2 | Unity 2017.4.17f1 IL2CPP | NVN |
+| [AI: THE SOMNIUM FILES - nirvanA Initiative](0100713016CCC000/README.md) | `0100713016CCC000` | 1.0.2 | 13.3.5 | Unity 2020.3.30f1 IL2CPP | NVN |
+| [ANIMAL WELL](010020D01AD24000/README.md) | `010020D01AD24000` | 1.0.10 | 20.5.7 | its own (not named) | NVN |
+| [Animal Crossing: New Horizons](01006F8002326000/README.md) | `01006F8002326000` | 3.0.3 | 20.5.4 | Nintendo EPD (sead / agl / gsys) | NVN |
+| [BALL x PIT](010086A022444000/README.md) | `010086A022444000` | 1.293 | 20.5.19 | Unity 6000.0.62f1 IL2CPP | NVN |
+| [Balatro](0100CD801CE5E000/README.md) | `0100CD801CE5E000` | 1.1.3 | 18.3.2 | LÖVE 11.4 (love-nx, LuaJIT, SDL) | OpenGL |
+| [Bayonetta](010076F0049A2000/README.md) | `010076F0049A2000` | 1.1 | 3.6.0 | PlatinumGames' engine (Wii U form) | NVN |
+| [Bayonetta 2](01007960049A0000/README.md) | `01007960049A0000` | 1.2 | 3.6.0 | PlatinumGames' engine (Wii U form) | NVN |
+| [Bayonetta 3](01004A4010FEA000/README.md) | `01004A4010FEA000` | 1.2.0 | 13.3.2 | PlatinumGames' engine | NVN |
+| [Big Brain Academy: Brain vs. Brain](0100620012D6E000/README.md) | `0100620012D6E000` | 1.2.0 | 11.4.3 | NintendoWare Bezel Engine 1.56 | NVN |
+| [Brain Memory Training Academy](0100F5D01DA3A000/README.md) | `0100F5D01DA3A000` | 1.0.0 (base) | 16.2.4 | Unity 2022.3.5f1 IL2CPP | NVN |
+| [Captain Toad: Treasure Tracker](01009BF0072D4000/README.md) | `01009BF0072D4000` | 1.4.2 | 8.2.0 | Nintendo EPD Tokyo (`al` over sead / agl) | NVN |
+| [Catherine: Full Body](0100BF00112C0000/README.md) | `0100BF00112C0000` | 1.0.1a | 8.2.1 | Atlus GFD (CRI middleware) | NVN |
+| [Celeste](01002B30028F6000/README.md) | `01002B30028F6000` | 1.4.1.1 | 15.3.2 | MonoGame (C# → C++ by BRUTE) | NVN |
+| [Cuphead](0100A5C00D162000/README.md) | `0100A5C00D162000` | 1.3.7 | 5.5.0 | Unity 2017.4.9f1 IL2CPP | NVN |
+| [DARK SOULS: REMASTERED](01004AB00A260000/README.md) | `01004AB00A260000` | 1.0.3 | 4.5.0 | FromSoftware's engine | NVN |
+| [Digimon Story Cyber Sleuth: Complete Edition](010014E00DB56000/README.md) | `010014E00DB56000` | 1.0.3 | 6.4.0 | Media.Vision MVGL | OpenGL |
+| [DRAGON QUEST VII Reimagined](0100A9D01C446000/README.md) | `0100A9D01C446000` | 1.2.0 | 19.3.1 | Unreal Engine 4.27 | NVN |
+| [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](01006C300E9F0000/README.md) | `01006C300E9F0000` | 1.0.4 | 7.3.2 | Unreal Engine 4.18 | NVN |
+| [FINAL FANTASY RESONANCE](0100606026F12000/README.md) | `0100606026F12000` | 1.0.1 | 20.5.17 | Unreal Engine 5.6.1 | NVN |
+| [FINAL FANTASY TACTICS - The Ivalice Chronicles](010038B015560000/README.md) | `010038B015560000` | 1.4.0 | 19.3.9 | Square Enix's engine | NVN |
+| [Fire Emblem Engage](0100A6301214E000/README.md) | `0100A6301214E000` | 2.0.0 | 12.3.7 | Unity 2020.3.18f1 IL2CPP, Wwise | NVN |
+| [Fire Emblem: Three Houses](010055D009F78000/README.md) | `010055D009F78000` | 1.2.0 | 6.5.0 | Koei Tecmo's KTGL | NVN |
+| [Hades](0100535012974000/README.md) | `0100535012974000` | 1.0.38233 | 9.3.0 | Supergiant Games' engine (The Forge) | Vulkan |
+| [Hades II](0100A00019DE0000/README.md) | `0100A00019DE0000` | base game | 19.3.9 | Supergiant Games' engine | NVN |
+| [Hollow Knight: Silksong](010013C00E930000/README.md) | `010013C00E930000` | 1.0.30000 | 20.5.8 | Unity 6000.0.50f1 IL2CPP | NVN |
+| [Hyrule Warriors: Age of Calamity](01002B00111A2000/README.md) | `01002B00111A2000` | 1.3.0 | 9.6.0 | Koei Tecmo's KTGL | NVN |
+| [Luigi's Mansion 3](0100DCA0064A6000/README.md) | `0100DCA0064A6000` | 1.4.0 | 7.3.2 | Next Level Games' engine | NVN |
+| [Mario Kart 8 Deluxe](0100152000022000/README.md) | `0100152000022000` | 4.0.0 | 4.4.0 | Nintendo (sead / agl / gsys, NintendoWare, Pia) | NVN |
+| [Mario vs. Donkey Kong](0100B99019412000/README.md) | `0100B99019412000` | 1.0.1 (cartridge base) | 15.3.0 | Nintendo (sead / agl / gsys) | NVN |
+| [Metroid Dread](010093801237C000/README.md) | `010093801237C000` | 2.1.0 | 11.4.3 | MercurySteam's engine | NVN |
+| [Monster Hunter Rise](0100B04011742000/README.md) | `0100B04011742000` | 16.0.2 | 11.4.3 | Capcom's RE Engine | NVN |
+| [Monster Train 2](010051701FB46000/README.md) | `010051701FB46000` | 1.1.1 | 18.3.5 | Unity 2022.3.54f1 IL2CPP | NVN |
+| [Octopath Traveler 0](01005270232F2000/README.md) | `01005270232F2000` | 1.0.5 | 19.3.13 | Unreal Engine 5 | NVN |
+| [Paper Mario: The Thousand-Year Door](0100ECD018EBE000/README.md) | `0100ECD018EBE000` | 1.0.1 | 15.3.2 | Intelligent Systems' engine on NintendoWare | NVN |
+| [Patrick's Parabox](0100E44016C22000/README.md) | `0100E44016C22000` | 1.0.1 | 13.3.7 | Unity 2020.3.30f1 IL2CPP | NVN |
+| [Pikmin 4](0100B7C00933A000/README.md) | `0100B7C00933A000` | 1.1.1 | 10.4.8 | Unreal Engine 4.26.2 | NVN |
+| [Pokémon Legends: Z-A](0100F43008C44000/README.md) | `0100F43008C44000` | 2.0.2 | 19.3.11 | Game Freak's Trinity engine | NVN |
+| [Pokémon Sword](0100ABF008968000/README.md) | `0100ABF008968000` | 1.3.2 | 7.3.2 | Game Freak's engine (before Trinity) | NVN |
+| [Raging Loop](010020400E1C2000/README.md) | `010020400E1C2000` | 1.0.0 (base) | 7.3.2 | Unity 2018.3.10f1 IL2CPP | NVN |
+| [Rhythm Heaven Groove](0100D9F01D474000/README.md) | `0100D9F01D474000` | 1.0.0 (base) | 21.4.0 | Nintendo's own 2D engine | NVN |
+| [ROMANCE OF THE THREE KINGDOMS 8 REMAKE](0100C2A01A730000/README.md) | `0100C2A01A730000` | 1.1.3 | 17.5.3 | Koei Tecmo's KTGL | NVN |
+| [STEINS;GATE RE:BOOT](01008BC024FDE000/README.md) | `01008BC024FDE000` | 1.0.3 | 20.5.17 | M2's ADV engine | NVN |
+| [Stardew Valley](0100E65002BB8000/README.md) | `0100E65002BB8000` | 1.6.15.13 | 20.5.27 | MonoGame (C# → C++ by BRUTE) | NVN |
+| [Super Mario 3D World + Bowser's Fury](010028600EBDA000/README.md) | `010028600EBDA000` | 1.2.2 | 10.4.0 | Nintendo EPD (sead / agl, NintendoWare) | NVN |
+| [Super Mario Bros. Wonder](010015100B514000/README.md) | `010015100B514000` | 1.2.1 (and 1.0.0) | 16.2.12 (1.0.0: 16.2.0) | Nintendo EPD (sead / agl) | NVN |
+| [Super Mario Galaxy](010099C022B96000/README.md) | `010099C022B96000` | 1.3.1 | 18.3.5 | NERD's Hagi Wii layer (recompiled PowerPC) | Vulkan |
+| [Super Mario Galaxy 2](0100FD8022DAA000/README.md) | `0100FD8022DAA000` | 1.4.0 | 18.3.5 | NERD's Hagi Wii layer (recompiled PowerPC) | Vulkan |
+| [Super Mario Odyssey](0100000000010000/README.md) | `0100000000010000` | 1.4.1 | 7.3.2 | Nintendo EPD (sead / agl, NintendoWare) | NVN |
+| [Super Smash Bros. Ultimate](01006A800016E000/README.md) | `01006A800016E000` | 13.0.5 | 8.2.1 | Bandai Namco / Sora's engine | NVN |
+| [Taiko Risshiden V DX](0100346017304000/README.md) | `0100346017304000` | 1.1.1 | 12.3.3 | Koei Tecmo's KTGL | NVN |
+| [The Great Ace Attorney Chronicles](010036E00FB20000/README.md) | `010036E00FB20000` | 1.0.0 (base) | 10.4.1 | Capcom's MT Framework | NVN |
+| [The Legend of Zelda: Breath of the Wild](01007EF00011E000/README.md) | `01007EF00011E000` | 1.9.0 | 20.5.22 | Nintendo EPD (sead / agl / gsys / ksys, Havok) | NVN |
+| [The Legend of Zelda: Link's Awakening](01006BB00C6F0000/README.md) | `01006BB00C6F0000` | 1.1.0 | 8.2.0 | Grezzo's engine on NintendoWare | NVN |
+| [The Legend of Zelda: Tears of the Kingdom](0100F2C0115B6000/README.md) | `0100F2C0115B6000` | 1.4.3 | 20.5.22 | Nintendo EPD (sead / agl / gsys) | NVN |
+| [Unicorn Overlord](010069401ADB8000/README.md) | `010069401ADB8000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN |
 
 ## Keys
 

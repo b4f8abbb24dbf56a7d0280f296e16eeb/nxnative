@@ -417,7 +417,11 @@ static void failures(void) {
 }
 // Exercise the real host helper through SDK-shaped test entry points. Its stack
 // allocation must reach MapMemory as guest backing and outlive SDK copyback.
+static module_t helper_sdk_module = { .loaded = 1 };
+static module_t *helper_module_of(const void *p) { (void)p; return &helper_sdk_module; }
+#define module_of helper_module_of
 #include "../hle_guestthread.c"
+#undef module_of
 static void (*helper_entry)(void *);
 static void *helper_arg, *helper_stack;
 static size_t helper_size;
@@ -433,22 +437,22 @@ static void helper_free(void *p) {
     assert(*(uint8_t *)helper_stack == 0x87); // DestroyThread already copied back
     helper_freed = 1; assert(!resize(0));
 }
-static int helper_create(void *tt, void (*fn)(void *), void *arg, void *source, size_t n, int prio) {
+static int helper_create(dm_guest_thread_type *tt, void (*fn)(void *), void *arg, void *source, size_t n, int prio) {
     (void)tt; (void)prio; helper_entry = fn; helper_arg = arg; helper_stack = source; helper_size = n;
     return (int)map(stack, (uintptr_t)source, n);
 }
-static void helper_start(void *tt) { (void)tt; helper_entry(helper_arg); helper_started = 1; }
-static void helper_wait(void *tt) { (void)tt; assert(helper_started); }
-static void helper_destroy(void *tt) {
+static void helper_start(dm_guest_thread_type *tt) { (void)tt; helper_entry(helper_arg); helper_started = 1; }
+static void helper_wait(dm_guest_thread_type *tt) { (void)tt; assert(helper_started); }
+static void helper_destroy(dm_guest_thread_type *tt) {
     (void)tt; assert(!unmap(stack, (uintptr_t)helper_stack, helper_size)); helper_destroyed = 1;
 }
 void *guest_sym(const char *name) {
     if (!strcmp(name, "malloc")) return helper_malloc;
     if (!strcmp(name, "free")) return helper_free;
-    if (!strcmp(name, "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi")) return helper_create;
-    if (!strcmp(name, "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE")) return helper_start;
-    if (!strcmp(name, "_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE")) return helper_wait;
-    if (!strcmp(name, "_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE")) return helper_destroy;
+    if (!strcmp(name, dm_guest_symbol_CreateThread)) return helper_create;
+    if (!strcmp(name, dm_guest_symbol_StartThread)) return helper_start;
+    if (!strcmp(name, dm_guest_symbol_WaitThread)) return helper_wait;
+    if (!strcmp(name, dm_guest_symbol_DestroyThread)) return helper_destroy;
     assert(0); return NULL;
 }
 static void helper_body(void *arg) { assert(arg == &helper_started); *(uint8_t *)stack = 0x87; }

@@ -1,9 +1,11 @@
 # StandardAllocator symbol boundary (experimental)
 
-**Shipping activation is hard-disabled.** `dm_sa_adapter_prepare` rejects even
-complete proof flags unless this translation unit is built with the synthetic
-fixture-only `DM_SA_ADAPTER_TESTING` macro. There is no enabled production installer or
-new `HLE_FORCE` registration. No game profile, SDK rewrite or game patch changes.
+**Default shipping activation is disabled.** Complete proof flags alone cannot
+enable `dm_sa_adapter_prepare`. Synthetic fixtures use `DM_SA_ADAPTER_TESTING`;
+the separate [bounded native experiment](bounded-shared-memory-experiment.md)
+requires build/runtime opt-in, exact reviewed full identities and an opaque
+startup authorization. No new `HLE_FORCE` registration, game profile, SDK rewrite
+cut or game patch changes.
 
 ## Implemented vertical slice
 

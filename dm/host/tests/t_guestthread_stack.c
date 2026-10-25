@@ -11,7 +11,7 @@ static _Thread_local int expect_failure;
 static int host_fail, guest_fail, create_fail, host_source, hide_symbols, self_join;
 static const char *missing_symbol;
 static int host_allocations, host_frees, guest_allocations, guest_frees;
-static int creates, starts, waits, destroys, bodies, marked;
+static int creates, starts, waits, destroys, bodies, marked, mutex_lookups, mutex_operations;
 static _Thread_local uint32_t current_handle = 1;
 static void *raw_storage;
 static size_t allocation_size;
@@ -26,7 +26,11 @@ static _Noreturn void guestthread_abort(void) { assert(expect_failure); longjmp(
 #define calloc host_calloc
 #define free host_free
 #define abort guestthread_abort
+static module_t helper_sdk_module = { .loaded = 1 };
+static module_t *helper_module_of(const void *p) { (void)p; return &helper_sdk_module; }
+#define module_of helper_module_of
 #include "../hle_guestthread.c"
+#undef module_of
 #undef abort
 #undef free
 #undef calloc
@@ -60,7 +64,7 @@ typedef struct {
     size_t size;
     int joined;
 } fake_thread;
-static int guest_create(void *tt, void (*entry)(void *), void *arg, void *source, size_t size, int prio) {
+static int guest_create(dm_guest_thread_type *tt, void (*entry)(void *), void *arg, void *source, size_t size, int prio) {
     assert(current_handle && !((uintptr_t)tt & 15) && size == 0x2000 && prio == 16);
     assert(dm_guest_map_source_available(source, size));
     assert((uintptr_t)source >= (uintptr_t)raw_storage);
@@ -74,33 +78,42 @@ static int guest_create(void *tt, void (*entry)(void *), void *arg, void *source
     return 0;
 }
 static void *fake_run(void *p) {
-    fake_thread *tt = p; current_handle = 2;
+    fake_thread *tt = (void *)p; current_handle = 2;
     tt->entry(tt->arg); return NULL;
 }
-static void guest_start(void *p) {
-    fake_thread *tt = p; ++starts;
+static void guest_start(dm_guest_thread_type *p) {
+    fake_thread *tt = (void *)p; ++starts;
     assert(!pthread_create(&tt->thread, NULL, fake_run, tt));
 }
-static void guest_wait(void *p) {
-    fake_thread *tt = p; ++waits;
+static void guest_wait(dm_guest_thread_type *p) {
+    fake_thread *tt = (void *)p; ++waits;
     assert(!pthread_join(tt->thread, NULL));
     assert(!unmap(stack_base, (uintptr_t)tt->source, tt->size));
     tt->joined = 1;
     assert(!guest_frees && !host_frees); // wait may unmap; storage must survive destroy
 }
-static void guest_destroy(void *p) {
-    fake_thread *tt = p;
+static void guest_destroy(dm_guest_thread_type *p) {
+    fake_thread *tt = (void *)p;
     assert(tt->joined && !guest_frees && !host_frees);
     ++destroys;
 }
+static void guest_mutex_initialize(dm_guest_mutex_type *p, dm_guest_bool recursive, int level) {
+    (void)p; (void)recursive; (void)level; ++mutex_operations;
+}
+static void guest_mutex_operation(dm_guest_mutex_type *p) { (void)p; ++mutex_operations; }
+static dm_guest_bool guest_mutex_locked(const dm_guest_mutex_type *p) { (void)p; ++mutex_operations; return 1; }
 void *guest_sym(const char *name) {
     if (hide_symbols || (missing_symbol && !strcmp(name, missing_symbol))) return NULL;
     if (!strcmp(name, "malloc")) return guest_allocate;
     if (!strcmp(name, "free")) return guest_release;
-    if (!strcmp(name, "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi")) return guest_create;
-    if (!strcmp(name, "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE")) return guest_start;
-    if (!strcmp(name, "_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE")) return guest_wait;
-    if (!strcmp(name, "_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE")) return guest_destroy;
+    if (!strcmp(name, dm_guest_symbol_CreateThread)) return guest_create;
+    if (!strcmp(name, dm_guest_symbol_StartThread)) return guest_start;
+    if (!strcmp(name, dm_guest_symbol_WaitThread)) return guest_wait;
+    if (!strcmp(name, dm_guest_symbol_DestroyThread)) return guest_destroy;
+    if (!strcmp(name, dm_guest_symbol_InitializeMutex)) { ++mutex_lookups; return guest_mutex_initialize; }
+    if (!strcmp(name, dm_guest_symbol_LockMutex)) { ++mutex_lookups; return guest_mutex_operation; }
+    if (!strcmp(name, dm_guest_symbol_IsMutexLockedByCurrentThread)) { ++mutex_lookups; return guest_mutex_locked; }
+    if (!strcmp(name, dm_guest_symbol_UnlockMutex)) { ++mutex_lookups; return guest_mutex_operation; }
     return NULL;
 }
 uint32_t thr_cur_handle(void) { return current_handle; }
@@ -119,6 +132,12 @@ static void reset(void) {
     assert(!raw_storage && host_allocations == host_frees && guest_allocations == guest_frees && !g_nmap);
     expect_failure = host_fail = guest_fail = create_fail = host_source = hide_symbols = self_join = 0;
     missing_symbol = NULL;
+    thread_binding.attempted = 0; thread_binding.error = thread_binding.symbol = NULL;
+    memset(&thread_binding.api, 0, sizeof thread_binding.api);
+    memset(thread_binding.owners, 0, sizeof thread_binding.owners);
+    mutex_binding.attempted = 0; mutex_binding.error = mutex_binding.symbol = NULL;
+    memset(&mutex_binding.api, 0, sizeof mutex_binding.api); mutex_binding.sdk_owner = NULL;
+    mutex_lookups = mutex_operations = 0;
     host_allocations = host_frees = guest_allocations = guest_frees = 0;
     creates = starts = waits = destroys = bodies = marked = free_phase = 0;
     current_handle = 1;
@@ -127,6 +146,7 @@ static void success(void) {
     free_phase = 1;
     void *handle = dm_guest_thread_spawn(body, &bodies, 16, 0x1001);
     assert(handle && !guest_frees && !host_frees);
+    assert(!mutex_binding.attempted && !mutex_lookups && !mutex_operations);
     hide_symbols = 1; // teardown must retain the originally paired functions
     dm_guest_thread_join(handle);
     assert(creates == 1 && starts == 1 && waits == 1 && destroys == 1 && bodies == 1 && marked);
@@ -137,6 +157,23 @@ static void failure(size_t size) {
     if (!setjmp(failed)) { dm_guest_thread_spawn(body, &bodies, 16, size); assert(!"expected fatal failure"); }
     assert(!starts && !waits && !destroys && !bodies && !marked && !g_nmap);
     assert(host_allocations == host_frees && guest_allocations == guest_frees);
+}
+static void optional_selftest_failure(void) {
+    expect_failure = 1;
+    if (!setjmp(failed)) { dm_guest_spawn_selftest(); assert(!"missing optional self-test import"); }
+    assert(!host_allocations && !guest_allocations && !creates && !starts && !mutex_operations);
+}
+static void optional_selftest_failures(void) {
+    const char *symbols[] = {
+#define DM_GUEST_MUTEX_SIGNATURE(name, result, parameters) dm_guest_symbol_##name,
+#include "../guest_mutex_signatures.inc"
+#undef DM_GUEST_MUTEX_SIGNATURE
+    };
+    assert(!setenv("DM_GUEST_SPAWN_TEST", "1", 1));
+    for (unsigned i = 0; i < sizeof symbols / sizeof *symbols; ++i) {
+        reset(); missing_symbol = symbols[i]; optional_selftest_failure();
+    }
+    assert(!unsetenv("DM_GUEST_SPAWN_TEST"));
 }
 static void source_preflight(void) {
     assert(!dm_guest_map_source_available((void *)heap_base, 0));
@@ -153,7 +190,17 @@ int main(void) {
     source_preflight();
     for (int i = 0; i < 8; ++i) { reset(); success(); } // close/reopen reuses the same source and destination
     reset(); self_join = 1; success();
-    reset(); missing_symbol = "free"; failure(0x1001); assert(!host_allocations && !guest_allocations);
+    const char *symbols[] = {
+#define DM_GUEST_THREAD_SIGNATURE(name, result, parameters) dm_guest_symbol_##name,
+#include "../guest_thread_signatures.inc"
+#undef DM_GUEST_THREAD_SIGNATURE
+        "malloc", "free"
+    };
+    for (unsigned i = 0; i < sizeof symbols / sizeof *symbols; ++i) {
+        reset(); missing_symbol = symbols[i]; failure(0x1001);
+        assert(!host_allocations && !guest_allocations && !creates);
+    }
+    optional_selftest_failures();
     reset(); host_fail = 1; failure(0x1001); assert(!guest_allocations && !creates);
     reset(); guest_fail = 1; failure(0x1001); assert(!guest_allocations && !creates);
     reset(); host_source = 1; failure(0x1001); assert(guest_frees == 1 && !creates);
