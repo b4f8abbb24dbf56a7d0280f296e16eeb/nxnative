@@ -125,10 +125,20 @@ static void release_config(void *context, void *self, const dm_sa_config *config
 }
 
 static dm_sa_result create_runtime(dm_memory_runtime **out, size_t max_regions,
-                                   int with_allocator) {
-    if (!out || !max_regions) return DM_SA_INVALID;
+                                   int with_allocator,
+                                   const dm_memory_runtime_contract *contract) {
+    if (!out || !max_regions || !contract) return DM_SA_INVALID;
+    dm_memory_runtime_contract selected = *contract;
+    // Validate both independent selectors before GetInfo can initialize the
+    // native memory backend. A constructor contract grants no hook authority.
+    if ((selected.domain != DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+         selected.domain != DM_VAMM_DOMAIN_RAW_ALIAS) ||
+        (selected.placement != DM_VAMM_PLACEMENT_MODERN &&
+         selected.placement != DM_VAMM_PLACEMENT_LEGACY &&
+         selected.placement != DM_VAMM_PLACEMENT_LEGACY_REDUCED)) return DM_SA_INVALID;
     dm_vamm_config config;
-    if (dm_vamm_native_configure(&config, max_regions)) return DM_SA_INVALID;
+    if (dm_vamm_native_configure_domain(&config, max_regions, selected.domain)) return DM_SA_INVALID;
+    config.placement = selected.placement;
     dm_memory_runtime *r = calloc(1, sizeof *r);
     if (!r) return DM_SA_NO_MEMORY;
     if (pthread_mutex_init(&r->mutex, NULL)) { free(r); return DM_SA_NO_MEMORY; }
@@ -147,11 +157,22 @@ static dm_sa_result create_runtime(dm_memory_runtime **out, size_t max_regions,
 fail:
     pthread_mutex_destroy(&r->mutex); free(r); return status;
 }
+dm_sa_result dm_memory_runtime_create_with_contract(dm_memory_runtime **out,
+    size_t max_regions, const dm_memory_runtime_contract *contract) {
+    return create_runtime(out, max_regions, 1, contract);
+}
+dm_sa_result dm_memory_runtime_create_vamm_only_with_contract(dm_memory_runtime **out,
+    size_t max_regions, const dm_memory_runtime_contract *contract) {
+    return create_runtime(out, max_regions, 0, contract);
+}
+static const dm_memory_runtime_contract modern_contract = {
+    DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA, DM_VAMM_PLACEMENT_MODERN
+};
 dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_regions) {
-    return create_runtime(out, max_regions, 1);
+    return dm_memory_runtime_create_with_contract(out, max_regions, &modern_contract);
 }
 dm_sa_result dm_memory_runtime_create_vamm_only(dm_memory_runtime **out, size_t max_regions) {
-    return create_runtime(out, max_regions, 0);
+    return dm_memory_runtime_create_vamm_only_with_contract(out, max_regions, &modern_contract);
 }
 static dm_vamm_adapter_config vamm_config(dm_memory_runtime *r) {
     return (dm_vamm_adapter_config){.context = r, .shared_owner = r->owner,

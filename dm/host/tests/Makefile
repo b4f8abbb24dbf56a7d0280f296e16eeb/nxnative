@@ -562,6 +562,30 @@ $(B)/t_memory_runtime_tsan_disabled: $(MEMORY_RUNTIME_DEPS) | $(B)
 	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RUNTIME_SRCS)
 memory-runtime-tsan: $(B)/t_memory_runtime_tsan $(B)/t_memory_runtime_tsan_unlimited $(B)/t_memory_runtime_tsan_16k $(B)/t_memory_runtime_tsan_16k_unlimited $(B)/t_memory_runtime_tsan_disabled
 	@set -e; for test in $^; do $$test; done
+# Explicit immutable domain/placement construction; no new SDK eligibility.
+MEMORY_CONTRACT_SRCS = t_memory_runtime_contract.c ../hle_memory_runtime.c ../hle_vamm_native.c ../hle_vamm.c
+MEMORY_CONTRACT_DEPS = $(MEMORY_CONTRACT_SRCS) ../hle_memory_runtime.h ../hle_vamm_native.h ../hle_vamm.h ../hle_standard_allocator_provider.h
+MEMORY_CONTRACT_MIXED_SRCS = t_memory_runtime_contract_mixed.c $(filter-out t_memory_runtime.c,$(MEMORY_RUNTIME_SRCS))
+MEMORY_CONTRACT_MIXED_DEPS = $(MEMORY_CONTRACT_MIXED_SRCS) $(MEMORY_RUNTIME_DEPS)
+$(B)/t_memory_runtime_contract: $(MEMORY_CONTRACT_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -o $@ $(MEMORY_CONTRACT_SRCS)
+$(B)/t_memory_runtime_contract_sanitize: $(MEMORY_CONTRACT_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_CONTRACT_SRCS)
+$(B)/t_memory_runtime_contract_mixed: $(MEMORY_CONTRACT_MIXED_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -o $@ $(MEMORY_CONTRACT_MIXED_SRCS)
+$(B)/t_memory_runtime_contract_mixed_16k: $(MEMORY_CONTRACT_MIXED_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -o $@ $(MEMORY_CONTRACT_MIXED_SRCS)
+$(B)/t_memory_runtime_contract_mixed_sanitize: $(MEMORY_CONTRACT_MIXED_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_CONTRACT_MIXED_SRCS)
+$(B)/t_memory_runtime_contract_mixed_sanitize_16k: $(MEMORY_CONTRACT_MIXED_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_CONTRACT_MIXED_SRCS)
+.PHONY: memory-runtime-contract memory-runtime-contract-sanitize
+memory-runtime-contract: $(B)/t_memory_runtime_contract $(B)/t_memory_runtime_contract_mixed $(B)/t_memory_runtime_contract_mixed_16k
+	@set -e; for test in $^; do $$test; done
+memory-runtime-contract-sanitize: $(B)/t_memory_runtime_contract_sanitize $(B)/t_memory_runtime_contract_mixed_sanitize $(B)/t_memory_runtime_contract_mixed_sanitize_16k
+	@set -e; for test in $^; do $$test; done
+run: memory-runtime-contract
+
 # Combined startup path: real runtime configs and ELF census/relocations, then
 # calls through committed slots into the native shared owner/provider/SVC path.
 MEMORY_STARTUP_SRCS = t_memory_runtime_startup.c $(filter-out t_memory_runtime.c,$(MEMORY_RUNTIME_SRCS)) ../hle_memory_hooks.c

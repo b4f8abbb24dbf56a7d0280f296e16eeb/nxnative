@@ -41,6 +41,13 @@ validate raw bounds before publishing a configuration. Existing runtime callers
 still request alias-minus-extra and modern placement. Domain policy is not a
 version selector, hook permit or implicit placement choice.
 
+The [runtime construction contract](shared-memory-runtime.md#explicit-immutable-construction-contracts)
+now composes those domain and placement mechanisms for both full and owner-only
+runtimes. The contract is copied/validated before backend queries and fixed for
+the owner's lifetime. Existing constructors and all current startup callers
+remain alias-minus-extra plus modern placement. This fills native construction
+wiring, not the separate per-SDK ABI/ownership eligibility gap.
+
 A separate [Vamm-only transaction](../dm/host/hle_memory_hooks.c)
 intercepts the complete 18-symbol group while leaving all StandardAllocator
 methods and existing bindings unchanged. Census, relocation journal, alias,

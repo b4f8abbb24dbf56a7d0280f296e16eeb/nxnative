@@ -3,6 +3,7 @@
 #pragma once
 #include "hle_standard_allocator_adapter.h"
 #include "hle_vamm_adapter.h"
+#include "hle_vamm_native.h"
 
 // This runtime uses alignment-aware exact leases and matching feasibility
 // statistics. It does not promise that any particular alignment/size fits the
@@ -10,9 +11,24 @@
 #define DM_MEMORY_RUNTIME_ALIGNED_LEASES 1
 
 typedef struct dm_memory_runtime dm_memory_runtime;
+// Independent construction mechanisms, NOT SDK eligibility or activation.
+// The values are copied into the owner before publication and cannot change
+// during its lifetime. No pointer to this caller-owned contract is retained.
+typedef struct {
+    dm_vamm_native_domain_policy domain;
+    dm_vamm_placement placement;
+} dm_memory_runtime_contract;
+// Explicit-contract counterparts for separately reviewed callers. Invalid
+// contracts reject before native GetInfo queries; every failure preserves out.
+// Construction creates no hooks/authority and does not initialize the owner.
+dm_sa_result dm_memory_runtime_create_with_contract(dm_memory_runtime **out,
+    size_t max_regions, const dm_memory_runtime_contract *contract);
+dm_sa_result dm_memory_runtime_create_vamm_only_with_contract(dm_memory_runtime **out,
+    size_t max_regions, const dm_memory_runtime_contract *contract);
 // Preallocates one native Vamm owner and its exact-lease provider. Does not
 // initialize Vamm, call guest code, reserve guest addresses or publish hooks.
 // Exclusive lifecycle; caller must not create an SDK owner over the same range.
+// Existing entry points always select ALIAS_MINUS_EXTRA + MODERN placement.
 dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_regions);
 // SDK-only alternative: preallocates ONLY the native Vamm owner. It creates no
 // StandardAllocator provider, factory, client or guest-forwarding callback.
