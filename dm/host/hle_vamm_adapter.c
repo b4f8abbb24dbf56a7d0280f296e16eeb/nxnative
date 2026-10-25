@@ -6,6 +6,7 @@
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
 // Kept independent of dm.h so portable adapter fixtures need no game profile.
 extern int dm_memory_experiment_authorized(const struct dm_memory_experiment_authorization *, const void *);
+extern int dm_memory_experiment_authorized_sdk_only(const struct dm_memory_experiment_authorization *, const void *);
 #endif
 
 _Static_assert(sizeof(uintptr_t) == 8 && sizeof(size_t) == 8, "64-bit Vamm ABI");
@@ -76,6 +77,8 @@ static void construct(void *self, unsigned index) {
     constructing = 1;
     pthread_mutex_unlock(&lifecycle);
     // The proven original ctor only bootstraps the lock/domain and NULL owner.
+    // Capture its actual self instead of decoding the enclosing OS-resource
+    // layout: the two reviewed modern SDK samples place this object differently.
     // NEVER call original InitializeIfEnabled: it constructs the SDK node tree.
     ((void (*)(void *))originals[index])(self);
     pthread_mutex_lock(&lifecycle);
@@ -125,7 +128,9 @@ uint32_t dm_vamm_adapter_prepare(const dm_vamm_adapter_config *c, dm_vamm_adapte
     authorized = c && c->proofs == DM_VAMM_PROOF_ALL;
 #endif
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
-    authorized = c && !c->proofs && dm_memory_experiment_authorized(c->experimental_startup, c->context) && c->shared_owner;
+    authorized = c && !c->proofs && c->shared_owner &&
+        (dm_memory_experiment_authorized(c->experimental_startup, c->context) ||
+         dm_memory_experiment_authorized_sdk_only(c->experimental_startup, c->context));
 #endif
     if (!authorized ||
         !c->symbols || c->symbol_count != DM_VAMM_SYMBOL_COUNT ||

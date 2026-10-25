@@ -373,6 +373,19 @@ run: guest-thread-stack
 
 # Actual native Vamm callbacks, shared production SVC transaction, raw GetInfo
 # resources, operation-specific result policy. No guest or proprietary inputs.
+VAMM_DOMAIN_SRCS = t_vamm_native_domain.c ../hle_vamm_native.c
+VAMM_DOMAIN_DEPS = $(VAMM_DOMAIN_SRCS) ../hle_vamm_native.h ../hle_vamm.h
+$(B)/t_vamm_native_domain: $(VAMM_DOMAIN_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -o $@ $(VAMM_DOMAIN_SRCS)
+$(B)/t_vamm_native_domain_sanitize: $(VAMM_DOMAIN_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_DOMAIN_SRCS)
+.PHONY: vamm-native-domain vamm-native-domain-sanitize
+vamm-native-domain: $(B)/t_vamm_native_domain
+	$(B)/t_vamm_native_domain
+vamm-native-domain-sanitize: $(B)/t_vamm_native_domain_sanitize
+	$(B)/t_vamm_native_domain_sanitize
+run: vamm-native-domain
+
 VAMM_NATIVE_SRCS = t_vamm_native.c ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
 VAMM_NATIVE_DEPS = $(VAMM_NATIVE_SRCS) ../hle_vamm_native.h $(VAMM_DEPS)
 $(B)/t_vamm_native: $(VAMM_NATIVE_DEPS) | $(B)
@@ -440,6 +453,42 @@ memory-hooks: $(B)/t_memory_hooks $(B)/t_memory_hooks_gate
 memory-hooks-sanitize: $(B)/t_memory_hooks_sanitize
 	$(B)/t_memory_hooks_sanitize
 run: memory-hooks
+
+# SDK-only reservation interception requires a separate live bounded permit.
+# Enabling the full-group experiment does not grant SDK-only authority.
+VAMM_ONLY_HOOK_DEPS = t_memory_hooks_vamm_only.c $(filter-out t_memory_hooks.c,$(MEMORY_HOOK_DEPS))
+VAMM_ONLY_HOOK_FLAGS = $(MEMORY_HOOK_FLAGS) -DDM_MEMORY_HOOKS_TESTING -DDM_VAMM_ADAPTER_TESTING
+$(B)/t_memory_hooks_vamm_only: $(VAMM_ONLY_HOOK_DEPS) | $(B)
+	$(CC) $(VAMM_ONLY_HOOK_FLAGS) -o $@ t_memory_hooks_vamm_only.c $(MEMORY_HOOK_SRCS)
+$(B)/t_memory_hooks_vamm_only_zero: $(VAMM_ONLY_HOOK_DEPS) | $(B)
+	$(CC) $(VAMM_ONLY_HOOK_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=0 -o $@ t_memory_hooks_vamm_only.c $(MEMORY_HOOK_SRCS)
+$(B)/t_memory_hooks_vamm_only_gate: $(VAMM_ONLY_HOOK_DEPS) | $(B)
+	$(CC) $(MEMORY_HOOK_FLAGS) -o $@ t_memory_hooks_vamm_only.c $(MEMORY_HOOK_SRCS)
+$(B)/t_memory_hooks_vamm_only_experiment_gate: $(VAMM_ONLY_HOOK_DEPS) | $(B)
+	$(CC) $(MEMORY_HOOK_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DDM_VAMM_ONLY_GATE_TEST -o $@ t_memory_hooks_vamm_only.c $(filter-out ../hle_memory_experiment.c,$(MEMORY_HOOK_SRCS))
+$(B)/t_memory_hooks_vamm_only_sanitize: $(VAMM_ONLY_HOOK_DEPS) | $(B)
+	$(CC) $(VAMM_ONLY_HOOK_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_memory_hooks_vamm_only.c $(MEMORY_HOOK_SRCS)
+.PHONY: memory-hooks-vamm-only memory-hooks-vamm-only-sanitize
+memory-hooks-vamm-only: $(B)/t_memory_hooks_vamm_only $(B)/t_memory_hooks_vamm_only_zero $(B)/t_memory_hooks_vamm_only_gate $(B)/t_memory_hooks_vamm_only_experiment_gate
+	$(B)/t_memory_hooks_vamm_only
+	$(B)/t_memory_hooks_vamm_only_zero
+	$(B)/t_memory_hooks_vamm_only_gate
+	$(B)/t_memory_hooks_vamm_only_experiment_gate
+memory-hooks-vamm-only-sanitize: $(B)/t_memory_hooks_vamm_only_sanitize
+	$(B)/t_memory_hooks_vamm_only_sanitize
+run: memory-hooks-vamm-only
+
+VAMM_PLACEMENT_DEPS = t_vamm_placement.c ../hle_vamm.c ../hle_vamm.h
+$(B)/t_vamm_placement: $(VAMM_PLACEMENT_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -o $@ t_vamm_placement.c ../hle_vamm.c
+$(B)/t_vamm_placement_sanitize: $(VAMM_PLACEMENT_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_vamm_placement.c ../hle_vamm.c
+.PHONY: vamm-placement vamm-placement-sanitize
+vamm-placement: $(B)/t_vamm_placement
+	$(B)/t_vamm_placement
+vamm-placement-sanitize: $(B)/t_vamm_placement_sanitize
+	$(B)/t_vamm_placement_sanitize
+run: vamm-placement
 
 # loader.c itself uses Mach-O/CommonCrypto/AArch64 TSD, so this end-to-end wrapper
 # fixture joins the existing Apple host run, not the portable Linux target.
@@ -612,3 +661,78 @@ standard-allocator-events-tsan: $(B)/t_standard_allocator_events_tsan
 	$(B)/t_standard_allocator_events_tsan
 
 run: standard-allocator-events
+
+# SDK-only startup keeps SA production-disabled while exercising native Vamm.
+MEMORY_VAMM_ONLY_SRCS = t_memory_runtime_vamm_only.c $(filter-out t_memory_runtime.c,$(MEMORY_RUNTIME_SRCS)) ../hle_memory_hooks.c
+MEMORY_VAMM_ONLY_DEPS = $(MEMORY_VAMM_ONLY_SRCS) $(MEMORY_STARTUP_DEPS)
+MEMORY_VAMM_ONLY_FLAGS = $(MAP_MEMORY_FLAGS) -Wno-unused-function -DDM_VAMM_ADAPTER_TESTING -DDM_MEMORY_HOOKS_TESTING
+$(B)/t_memory_runtime_vamm_only: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_unlimited: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_16k: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_HOST_PAGE_16K -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_16k_unlimited: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_disabled: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0 -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+.PHONY: memory-runtime-vamm-only
+memory-runtime-vamm-only: $(B)/t_memory_runtime_vamm_only $(B)/t_memory_runtime_vamm_only_unlimited $(B)/t_memory_runtime_vamm_only_16k $(B)/t_memory_runtime_vamm_only_16k_unlimited $(B)/t_memory_runtime_vamm_only_disabled $(B)/t_memory_runtime_vamm_only_gate
+	@set -e; for test in $^; do $$test; done
+$(B)/t_memory_runtime_vamm_only_sanitize: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_sanitize_unlimited: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_sanitize_16k: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_sanitize_16k_unlimited: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+$(B)/t_memory_runtime_vamm_only_sanitize_disabled: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MEMORY_VAMM_ONLY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+.PHONY: memory-runtime-vamm-only-sanitize
+memory-runtime-vamm-only-sanitize: $(B)/t_memory_runtime_vamm_only_sanitize $(B)/t_memory_runtime_vamm_only_sanitize_unlimited $(B)/t_memory_runtime_vamm_only_sanitize_16k $(B)/t_memory_runtime_vamm_only_sanitize_16k_unlimited $(B)/t_memory_runtime_vamm_only_sanitize_disabled
+	@set -e; for test in $^; do $$test; done
+$(B)/t_memory_runtime_vamm_only_gate: $(MEMORY_VAMM_ONLY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -Wno-unused-function -DDM_GAME_ALLOC_BIG_ALIGN=1 -o $@ $(MEMORY_VAMM_ONLY_SRCS)
+run: memory-runtime-vamm-only
+
+# Owner-only runtime construction must not allocate/call an SA provider.
+MEMORY_OWNER_ONLY_SRCS = t_memory_runtime_owner_only.c ../hle_memory_runtime.c ../hle_vamm.c
+MEMORY_OWNER_ONLY_DEPS = $(MEMORY_OWNER_ONLY_SRCS) ../hle_memory_runtime.h ../hle_vamm.h ../hle_vamm_native.h ../hle_standard_allocator_provider.h
+$(B)/t_memory_runtime_owner_only: $(MEMORY_OWNER_ONLY_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -o $@ $(MEMORY_OWNER_ONLY_SRCS)
+$(B)/t_memory_runtime_owner_only_sanitize: $(MEMORY_OWNER_ONLY_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_OWNER_ONLY_SRCS)
+.PHONY: memory-runtime-owner-only memory-runtime-owner-only-sanitize
+memory-runtime-owner-only: $(B)/t_memory_runtime_owner_only
+	$<
+memory-runtime-owner-only-sanitize: $(B)/t_memory_runtime_owner_only_sanitize
+	$<
+run: memory-runtime-owner-only
+
+# Distinct SDK-only native authorization: no fixture activation switches.
+SDK_MEMORY_EXPERIMENT_SRCS = t_sdk_memory_experiment.c $(filter-out t_memory_runtime.c,$(MEMORY_RUNTIME_SRCS)) ../hle_memory_hooks.c
+SDK_MEMORY_EXPERIMENT_DEPS = $(SDK_MEMORY_EXPERIMENT_SRCS) $(MEMORY_EXPERIMENT_DEPS)
+SDK_MEMORY_EXPERIMENT_FLAGS = $(MAP_MEMORY_FLAGS) -Wno-unused-function -DDM_GAME_ALLOC_BIG_ALIGN=1
+$(B)/t_sdk_memory_experiment: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_16k: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DDM_TEST_HOST_PAGE_16K -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_unlimited: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_16k_unlimited: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_gate: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_zero: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=0 -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_sanitize: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+$(B)/t_sdk_memory_experiment_16k_sanitize: $(SDK_MEMORY_EXPERIMENT_DEPS) | $(B)
+	$(CC) $(SDK_MEMORY_EXPERIMENT_FLAGS) -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SDK_MEMORY_EXPERIMENT_SRCS)
+.PHONY: sdk-memory-experiment sdk-memory-experiment-sanitize
+sdk-memory-experiment: $(B)/t_sdk_memory_experiment $(B)/t_sdk_memory_experiment_16k $(B)/t_sdk_memory_experiment_unlimited $(B)/t_sdk_memory_experiment_16k_unlimited $(B)/t_sdk_memory_experiment_gate $(B)/t_sdk_memory_experiment_zero
+	@set -e; for test in $^; do $$test; done
+sdk-memory-experiment-sanitize: $(B)/t_sdk_memory_experiment_sanitize $(B)/t_sdk_memory_experiment_16k_sanitize
+	@set -e; for test in $^; do $$test; done
+run: sdk-memory-experiment

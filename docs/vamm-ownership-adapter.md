@@ -1,5 +1,8 @@
 # Experimental Vamm ownership boundary
 
+See [SDK compatibility status](sdk-memory-compatibility.md) for the 19-build inventory,
+placement mechanisms and the separately gated Vamm-only transaction prototype.
+
 **Experimental integration; default production installation is disabled.**
 The separate [bounded native experiment](bounded-shared-memory-experiment.md)
 requires build/runtime opt-in and exact reviewed full identities. No game or SDK
