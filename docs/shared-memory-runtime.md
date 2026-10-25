@@ -16,6 +16,51 @@ settings containing that same owner handle, native retention callbacks, and
 the StandardAllocator configuration factory. It does not supply a symbol
 census or fabricate caller/ABI/behavior proofs.
 
+### Explicit immutable construction contracts
+
+`dm_memory_runtime_create_with_contract` and
+`dm_memory_runtime_create_vamm_only_with_contract` compose the independently
+implemented native domain and SDK placement mechanisms. The contract contains
+only `domain` (alias-minus-extra or raw alias) and `placement` (modern, legacy
+original or legacy reduced). Both selectors are copied once and validated
+before native GetInfo queries; the owner copies the resulting configuration.
+No caller-owned contract pointer or mutable policy is retained. Invalid/null
+contracts, null output and zero record capacity reject before querying the
+backend. Every construction failure preserves the output pointer and unwinds
+any unused owner/provider. Existing metadata-capacity bounds remain enforced
+by owner creation; they are not a new zero-query guarantee for every count.
+
+Both existing constructors remain explicit **alias-minus-extra + modern**
+wrappers, including all current experimental startup callers. Full and
+owner-only runtimes keep their separate configuration/lifetime capabilities.
+Selecting mechanisms neither authorizes a hook transaction nor establishes a
+reviewed SDK contract. No allowlist, permit, environment mode, profile or patch
+changes accompany these APIs.
+
+The selected placement governs SDK-facing reservations. Managed allocator
+leases still use exact caller alignment through `dm_vamm_allocate_aligned`,
+paired with `dm_vamm_get_aligned_stats`; SDK size tiers must not silently alter
+either native lease placement or its reported feasibility. A large lazy
+StandardAllocator capacity remains a limit rather than a contiguous arena.
+
+Source-only checks:
+
+```sh
+make -C dm/host/tests memory-runtime-contract
+ASAN_OPTIONS=detect_leaks=0 make -C dm/host/tests memory-runtime-contract-sanitize
+```
+
+The contract fixture covers both runtime types across all six domain/placement
+combinations, modern wrappers, invalid-input ordering, caller-contract mutation,
+provider failure cleanup and explicit aligned-provider callbacks/statistics.
+The mixed fixture runs all six combinations with real native owner/provider/SVC
+code at native and simulated 16 KiB host-page sizes. It combines a 40 GiB lazy
+managed allocator with an independently reserved sparse range committed at
+both ends, shared physical-budget exhaustion, unchanged-output no-space,
+provided-buffer child forwarding and borrowed-source free failure/retention.
+Guest originals are synthetic; these are not Paper Mario/Absolum ABI or gameplay
+tests, and no SDK is newly enabled.
+
 The Vamm adapter retains the explicit owner capability, rather than using a
 global getter or creating another reservation manager. Retention rejects an
 initialized, reserved or already-retained owner. Only the adapter's verified
