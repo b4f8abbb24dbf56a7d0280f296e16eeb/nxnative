@@ -4,6 +4,7 @@
 
 #define DM_MEMORY_EXPERIMENT_NAME "za-base-v1"
 #define DM_SDK_MEMORY_EXPERIMENT_NAME "za-base-sdk-v1"
+#define DM_MEMORY_RECLAIM_ENV "DM_MEMORY_RECLAIM"
 enum { DM_MEMORY_EXPERIMENT_FAILED = -1, DM_MEMORY_EXPERIMENT_OFF = 0,
        DM_MEMORY_EXPERIMENT_ACTIVE = 1 };
 // Pure eligibility check over the COMPLETE mapped set, including deferred NROs.
@@ -12,6 +13,8 @@ const char *dm_memory_experiment_preflight(const module_t *modules, size_t count
 // Called once by load_modules after opening the transaction window and before
 // sealing HLECOUNT/guest entry. NULL, empty or "0" requests the production path.
 // Failure is fatal to an explicitly requested experiment, never SDK fallback.
+// DM_MEMORY_RECLAIM is absent/0 (off), 1 (on), or invalid. On requires an
+// independently admitted full shared-memory request; it grants no new admission.
 int dm_memory_experiment_startup(const char *request, const char **diagnostic);
 
 // Opaque, short-lived native startup authorization, NOT asserted proof bits.

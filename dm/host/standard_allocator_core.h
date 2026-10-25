@@ -103,6 +103,22 @@ typedef struct {
     void (*metadata_free)(void *context, void *pointer);
 } dm_sa_config;
 
+// Saturating cumulative observations, not physical-memory deltas. A successful
+// callback range may contain already committed pages or race an idempotent raw
+// SVC operation. Only committed_bytes is an authoritative current snapshot.
+// Zero for providers without the optional page capability. No payload is read.
+typedef struct {
+    uint64_t sequence; // saturates; snapshot order, not observer delivery order
+    uint64_t reclaim_attempts, reclaim_successes;
+    uint64_t reclaim_requested_range_bytes, reclaim_successful_range_bytes;
+    uint64_t recommit_attempts, recommit_successes;
+    uint64_t recommit_requested_range_bytes, recommit_successful_range_bytes;
+    uint64_t reclaim_borrowed_runs, recommit_borrowed;
+    // Exact preparation budget prechecks vs generic callback result categories.
+    // Not all allocation NO_MEMORY results imply a page/budget failure.
+    uint64_t recommit_budget_denials, change_no_memory, change_busy, page_failures, publication_busy;
+} dm_sa_page_diagnostics;
+
 typedef struct {
     // backing_bytes is the exact outstanding lease extent/capacity charge,
     // including reserved holes; committed_bytes is actual logical commitment.
@@ -113,6 +129,7 @@ typedef struct {
     size_t metadata_bytes;
     int closed;
     size_t committed_bytes;
+    dm_sa_page_diagnostics pages;
 } dm_sa_stats;
 typedef struct {
     uint64_t block_count, allocated_bytes;
@@ -152,6 +169,9 @@ dm_sa_result dm_sa_reallocate(dm_sa_allocator *allocator, void *pointer, size_t 
 dm_sa_result dm_sa_shrink(dm_sa_allocator *allocator, void *pointer, size_t size, size_t *out);
 dm_sa_result dm_sa_get_size(dm_sa_allocator *allocator, const void *pointer, size_t *out);
 dm_sa_result dm_sa_get_stats(dm_sa_allocator *allocator, dm_sa_stats *out);
+// O(1) copied counters under the core mutex; no provider callbacks or allocation.
+// Diagnostic observation cannot change operation results or owner accounting.
+dm_sa_result dm_sa_get_page_diagnostics(dm_sa_allocator *allocator, dm_sa_page_diagnostics *out);
 // No per-thread caches: trim releases any wholly free spans retained after a
 // provider release failure and reports the first whole-span release error.
 // Optional free-page reclamation in live spans is best effort; its errors are

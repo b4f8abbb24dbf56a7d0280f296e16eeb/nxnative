@@ -41,6 +41,52 @@ uint32_t dm_vamm_svc_change_pages(uintptr_t base, size_t size, int commit) {
 }
 
 #if defined(DM_SA_ADAPTER_TESTING) && defined(DM_VAMM_ADAPTER_TESTING)
+// Keep the actual runtime/owner/provider. Only its optional host-metadata pair
+// is injected to seed a saturation boundary while the core is idle.
+static dm_sa_result (*native_make_config)(void *, void *, size_t, unsigned, dm_sa_config *);
+static int capture_core_tail;
+static dm_sa_page_diagnostics *core_tail;
+static void *event_metadata_alloc(void *context, size_t size) {
+    (void)context; void *p = malloc(size);
+    if (p && capture_core_tail) {
+        assert(size >= sizeof(dm_sa_page_diagnostics)); capture_core_tail = 0;
+        core_tail = (dm_sa_page_diagnostics *)((unsigned char *)p + size - sizeof(dm_sa_page_diagnostics));
+    }
+    return p;
+}
+static void event_metadata_free(void *context, void *p) { (void)context; free(p); }
+static dm_sa_result event_make_config(void *context, void *self, size_t capacity,
+                                     unsigned cache, dm_sa_config *out) {
+    dm_sa_result r = native_make_config(context, self, capacity, cache, out);
+    if (r == DM_SA_OK) { out->metadata_alloc = event_metadata_alloc; out->metadata_free = event_metadata_free; }
+    return r;
+}
+static pthread_mutex_t event_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t event_cond = PTHREAD_COND_INITIALIZER;
+static unsigned page_events_seen;
+static int block_event, event_entered, event_continue;
+static dm_sa_adapter_event delayed_event;
+static void record_event(void *context, const dm_sa_adapter_event *event) {
+    assert(context && event && event->pages_valid);
+    dm_sa_adapter_event copied = *event;
+    assert(copied.pages.reclaim_successes <= copied.pages.reclaim_attempts &&
+           copied.pages.recommit_successes <= copied.pages.recommit_attempts &&
+           copied.pages.reclaim_successful_range_bytes <= copied.pages.reclaim_requested_range_bytes &&
+           copied.pages.recommit_successful_range_bytes <= copied.pages.recommit_requested_range_bytes);
+    pthread_mutex_lock(&event_mutex);
+    if (event->kind == DM_SA_EVENT_PAGE_ACTIVITY) {
+        ++page_events_seen;
+        if (block_event) {
+            block_event = 0; event_entered = 1; delayed_event = copied;
+            pthread_cond_broadcast(&event_cond);
+            while (!event_continue) pthread_cond_wait(&event_cond, &event_mutex);
+            // Another thread destroyed the old core and initialized this same
+            // object while notification waited. Only this detached value is used.
+            assert(!memcmp(&copied, &delayed_event, sizeof copied));
+        }
+    }
+    pthread_mutex_unlock(&event_mutex);
+}
 static dm_sa_stats snapshot;
 static void record_dump(void *context, const void *self, const dm_sa_stats *stats) {
     assert(context && self && stats); snapshot = *stats;
@@ -100,6 +146,73 @@ static void full_cycle(void *self, dm_vamm *owner) {
     FREE(self, p); assert(!alias_mapped());
     assert(!dm_vamm_get_stats(owner, SMALL, &after) && !after.regions);
 }
+typedef struct { void *self, *pointer; unsigned value; } event_worker_args;
+static void *event_shrinker(void *context) {
+    event_worker_args *args = context;
+    assert(SHRINK(args->self, args->pointer, 32) == 32); return NULL;
+}
+static void *event_churn(void *context) {
+    event_worker_args *args = context;
+    for (unsigned i = 0; i < 32; ++i) {
+        assert(REALLOC(args->self, args->pointer, SMALL) == args->pointer);
+        for (size_t j = 0; j < 32; ++j) assert(((unsigned char *)args->pointer)[j] == args->value);
+        assert(SHRINK(args->self, args->pointer, 32) == 32);
+    }
+    return NULL;
+}
+static void saturated_event_routes(void *self) {
+    FINISH(self); capture_core_tail = 1; INIT(self); assert(!capture_core_tail);
+    void *p = ALLOC(self, SMALL); assert(p); core_tail->sequence = UINT64_MAX - 1;
+    pthread_mutex_lock(&event_mutex); unsigned before = page_events_seen; pthread_mutex_unlock(&event_mutex);
+    race_source = 0; race_mode = RACE_DECOMMIT_BORROW;
+    assert(SHRINK(self, p, 32) == 32 && !race_mode);
+    assert(read_stats(self).pages.sequence == UINT64_MAX && !read_stats(self).pages.reclaim_successes);
+    assert(!call(5, info(I_StackAddr), race_source, PAGE));
+    TRIM(self); assert(read_stats(self).pages.reclaim_successes == 1);
+    assert(REALLOC(self, p, 3 * PAGE) == p && read_stats(self).pages.recommit_successes == 1);
+    pthread_mutex_lock(&event_mutex); assert(page_events_seen == before + 3); pthread_mutex_unlock(&event_mutex);
+    assert(SHRINK(self, p, 32) == 32);
+    pthread_mutex_lock(&event_mutex); assert(page_events_seen == before + 3); pthread_mutex_unlock(&event_mutex);
+    FREE(self, p); assert(!alias_mapped());
+}
+static void event_lifetimes(void *self) {
+    FINISH(self); INIT(self); // isolate counters and sampling generation
+    void *p = ALLOC(self, SMALL); assert(p); memset(p, 0x24, SMALL);
+    pthread_mutex_lock(&event_mutex);
+    block_event = 1; event_entered = event_continue = 0;
+    pthread_mutex_unlock(&event_mutex);
+    event_worker_args args = {self, p, 0}; pthread_t thread;
+    assert(!pthread_create(&thread, NULL, event_shrinker, &args));
+    pthread_mutex_lock(&event_mutex);
+    while (!event_entered) pthread_cond_wait(&event_cond, &event_mutex);
+    uint64_t old_generation = delayed_event.generation;
+    assert(delayed_event.pages.reclaim_successes == 1 && delayed_event.stats_result == DM_SA_OK &&
+           delayed_event.stats.committed_bytes == PAGE && delayed_event.stats.backing_bytes == SMALL);
+    pthread_mutex_unlock(&event_mutex);
+    FINISH(self); assert(!alias_mapped()); INIT(self);
+    pthread_mutex_lock(&event_mutex);
+    assert(delayed_event.generation == old_generation);
+    event_continue = 1; pthread_cond_broadcast(&event_cond);
+    pthread_mutex_unlock(&event_mutex);
+    assert(!pthread_join(thread, NULL));
+    assert(!read_stats(self).pages.sequence);
+
+    enum { WORKERS = 4 }; event_worker_args workers[WORKERS]; pthread_t threads[WORKERS];
+    for (unsigned i = 0; i < WORKERS; ++i) {
+        p = ALLOC(self, SMALL); assert(p); memset(p, 0x31 + (int)i, SMALL);
+        workers[i] = (event_worker_args){self, p, 0x31 + i};
+    }
+    for (unsigned i = 0; i < WORKERS; ++i) assert(SHRINK(self, workers[i].pointer, 32) == 32);
+    pthread_mutex_lock(&event_mutex); unsigned before = page_events_seen; pthread_mutex_unlock(&event_mutex);
+    for (unsigned i = 0; i < WORKERS; ++i) assert(!pthread_create(&threads[i], NULL, event_churn, &workers[i]));
+    for (unsigned i = 0; i < WORKERS; ++i) assert(!pthread_join(threads[i], NULL));
+    dm_sa_stats stats = read_stats(self);
+    assert(stats.pages.reclaim_successes == WORKERS * 33 && stats.pages.recommit_successes == WORKERS * 32);
+    assert(stats.committed_bytes == WORKERS * PAGE && stats.backing_bytes == WORKERS * SMALL);
+    pthread_mutex_lock(&event_mutex); assert(page_events_seen - before <= 12); pthread_mutex_unlock(&event_mutex);
+    for (unsigned i = 0; i < WORKERS; ++i) FREE(self, workers[i].pointer);
+    assert(!alias_mapped());
+}
 static size_t physical_budget(void) {
     dm_sa_svc_scope_begin(); size_t budget = dm_sa_svc_physical_budget_locked();
     dm_sa_svc_scope_end(); return budget;
@@ -131,13 +244,17 @@ static void budget_cycle(void *self) {
     assert(REALLOC(self, p, 3 * PAGE) == p && !physical_budget());
     for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)p)[i] == 0x51);
     for (size_t i = PAGE; i < 3 * PAGE; ++i) assert(!((unsigned char *)p)[i]);
+    dm_sa_page_diagnostics before_denial = read_stats(self).pages;
     assert(!REALLOC(self, p, 4 * PAGE) && read_stats(self).allocated_bytes == 3 * PAGE);
+    assert(read_stats(self).pages.recommit_budget_denials == before_denial.recommit_budget_denials + 1);
+    assert(read_stats(self).pages.recommit_attempts == before_denial.recommit_attempts);
     assert(SHRINK(self, p, 32) == 32 && physical_budget() == 2 * PAGE);
     // Consume one page after the provider snapshot, before native commitment.
     // Its strict scope must refuse two missing pages, even in unlimited mode.
     race_source = spare; race_mode = RACE_COMMIT_BUDGET;
     assert(!REALLOC(self, p, 3 * PAGE) && !race_mode && physical_budget() == PAGE);
     assert(read_stats(self).allocated_bytes == 32 && read_stats(self).committed_bytes == PAGE);
+    assert(read_stats(self).pages.change_no_memory >= 1);
     assert(!V(4, uint32_t (*)(uintptr_t))(spare));
     assert(REALLOC(self, p, 3 * PAGE) == p && !physical_budget());
     assert(((unsigned char *)rival)[0] == 0x43 && ((unsigned char *)rival)[rival_size - 1] == 0x43);
@@ -197,7 +314,8 @@ int main(void) {
     puts("page-capable construction grants no production activation: PASS");
 #else
     default_capability_absent(); owner_only_runtime_tests();
-    a.dump = record_dump;
+    a.dump = record_dump; a.event = record_event; a.page_events = 1;
+    native_make_config = a.make_config; a.make_config = event_make_config;
     assert(!dm_vamm_adapter_install(&v) && dm_sa_adapter_install(&a) == DM_SA_OK);
     unsigned char manager[64] = {0}; V(8, void (*)(void *))(manager);
     V(0, void (*)(void))();
@@ -209,7 +327,7 @@ int main(void) {
             c.provider.pages.budget && c.provider.pages.change && !alias_mapped());
         a.release_config(a.context, probe, &c);
         INIT(self); full_cycle(self, v.shared_owner); fatal_backend_failures(self); budget_cycle(self);
-        borrow_races(self, runtime); FINISH(self);
+        borrow_races(self, runtime); saturated_event_routes(self); event_lifetimes(self); FINISH(self);
     } else {
         expect_initialize(self, DM_SA_INVALID); assert(!dm_sa_adapter_is_managed(self));
     }

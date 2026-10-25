@@ -47,6 +47,8 @@ typedef struct instance {
     dm_sa_config configuration;
     unsigned users;
     uint64_t generation, diagnostic_failures;
+    uint64_t page_sequence, page_event_count;
+    unsigned page_success_seen;
     int initializing, finalizing;
     struct instance *next;
 } instance;
@@ -102,7 +104,13 @@ static dm_sa_adapter_event event_snapshot(instance *i, dm_sa_allocator *allocato
     dm_sa_adapter_event event = {.kind = kind, .self = i->self,
         .generation = i->generation, .requested_size = size, .alignment = alignment,
         .result = result, .stats_result = DM_SA_CLOSED};
-    if (allocator) event.stats_result = dm_sa_get_stats(allocator, &event.stats);
+    if (allocator) {
+        event.stats_result = dm_sa_get_stats(allocator, &event.stats);
+        if (settings.page_events) {
+            if (event.stats_result == DM_SA_OK) { event.pages = event.stats.pages; event.pages_valid = 1; }
+            else event.pages_valid = dm_sa_get_page_diagnostics(allocator, &event.pages) == DM_SA_OK;
+        }
+    }
     return event;
 }
 static int failure_snapshot(instance *i, dm_sa_adapter_event_kind kind,
@@ -116,6 +124,27 @@ static int failure_snapshot(instance *i, dm_sa_adapter_event_kind kind,
     if (count > 4 && (count & (count - 1))) return 0;
     *out = event_snapshot(i, i->allocator, kind, result, size, alignment);
     out->failure_count = count;
+    return 1;
+}
+static int page_snapshot(instance *i, dm_sa_result result, dm_sa_adapter_event *out) {
+    if (!settings.event || !settings.page_events) return 0;
+    dm_sa_page_diagnostics pages;
+    if (dm_sa_get_page_diagnostics(i->allocator, &pages) != DM_SA_OK) return 0;
+    pthread_mutex_lock(&mutex);
+    unsigned success = (pages.reclaim_successes ? 1u : 0u) | (pages.recommit_successes ? 2u : 0u);
+    int first_success = (success & ~i->page_success_seen) != 0;
+    if (pages.sequence < i->page_sequence || (pages.sequence == i->page_sequence &&
+        !(pages.sequence == UINT64_MAX && first_success))) { pthread_mutex_unlock(&mutex); return 0; }
+    i->page_sequence = pages.sequence;
+    uint64_t count = i->page_event_count;
+    if (count != UINT64_MAX) count = ++i->page_event_count;
+    i->page_success_seen |= success;
+    pthread_mutex_unlock(&mutex);
+    if (!first_success && count > 4 && (count & (count - 1))) return 0;
+    *out = event_snapshot(i, i->allocator, DM_SA_EVENT_PAGE_ACTIVITY, result, 0, 0);
+    out->page_event_count = count;
+    // The authoritative stats scan may be newer; keep its counters if valid.
+    // Neither sequence nor sample order promises console order across threads.
     return 1;
 }
 static void event_notify(const dm_sa_adapter_event *event) {
@@ -176,6 +205,7 @@ static void initialize(void *self, void *buffer, size_t capacity, unsigned cache
     i->initializing = 1;
     i->generation = ++next_generation;
     i->diagnostic_failures = 0;
+    i->page_sequence = i->page_event_count = 0; i->page_success_seen = 0;
     if (fresh) { i->next = instances; instances = i; }
     pthread_mutex_unlock(&mutex);
     // Factory/provider creation may call other allocator instances. Publish an
@@ -242,6 +272,9 @@ static void finalize(void *self) {
     i->finalizing = 1;
     while (i->users) pthread_cond_wait(&idle, &mutex);
     pthread_mutex_unlock(&mutex);
+    dm_sa_page_diagnostics final_pages = {0};
+    int have_pages = settings.event && settings.page_events &&
+        dm_sa_get_page_diagnostics(i->allocator, &final_pages) == DM_SA_OK;
     dm_sa_result r = dm_sa_destroy(i->allocator);
     dm_sa_adapter_event event;
     int notify = settings.event != NULL;
@@ -249,6 +282,7 @@ static void finalize(void *self) {
     // its retained ownership, so a best-effort snapshot is safe before unlock.
     if (notify) event = event_snapshot(i, r == DM_SA_OK ? NULL : i->allocator,
         DM_SA_EVENT_FINALIZED, r, i->configuration.capacity, 0);
+    if (notify && r == DM_SA_OK && have_pages) { event.pages = final_pages; event.pages_valid = 1; }
     if (r == DM_SA_OK && settings.release_config)
         settings.release_config(settings.context, self, &i->configuration);
     pthread_mutex_lock(&mutex);
@@ -273,8 +307,11 @@ static void *managed_allocate(instance *i, size_t size, size_t alignment) {
         r = dm_sa_allocate(i->allocator, size, alignment < 16 ? 16 : alignment, &out);
     dm_sa_adapter_event event;
     int notify = failure_snapshot(i, DM_SA_EVENT_ALLOCATE_FAILED, r, size, alignment, &event);
+    dm_sa_adapter_event pages;
+    int notify_pages = page_snapshot(i, r, &pages);
     drop(i);
     if (notify) event_notify(&event);
+    if (notify_pages) event_notify(&pages);
     if (r != DM_SA_OK) return NULL;
     return out;
 }
@@ -309,8 +346,11 @@ static void *reallocate(void *self, void *pointer, size_t size) {
     dm_sa_result r = !pointer && !size ? DM_SA_OK : size <= INT64_MAX ? dm_sa_reallocate(i->allocator, pointer, size, &out) : DM_SA_INVALID;
     dm_sa_adapter_event event;
     int notify = failure_snapshot(i, DM_SA_EVENT_REALLOCATE_FAILED, r, size, 0, &event);
+    dm_sa_adapter_event pages;
+    int notify_pages = page_snapshot(i, r, &pages);
     drop(i);
     if (notify) event_notify(&event);
+    if (notify_pages) event_notify(&pages);
     return r == DM_SA_OK ? out : NULL;
 }
 static size_t shrink(void *self, void *pointer, size_t size) {
@@ -320,7 +360,10 @@ static size_t shrink(void *self, void *pointer, size_t size) {
     // SDK Shrink(p,0) keeps a live minimum-sized allocation, unlike Reallocate
     // (p,0). Core policy uses a 16-byte minimum rather than SDK size classes.
     dm_sa_result r = size <= INT64_MAX ? dm_sa_shrink(i->allocator, pointer, size ? size : 1, &out) : DM_SA_INVALID;
+    dm_sa_adapter_event event;
+    int notify = page_snapshot(i, r, &event);
     drop(i);
+    if (notify) event_notify(&event);
     return r == DM_SA_OK ? out : 0;
 }
 static size_t get_size(const void *self, const void *pointer) {
@@ -349,7 +392,10 @@ static void maintenance(const void *self, int which) {
     // Managed mode has no thread-local cache, including when the SDK bool was
     // true. Wholly free real spans are released through their original owner.
     dm_sa_result r = dm_sa_trim(i->allocator);
+    dm_sa_adapter_event event;
+    int notify = page_snapshot(i, r, &event);
     drop(i);
+    if (notify) event_notify(&event);
     if (r != DM_SA_OK) fail(names[which], r);
 }
 static void clear_cache(const void *self) { maintenance(self, CLEAR_CACHE); }

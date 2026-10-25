@@ -6,7 +6,7 @@
 #undef MEMORY_STARTUP_MAIN
 #include "../hle_memory_experiment.h"
 
-static unsigned creates, destroys, installs;
+static unsigned creates, page_creates, destroys, installs;
 static int fail_create, fail_configs;
 static dm_sa_result track_create(dm_memory_runtime **out, size_t max_regions, const dm_memory_runtime_contract *contract) {
     assert(contract && contract->domain == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
@@ -14,6 +14,15 @@ static dm_sa_result track_create(dm_memory_runtime **out, size_t max_regions, co
     ++creates;
     if (fail_create) return DM_SA_NO_MEMORY;
     dm_sa_result result = dm_memory_runtime_create_with_contract(out, max_regions, contract);
+    if (result == DM_SA_OK) startup_runtime = *out;
+    return result;
+}
+static dm_sa_result track_page_create(dm_memory_runtime **out, size_t max_regions, const dm_memory_runtime_contract *contract) {
+    assert(contract && contract->domain == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+           contract->placement == DM_VAMM_PLACEMENT_MODERN && max_regions == 65536);
+    ++creates; ++page_creates;
+    if (fail_create) return DM_SA_NO_MEMORY;
+    dm_sa_result result = dm_memory_runtime_create_page_capable_with_contract(out, max_regions, contract);
     if (result == DM_SA_OK) startup_runtime = *out;
     return result;
 }
@@ -41,10 +50,12 @@ int loader_install_vamm_hooks(const dm_vamm_adapter_config *v) {
 #undef DM_MEMORY_RUNTIME_ALIGNED_LEASES
 #endif
 #define dm_memory_runtime_create_with_contract track_create
+#define dm_memory_runtime_create_page_capable_with_contract track_page_create
 #define dm_memory_runtime_destroy track_destroy
 #define dm_memory_runtime_configs track_configs
 #include "../hle_memory_experiment.c"
 #undef dm_memory_runtime_create_with_contract
+#undef dm_memory_runtime_create_page_capable_with_contract
 #undef dm_memory_runtime_destroy
 #undef dm_memory_runtime_configs
 
@@ -182,6 +193,14 @@ static int unexpected_callback(void *p, size_t n, void *context) {
     (void)p; (void)n; (void)context;
     _exit(88); // Anything but SIGABRT proves the forbidden callback ran.
 }
+static void factory_capability(int enabled) {
+    unsigned char probe[DM_SA_ADAPTER_OBJECT_SIZE] = {0}; dm_sa_config c;
+    assert(startup_allocator.make_config(startup_allocator.context, probe, SMALL, 0, &c) == DM_SA_OK);
+    assert(c.provider.pages.granule == (enabled ? PAGE : 0));
+    assert(!!c.provider.pages.query_run == enabled && !!c.provider.pages.budget == enabled &&
+        !!c.provider.pages.change == enabled);
+    startup_allocator.release_config(startup_allocator.context, probe, &c);
+}
 static void active_calls(void) {
     assert(!dm_memory_experiment_authorized(startup_allocator.experimental_startup, startup_runtime));
     assert(dm_memory_hooks_enter_guest()); // startup completed, guest may now enter
@@ -194,6 +213,7 @@ static void active_calls(void) {
     assert(strstr(rejected, "StandardAllocator Initialize failed"));
     assert(!strstr(rejected, "managed Initialize success") && !strstr(rejected, "experimental shared memory snapshot"));
     V(10, void (*)(void *))(manager);
+    factory_capability(0);
     CONSTRUCT(self);
     S(7, void (*)(void *, void *, size_t, unsigned))(self, NULL, (size_t)12 << 30, 1);
     assert(self[0] && dm_sa_adapter_is_managed(self) && !alias_mapped());
@@ -296,20 +316,127 @@ static void scenario(unsigned which) {
     }
 }
 static void run_scenario(void *which) { scenario(*(unsigned *)which); }
+static void active_reclaim_calls(void) {
+    assert(dm_memory_hooks_enter_guest());
+    unsigned char manager[64] = {0}, self[DM_SA_ADAPTER_OBJECT_SIZE] = {0};
+    V(8, void (*)(void *))(manager); V(10, void (*)(void *))(manager);
+    assert(startup_allocator.page_events);
+    factory_capability(1); CONSTRUCT(self); INIT(self);
+    void *p = S(10, void *(*)(void *,size_t,size_t))(self, SMALL, 16); assert(p);
+    memset(p, 0x47, SMALL);
+    assert(S(13, size_t (*)(void *,void *,size_t))(self, p, 32) == 32 && alias_mapped() == PAGE);
+    S(20, void (*)(const void *))(self); // reserved versus committed evidence
+    void *q = S(10, void *(*)(void *,size_t,size_t))(self, 2 * PAGE + 16, 16);
+    assert(q == (unsigned char *)p + 32 && alias_mapped() == 3 * PAGE);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)p)[i] == 0x47);
+    for (size_t i = PAGE; i < 2 * PAGE + 48; ++i) assert(!((unsigned char *)p)[i]);
+    FREE(self, q); assert(alias_mapped() == 3 * PAGE);
+    S(18, void (*)(const void *))(self); assert(alias_mapped() == PAGE);
+    assert(S(12, void *(*)(void *,void *,size_t))(self, p, 4 * PAGE) == p && alias_mapped() == 4 * PAGE);
+    assert(S(13, size_t (*)(void *,void *,size_t))(self, p, 0) == 16 && alias_mapped() == PAGE);
+    // Enough real operations to prove exponential sampling without requiring
+    // Dump for evidence. Cumulative ranges include already-backed boundaries.
+    for (unsigned i = 0; i < 64; ++i) {
+        assert(S(12, void *(*)(void *,void *,size_t))(self, p, 4 * PAGE) == p);
+        assert(S(13, size_t (*)(void *,void *,size_t))(self, p, 32) == 32);
+    }
+    assert(!setenv(DM_MEMORY_RECLAIM_ENV, "0", 1));
+    factory_capability(1); // environment changes cannot reconfigure a live owner
+    FREE(self, p); FINISH(self); assert(!alias_mapped());
+    const char *why = NULL;
+    assert(dm_memory_experiment_startup(DM_MEMORY_EXPERIMENT_NAME, &why) == DM_MEMORY_EXPERIMENT_FAILED);
+    assert(why && strstr(why, "startup/restart") && creates == 1 && page_creates == 1 && !destroys);
+}
+static void flag_scenario(void *context) {
+    unsigned which = *(unsigned *)context;
+    identities(); assert(dm_memory_hooks_open_startup());
+    const char *request = DM_MEMORY_EXPERIMENT_NAME, *value = "1", *why = NULL;
+    if (which == 1) request = NULL;
+    if (which == 2) request = "0";
+    if (which == 3) request = "";
+    if (which == 4) value = "";
+    if (which == 5) value = "2";
+    if (which == 6) value = "01";
+    if (which == 7) value = "true";
+    if (which == 8) value = " 1";
+    if (which == 9) request = DM_SDK_MEMORY_EXPERIMENT_NAME;
+    if (which == 10) g_mod[1].full_build_id[0] = 0;
+    if (which == 11) g_mod[0].full_build_id[63] = '1';
+    if (which == 12) fail_create = 1;
+    if (which == 13) fail_configs = 1;
+    if (which == 14) startup_images[1]->symbols[1].st_shndx = 0;
+    if (which == 15) {
+        assert(!setenv(DM_MEMORY_RECLAIM_ENV, "0", 1));
+        assert(dm_memory_experiment_startup("0", &why) == DM_MEMORY_EXPERIMENT_OFF);
+    }
+    if (which == 16) { value = "-1"; request = "0"; }
+    if (which == 17) request = "unknown-game";
+    assert(!setenv(DM_MEMORY_RECLAIM_ENV, value, 1));
+    int result = dm_memory_experiment_startup(request, &why);
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
+    if (!which) {
+        assert(result == DM_MEMORY_EXPERIMENT_ACTIVE && !why && creates == 1 && page_creates == 1 && installs == 1 && !destroys);
+        active_reclaim_calls(); return;
+    }
+    if (which == 12) assert(creates == 1 && page_creates == 1 && !installs && !destroys);
+    else if (which == 13) assert(creates == 1 && page_creates == 1 && !installs && destroys == 1);
+    else if (which == 14) assert(creates == 1 && page_creates == 1 && installs == 1 && destroys == 1);
+    else assert(!creates && !page_creates && !installs && !destroys);
+#else
+    assert(!creates && !page_creates && !installs && !destroys);
+#endif
+    assert(result == DM_MEMORY_EXPERIMENT_FAILED && why && *why);
+    if (which >= 1 && which <= 3) assert(strstr(why, "requires an admitted full"));
+    if ((which >= 4 && which <= 8) || which == 16) assert(strstr(why, "expected DM_MEMORY_RECLAIM"));
+    if (which == 9) assert(strstr(why, "SDK-only"));
+    if (which == 15) assert(strstr(why, "startup/restart"));
+    assert(!dm_memory_hooks_active() && !alias_mapped() && !atomic_load(&constructors));
+    for (unsigned k = 0; k < 2; ++k) for (unsigned i = 0; i < STARTUP_SYMBOLS; ++i)
+        assert(startup_images[k]->slots[i] == original_slots[k][i]);
+}
 int main(void) {
     struct rlimit limit = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &limit));
+    assert(!unsetenv(DM_MEMORY_RECLAIM_ENV));
     startup_images_create(); preflight();
+    for (unsigned explicit_off = 0; explicit_off < 2; ++explicit_off) {
+    if (explicit_off) assert(!setenv(DM_MEMORY_RECLAIM_ENV, "0", 1));
     for (unsigned i = 0; i <= 19; ++i) {
         char log[32768];
         int status = child_log(run_scenario, &i, log, sizeof log);
         if (!WIFEXITED(status) || WEXITSTATUS(status)) fputs(log, stderr);
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
-        if (i == 14) assert_lifecycle_log(log);
+        if (i == 14) {
+            assert_lifecycle_log(log);
+            assert(!strstr(log, "experimental shared memory pages "));
+            assert(strstr(log, "contract=" DM_MEMORY_EXPERIMENT_NAME " mode=full reclaim=off"));
+        }
         else
 #endif
             assert(!strstr(log, "experimental shared memory managed ") &&
                    !strstr(log, "experimental shared memory snapshot "));
+    }
+    }
+    for (unsigned i = 0; i <= 17; ++i) {
+        char log[32768]; int status = child_log(flag_scenario, &i, log, sizeof log);
+        if (!WIFEXITED(status) || WEXITSTATUS(status)) fputs(log, stderr);
+        assert(WIFEXITED(status) && !WEXITSTATUS(status));
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
+        if (!i) {
+            assert(strstr(log, "contract=" DM_MEMORY_EXPERIMENT_NAME " mode=full reclaim=on"));
+            assert(strstr(log, "reserved=65536 committed=4096"));
+            assert(strstr(log, "route=unexercised reclaim_calls=0 reclaim_ok=0"));
+            assert(strstr(log, "reclaim_calls=67 reclaim_ok=67"));
+            assert(strstr(log, "recommit_calls=66 recommit_ok=66"));
+            assert(strstr(log, "recommit_requested_range_bytes=12288 recommit_successful_range_bytes=12288"));
+            assert(strstr(log, "ranges_not_physical_deltas"));
+            const char *first = strstr(log, "managed page activity ");
+            assert(first && first < strstr(log, "experimental shared memory Dump "));
+            assert(occurrences(log, "managed page activity ") >= 8 &&
+                   occurrences(log, "managed page activity ") <= 14);
+        } else
+#endif
+            assert(!strstr(log, " active:"));
     }
     for (unsigned k = 0; k < 2; ++k) assert(!munmap(startup_images[k], startup_image_bytes));
     puts("bounded experiment: identity, off/on, prepublication cleanup, lifecycle/budget/failure diagnostics, managed Hash/Dump/Walk policy: PASS");

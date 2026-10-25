@@ -63,10 +63,11 @@ provided-buffer child forwarding and borrowed-source free failure/retention.
 
 `dm_memory_runtime_create_page_capable_with_contract` constructs a full-mode
 runtime whose optional provider callback invokes `dm_vamm_pages` on its one
-retained owner. It is currently used only by synthetic integration fixtures.
-**No admitted startup descriptor selects it.** All existing constructors,
-`za-base-v1` and `za-base-sdk-v1` retain their previous behavior; default hook
-activation stays disabled. There is no SDK-only counterpart because that mode
+retained owner. The bounded startup policy can select it only with the explicit
+[default-off reclaim flag](bounded-shared-memory-experiment.md#deliberate-opt-in)
+after the existing full-mode module/build/ownership preflight. All existing
+constructors remain whole-lease-backed; flag-off behavior and `za-base-sdk-v1`
+are unchanged, and default hook activation stays disabled. There is no SDK-only counterpart because that mode
 does not create a StandardAllocator provider. Construction grants no additional
 SDK, game, lifetime or relocation authority.
 
@@ -90,9 +91,9 @@ synthetic. Race synchronization wraps the real native SVC bridge, not the
 runtime factory or owner callback. Host-protection failures retain the existing
 fatal policy and are tested separately from returning best-effort failures.
 
-No successful fixture authorizes game use. Before any startup descriptor can
-select this constructor, independent review and native CI must cover the full
-runtime/startup path. The existing game contract still requires callers to stop
+No successful fixture authorizes another game's use. Independent review and
+native CI must cover the full runtime/startup flag path before test handoff.
+The existing game contract still requires callers to stop
 using freed bytes, a realloc-moved source, or a relinquished Shrink tail before
 that lifetime ends. MapMemory source guards cover registered borrows, not every
 possible in-flight GPU/Metal reference or unobserved guest pointer. Real Apple

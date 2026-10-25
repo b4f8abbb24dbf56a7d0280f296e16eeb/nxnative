@@ -1,7 +1,7 @@
 # Tests that need no game files, keys or GPU. GitHub's macOS runners are virtual Macs without Metal 4 (issue #112), so the tests that go through mtl_init
 # (t_nvn, t_mip_extent, t_rt_range and the rest of dm/gfx/tests' run list) stay local: run `make -C dm/gfx/tests GAME=<id> run` on an Apple-silicon Mac.
 # `profile_guess.py --check` stays local too: it compares the guesses with the extractions of the games (it needs their files).
-name: Partial reclaim and explicit runtime exact-head ARM64 validation
+name: Default-off reclaim flag and diagnostics exact-head ARM64 validation
 
 on:
   push:
@@ -34,13 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
+          ref: f9452470217a8471ccde67afbfface98ab4eb49b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
-          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
+          test "$(git rev-parse HEAD)" = f9452470217a8471ccde67afbfface98ab4eb49b
+          test "$(git rev-parse HEAD^{tree})" = fb4ccd8b055c41bd0797db0a3d6db13f14e90a64
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -83,13 +83,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
+          ref: f9452470217a8471ccde67afbfface98ab4eb49b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
-          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
+          test "$(git rev-parse HEAD)" = f9452470217a8471ccde67afbfface98ab4eb49b
+          test "$(git rev-parse HEAD^{tree})" = fb4ccd8b055c41bd0797db0a3d6db13f14e90a64
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -126,13 +126,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
+          ref: f9452470217a8471ccde67afbfface98ab4eb49b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
-          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
+          test "$(git rev-parse HEAD)" = f9452470217a8471ccde67afbfface98ab4eb49b
+          test "$(git rev-parse HEAD^{tree})" = fb4ccd8b055c41bd0797db0a3d6db13f14e90a64
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -178,13 +178,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
+          ref: f9452470217a8471ccde67afbfface98ab4eb49b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
-          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
+          test "$(git rev-parse HEAD)" = f9452470217a8471ccde67afbfface98ab4eb49b
+          test "$(git rev-parse HEAD^{tree})" = fb4ccd8b055c41bd0797db0a3d6db13f14e90a64
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -214,13 +214,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
+          ref: f9452470217a8471ccde67afbfface98ab4eb49b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
-          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
+          test "$(git rev-parse HEAD)" = f9452470217a8471ccde67afbfface98ab4eb49b
+          test "$(git rev-parse HEAD^{tree})" = fb4ccd8b055c41bd0797db0a3d6db13f14e90a64
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -515,6 +515,177 @@ jobs:
                 clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" 2>&1 | tee "../../../logs/$name-build.log"
                 "$binary" 2>&1 | tee "../../../logs/$name.log"
                 grep -Fq "$marker" "../../../logs/$name.log"
+              done
+            done
+          done
+      - name: Independent bounded reclaim flag selection and rollback (165 cases per variant)
+        if: ${{ !cancelled() }}
+        run: |
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_reclaim_flag_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 8b52bd355884db028f400eca37d994b3c76786eebb4dff7b8ccb44a621a98a48
+          cd dm/host/tests
+          mkdir -p "build/ci-reclaim-flag-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          sources=(../hle_memory_runtime.c ../hle_standard_allocator_policy.c
+                   ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c
+                   ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+                   ../hle_standard_allocator_adapter.c ../hle_memory_hooks.c)
+          # Twenty native/forced-page, budget and sanitizer variants overall.
+          # The runtime environment flag introduces no new build/stamp variable.
+          # No adapter or memory-hooks testing define bypasses authorization.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for budget in limited unlimited; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -Wno-unused-function -pthread
+                       -I. -I.. -Imap_memory_profile -Iaddress_space_profile
+                       -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_EXPERIMENTAL_SHARED_MEMORY=1)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$budget" = unlimited ]; then flags+=(-DDM_GAME_MEM_MAP_LIMIT=0); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                name="reclaim-flag-$sanitizer-$page-$budget"
+                binary="build/ci-reclaim-flag-$MODE/$name"
+                clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" 2>&1 | tee "../../../logs/$name-build.log"
+                "$binary" 2>&1 | tee "../../../logs/$name.log"
+                grep -Fq 'independent reclaim flag: strict selection, original ownership gates, transactional rollback and off differential passed (165 cases)' "../../../logs/$name.log"
+              done
+            done
+          done
+      - name: Independent compiled-off and unaligned bounded reclaim gates (165 cases per variant)
+        if: ${{ !cancelled() }}
+        run: |
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_reclaim_flag_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 8b52bd355884db028f400eca37d994b3c76786eebb4dff7b8ccb44a621a98a48
+          cd dm/host/tests
+          mkdir -p "build/ci-reclaim-flag-gates-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          sources=(../hle_memory_runtime.c ../hle_standard_allocator_policy.c
+                   ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c
+                   ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+                   ../hle_standard_allocator_adapter.c ../hle_memory_hooks.c)
+          # Ten compiled-off and ten unaligned gate executions overall.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for gate in compiled-off unaligned; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -Wno-unused-function -pthread
+                       -I. -I.. -Imap_memory_profile -Iaddress_space_profile -DDM_GAME_ALLOC_BIG_ALIGN=1)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                # Compiled-off omits the existing experimental compile define;
+                # neither gate adds any adapter or memory-hooks testing define.
+                if [ "$gate" = unaligned ]; then
+                  flags+=(-DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DMEMORY_EXPERIMENT_NO_ALIGNED_LEASES)
+                fi
+                name="reclaim-flag-gate-$gate-$sanitizer-$page"
+                binary="build/ci-reclaim-flag-gates-$MODE/$name"
+                clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" 2>&1 | tee "../../../logs/$name-build.log"
+                "$binary" 2>&1 | tee "../../../logs/$name.log"
+                grep -Fq 'independent reclaim flag: strict selection, original ownership gates, transactional rollback and off differential passed (165 cases)' "../../../logs/$name.log"
+              done
+            done
+          done
+      - name: Check out frozen explicit-runtime baseline for reclaim-off differential
+        if: ${{ !cancelled() }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
+          path: .ci-reclaim-flag-baseline
+          sparse-checkout: dm/host
+          persist-credentials: false
+      - name: Reclaim absent and zero match frozen explicit-runtime behavior (38 cases per side)
+        if: ${{ !cancelled() }}
+        run: |
+          baseline="$GITHUB_WORKSPACE/.ci-reclaim-flag-baseline"
+          test "$(git -C "$baseline" rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
+          test "$(git -C "$baseline" rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_reclaim_flag_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 8b52bd355884db028f400eca37d994b3c76786eebb4dff7b8ccb44a621a98a48
+          output="$GITHUB_WORKSPACE/dm/host/tests/build/ci-reclaim-flag-diff-$MODE"
+          logs="$GITHUB_WORKSPACE/logs"
+          mkdir -p "$output"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          sources=(../hle_memory_runtime.c ../hle_standard_allocator_policy.c
+                   ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c
+                   ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+                   ../hle_standard_allocator_adapter.c ../hle_memory_hooks.c)
+          # Twenty same-harness pairs: compare native stdout, not a Linux hash
+          # or architecture-dependent metadata/RSS value. Each side checks38
+          # absent/zero scenarios and emits its operation trace plus marker.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for budget in limited unlimited; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -Wno-unused-function -pthread
+                       -I. -I.. -Imap_memory_profile -Iaddress_space_profile
+                       -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_EXPERIMENTAL_SHARED_MEMORY=1 -DDM_RECLAIM_REVIEW_BASELINE)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$budget" = unlimited ]; then flags+=(-DDM_GAME_MEM_MAP_LIMIT=0); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                name="reclaim-flag-off-$sanitizer-$page-$budget"
+                for version in baseline current; do
+                  src="$GITHUB_WORKSPACE"
+                  if [ "$version" = baseline ]; then src="$baseline"; fi
+                  cd "$src/dm/host/tests"
+                  binary="$output/$name-$version"
+                  clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" 2>&1 | tee "$logs/$name-$version-build.log"
+                  "$binary" > "$logs/$name-$version.log"
+                  grep -Fq 'independent reclaim flag: strict selection, original ownership gates, transactional rollback and off differential passed (38 cases)' "$logs/$name-$version.log"
+                done
+                cmp "$logs/$name-baseline.log" "$logs/$name-current.log"
+                echo "reclaim-off differential: 38 cases and operation trace byte-identical ($sanitizer/$page/$budget)" | tee "$logs/$name-result.log"
+              done
+            done
+          done
+      - name: Independent diagnostics saturation and deterministic stale-copy sampling
+        if: ${{ !cancelled() }}
+        run: |
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_reclaim_diagnostics_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 940489906aed838d88d6bd542705d00909943922686dde0fade48109e8077bba
+          cd dm/host/tests
+          mkdir -p "build/ci-reclaim-diagnostics-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          sources=(../hle_memory_runtime.c ../hle_standard_allocator_policy.c
+                   ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c
+                   ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c)
+          # Twenty ordinary and twenty stale-copy variants overall. The native
+          # Apple default may already be 16K; this is not a true 4K-host claim.
+          # These diagnostics-only testing defines never enter the separate
+          # reclaim-flag/production-authorization fixture's compile flags.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for budget in limited unlimited; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -pthread
+                       -I. -I.. -Imap_memory_profile -Iaddress_space_profile
+                       -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_SA_ADAPTER_TESTING -DDM_VAMM_ADAPTER_TESTING)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$budget" = unlimited ]; then flags+=(-DDM_GAME_MEM_MAP_LIMIT=0); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                for variant in ordinary stale-copy; do
+                  name="reclaim-diagnostics-$variant-$sanitizer-$page-$budget"
+                  binary="build/ci-reclaim-diagnostics-$MODE/$name"
+                  if [ "$variant" = stale-copy ]; then
+                    adapter_object="build/ci-reclaim-diagnostics-$MODE/$name-adapter.o"
+                    # Rename ONLY inside this adapter translation unit. The
+                    # fixture wrapper calls the real mutex-protected accessor,
+                    # then pauses after its returned copy; core/owner are real.
+                    clang "${flags[@]}" -Ddm_sa_get_page_diagnostics=review_get_page_diagnostics \
+                      -c ../hle_standard_allocator_adapter.c -o "$adapter_object" 2>&1 | tee "../../../logs/$name-adapter-build.log"
+                    clang "${flags[@]}" -DDM_REVIEW_STALE_SAMPLER -o "$binary" "$fixture" \
+                      "${sources[@]}" "$adapter_object" 2>&1 | tee "../../../logs/$name-build.log"
+                  else
+                    clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" \
+                      ../hle_standard_allocator_adapter.c 2>&1 | tee "../../../logs/$name-build.log"
+                  fi
+                  "$binary" 2>&1 | tee "../../../logs/$name.log"
+                  grep -Fq 'independent page diagnostics: saturation first-success, sampling, coherent range/snapshot and detached core/owner lifetime copies passed' "../../../logs/$name.log"
+                  grep -Fq 'saturated first reclaim: before=1 after=2 actual_successes=1' "../../../logs/$name.log"
+                done
               done
             done
           done

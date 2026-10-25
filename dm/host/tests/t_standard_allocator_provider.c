@@ -360,10 +360,17 @@ static void test_sparse_core_stats(owner *o, dm_sa_sdk_owner callbacks) {
     assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
 }
 static size_t sparse_metadata_calls, sparse_metadata_failure;
+static int capture_diagnostic_tail;
+static dm_sa_page_diagnostics *diagnostic_tail;
 static void *sparse_metadata_alloc(void *context, size_t size) {
     (void)context;
     if (++sparse_metadata_calls == sparse_metadata_failure) return NULL;
-    return malloc(size);
+    void *allocation = malloc(size);
+    if (capture_diagnostic_tail && allocation) {
+        assert(size >= sizeof(dm_sa_page_diagnostics)); capture_diagnostic_tail = 0;
+        diagnostic_tail = (dm_sa_page_diagnostics *)((unsigned char *)allocation + size - sizeof(dm_sa_page_diagnostics));
+    }
+    return allocation;
 }
 static void sparse_metadata_free(void *context, void *pointer) { (void)context; free(pointer); }
 static void decommit_free_tail(dm_sa_provider *p, const dm_sa_span *lease, size_t offset) {
@@ -396,15 +403,20 @@ static void test_sparse_core_recommit(owner *o, dm_sa_sdk_owner callbacks) {
         dm_sa_stats after = stats(a);
         assert(after.metadata_bytes == before.metadata_bytes && after.committed_bytes == PAGE &&
                after.allocation_count == 1 && after.allocated_bytes == 32 && o->page_calls == page_calls);
+        assert(!after.pages.sequence);
     }
     sparse_metadata_failure = 0;
     out = (void *)1; o->fail_pages = 1;
     assert(dm_sa_allocate(a, PAGE, PAGE, &out) == DM_SA_PROVIDER_FAILED && out == (void *)1);
     assert(stats(a).committed_bytes == PAGE && stats(a).metadata_bytes == before.metadata_bytes);
+    assert(stats(a).pages.recommit_attempts == 1 && !stats(a).pages.recommit_successes &&
+           stats(a).pages.recommit_requested_range_bytes == PAGE && stats(a).pages.page_failures == 1);
     assert(dm_sa_allocate(a, PAGE, PAGE, &out) == DM_SA_OK && out == (unsigned char *)anchor + PAGE);
     for (size_t i = 0; i < PAGE; ++i) assert(!((unsigned char *)out)[i]);
     for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x37);
     assert(stats(a).committed_bytes == 2 * PAGE);
+    assert(stats(a).pages.recommit_attempts == 2 && stats(a).pages.recommit_successes == 1 &&
+           stats(a).pages.recommit_successful_range_bytes == PAGE);
     assert(dm_sa_free(a, out) == DM_SA_OK && dm_sa_free(a, anchor) == DM_SA_OK);
     assert(dm_sa_destroy(a) == DM_SA_OK);
 
@@ -455,6 +467,7 @@ static void test_sparse_core_recommit(owner *o, dm_sa_sdk_owner callbacks) {
     assert(dm_sa_reallocate(a, anchor, 3 * PAGE, &out) == DM_SA_BUSY && out == (void *)1);
     assert(dm_sa_get_size(a, anchor, &usable) == DM_SA_OK && usable == PAGE);
     assert(stats(a).allocated_bytes == PAGE && stats(a).committed_bytes == 3 * PAGE);
+    assert(stats(a).pages.recommit_successes == 1 && stats(a).pages.publication_busy == 1);
     assert(!mprotect((void *)((uintptr_t)anchor & ~(uintptr_t)(host_page() - 1)), host_page(), PROT_READ | PROT_WRITE));
     for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)anchor)[i] == 0x4d);
     return_borrow(o);
@@ -556,6 +569,11 @@ static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
     dm_sa_stats st = stats(a);
     assert(st.backing_bytes == POOL && st.committed_bytes == PAGE && st.allocated_bytes == 32 && st.allocation_count == 1);
     assert(o->sizes[0] == POOL && captured_lease.token == lease.token);
+    assert(st.pages.sequence == 1 && st.pages.reclaim_attempts == 1 && st.pages.reclaim_successes == 1 &&
+           st.pages.reclaim_requested_range_bytes == POOL - PAGE &&
+           st.pages.reclaim_successful_range_bytes == POOL - PAGE && !st.pages.recommit_attempts);
+    dm_sa_page_diagnostics copied;
+    assert(dm_sa_get_page_diagnostics(a, &copied) == DM_SA_OK && !memcmp(&copied, &st.pages, sizeof copied));
     p.begin(p.context); assert(p.pages.budget(p.context, &after_budget) == DM_SA_OK); p.end(p.context);
     assert(after_budget == before_budget + POOL - PAGE);
     for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x71);
@@ -567,7 +585,13 @@ static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
     assert(stats(a).committed_bytes == 3 * PAGE);
     assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == PAGE);
     calls = o->page_calls;
+    dm_sa_page_diagnostics idle = stats(a).pages;
     assert(dm_sa_trim(a) == DM_SA_OK && o->page_calls == calls); // idempotent holes
+    copied = stats(a).pages; assert(!memcmp(&copied, &idle, sizeof copied));
+    // Requested/successful coverage includes the existing live boundary page;
+    // it is deliberately NOT the newly committed physical delta (two pages).
+    assert(copied.recommit_requested_range_bytes == 3 * PAGE &&
+           copied.recommit_successful_range_bytes == 3 * PAGE);
     assert(dm_sa_reallocate(a, anchor, 3 * PAGE, &reuse) == DM_SA_OK && reuse == anchor);
     memset(anchor, 0x82, 3 * PAGE);
     assert(dm_sa_reallocate(a, anchor, 48, &reuse) == DM_SA_OK && reuse == anchor);
@@ -578,6 +602,27 @@ static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
     o->fail_release = 1;
     assert(dm_sa_trim(a) == DM_SA_PROVIDER_FAILED && stats(a).backing_bytes == POOL);
     assert(dm_sa_trim(a) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+
+    // Test-only seed through the injected host metadata allocator: no exported
+    // mutation hook and no guest bytes. All cumulative fields saturate, not wrap.
+    capture_diagnostic_tail = 1;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK && !capture_diagnostic_tail);
+    assert(dm_sa_allocate(a, POOL, 16, &anchor) == DM_SA_OK);
+    *diagnostic_tail = (dm_sa_page_diagnostics){.sequence = UINT64_MAX - 1,
+        .reclaim_attempts = UINT64_MAX - 1, .reclaim_successes = UINT64_MAX - 1,
+        .reclaim_requested_range_bytes = UINT64_MAX - 8, .reclaim_successful_range_bytes = UINT64_MAX - 8,
+        .recommit_attempts = UINT64_MAX - 1, .recommit_successes = UINT64_MAX - 1,
+        .recommit_requested_range_bytes = UINT64_MAX - 8, .recommit_successful_range_bytes = UINT64_MAX - 8};
+    assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK);
+    assert(dm_sa_reallocate(a, anchor, POOL, &reuse) == DM_SA_OK && reuse == anchor);
+    assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK);
+    copied = stats(a).pages;
+    assert(copied.sequence == UINT64_MAX && copied.reclaim_attempts == UINT64_MAX &&
+           copied.reclaim_successes == UINT64_MAX && copied.recommit_attempts == UINT64_MAX &&
+           copied.recommit_successes == UINT64_MAX && copied.reclaim_requested_range_bytes == UINT64_MAX &&
+           copied.reclaim_successful_range_bytes == UINT64_MAX && copied.recommit_requested_range_bytes == UINT64_MAX &&
+           copied.recommit_successful_range_bytes == UINT64_MAX);
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
 
     // Interior free blocks and both partial boundary pages remain safe. Trim
     // also reclaims unused pool tail pages without moving either live neighbor.
@@ -600,6 +645,7 @@ static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
     sparse_metadata_failure = sparse_metadata_calls + 1; usable = 123; calls = o->page_calls;
     assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_NO_MEMORY && usable == 123);
     assert(o->page_calls == calls && stats(a).allocated_bytes == POOL && stats(a).committed_bytes == POOL);
+    assert(!stats(a).pages.sequence);
     sparse_metadata_failure = 0;
     for (size_t i = 0; i < POOL; ++i) assert(((unsigned char *)anchor)[i] == 0x46);
     assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
@@ -615,6 +661,8 @@ static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
         else bad_run_query = (int)mode - 1;
         assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK && usable == 32);
         assert(stats(a).allocated_bytes == 32 && stats(a).committed_bytes == POOL);
+        assert(stats(a).pages.page_failures == 1 && !stats(a).pages.reclaim_successes &&
+               stats(a).pages.reclaim_attempts == (mode == 1 ? 1u : 0u));
         assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == PAGE);
         for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x55);
         assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
@@ -630,7 +678,9 @@ static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
     return_borrow(o); o->borrow_change = 1;
     assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK && usable == 32);
     assert(stats(a).committed_bytes == POOL && o->borrowed == (uintptr_t)anchor + PAGE);
+    assert(stats(a).pages.change_busy == 1 && !stats(a).pages.reclaim_successes);
     assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == 2 * PAGE);
+    assert(stats(a).pages.reclaim_borrowed_runs == 1 && stats(a).pages.reclaim_successes == 1);
     for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)o->stack)[i] == 0x64);
     return_borrow(o);
     assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == PAGE);

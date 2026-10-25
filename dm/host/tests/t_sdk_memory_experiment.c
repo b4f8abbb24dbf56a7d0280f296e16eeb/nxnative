@@ -223,6 +223,7 @@ static void scenario(unsigned which) {
         }
     }
     if (which == 16) request = DM_MEMORY_EXPERIMENT_NAME;
+    if (which == 18) assert(!setenv(DM_MEMORY_RECLAIM_ENV, "1", 1));
     if (which >= 100 && which < 100 + 2 * DM_VAMM_SYMBOL_COUNT) fail_resolution = (int)which - 100;
     int result = dm_memory_experiment_startup(request, &why);
     if (which < 3) {
@@ -235,7 +236,8 @@ static void scenario(unsigned which) {
             assert(resolver_calls == 2 * DM_VAMM_SYMBOL_COUNT);
             active_sdk_calls(); return;
         }
-        if (which == 16) assert(full_creates == 1 && full_configs == 1 && full_installs == 1 && destroys == 1 && !sdk_creates);
+        if (which == 18) assert(!sdk_creates && !full_creates && !sdk_configs && !full_configs && !sdk_installs && !full_installs && !destroys);
+        else if (which == 16) assert(full_creates == 1 && full_configs == 1 && full_installs == 1 && destroys == 1 && !sdk_creates);
         else if (which == 10) assert(sdk_creates == 1 && !sdk_configs && !sdk_installs && !destroys);
         else if (which == 11) assert(sdk_creates == 1 && sdk_configs == 1 && !sdk_installs && destroys == 1);
         else if (which >= 6) assert(sdk_creates == 1 && sdk_configs == 1 && sdk_installs == 1 && destroys == 1);
@@ -244,6 +246,7 @@ static void scenario(unsigned which) {
         assert(!sdk_creates && !full_creates && !sdk_installs && !full_installs && !destroys);
 #endif
         assert(result == DM_MEMORY_EXPERIMENT_FAILED && why && *why);
+        if (which == 18) assert(strstr(why, "DM_MEMORY_RECLAIM=1") && strstr(why, "SDK-only"));
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
         if (fail_resolution >= 0) assert(resolver_calls == fail_resolution + 1);
 #endif
@@ -287,13 +290,15 @@ static void run_scenario(unsigned which) {
 }
 int main(void) {
     alarm(60); struct rlimit limit = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &limit));
+    assert(!unsetenv(DM_MEMORY_RECLAIM_ENV));
     startup_images_create();
     for (unsigned k = 0; k < 2; ++k) {
         startup_images[k]->slots[10] = (uintptr_t)sdk_original_allocate;
         startup_images[k]->slots[11] = (uintptr_t)sdk_original_free;
         memcpy(original_slots[k], startup_images[k]->slots, sizeof original_slots[k]);
     }
-    for (unsigned i = 0; i <= 17; ++i) run_scenario(i);
+    for (unsigned i = 0; i <= 18; ++i) run_scenario(i);
+    assert(!setenv(DM_MEMORY_RECLAIM_ENV, "0", 1)); run_scenario(12);
     for (unsigned i = 0; i < 2 * DM_VAMM_SYMBOL_COUNT; ++i) run_scenario(100 + i);
     for (unsigned k = 0; k < 2; ++k) assert(!munmap(startup_images[k], startup_image_bytes));
     puts("SDK experiment: real authority separation, original SA, exact requests, native Vamm, rejection cleanup, lifetime: PASS");

@@ -26,6 +26,24 @@ experimental binary. The separately reviewed `za-base-sdk-v1` value selects
 SDK-only mode; any other requested value fails explicitly rather than
 silently falling back. iOS packaging does not opt in automatically.
 
+Partial-page reclamation is a separate, **default-off runtime flag**:
+
+```sh
+DM_EXPERIMENTAL_SHARED_MEMORY=za-base-v1 DM_MEMORY_RECLAIM=1 \
+  dm/host/dmhost /path/to/rewritten-base main sdk
+```
+
+An absent `DM_MEMORY_RECLAIM` or exact `0` preserves whole-lease backing; exact
+`1` selects the page-capable native factory only after the full-mode contract
+passes. Any other value, including an empty string, is invalid. `1` with an
+inactive experiment or SDK-only mode fails clearly rather than becoming a
+silent no-op. The flag is read once at startup, not a live ownership switch.
+It is reusable for future **separately reviewed** full-mode contracts, but it
+does not admit another title, version, module set or SDK: only the Z-A base
+identities below are currently eligible. All existing cuts and metadata bounds
+remain unchanged. Both the experimental build and exact runtime request are
+still required; a failed check stops before guest entry.
+
 Only these **full 32-byte NSO build IDs** are eligible:
 
 | Module | Reviewed identity |
@@ -100,16 +118,67 @@ high-alignment request fits.
 
 Managed Dump still reports nominal capacity, actual leased backing, live
 bytes/blocks, span count, real free/largest budgets, native metadata and closed
-state. Fatal
+state. Existing Dump/event snapshots append `reserved` (the outstanding lease
+extent, also reported as `backing`) and authoritative `committed` bytes. The
+one-time activation policy line names the contract, full/SDK-only mode and
+reclaim on/off. A successful flag request is not evidence that a game has
+actually shrunk or trimmed any allocation; compare the commitment snapshots
+with the exercised operations. Returning pages preserves the virtual reservation
+and does not promise an immediate physical RSS drop. Fatal
 contracts identify the operation/result and explicitly retain ownership. Ordinary
 allocation exhaustion still returns null without SDK fallback.
+
+### Reclaim evidence (only `DM_MEMORY_RECLAIM=1`)
+
+Every managed Initialize emits a zero cumulative page line with
+`route=unexercised`. This means enabled but not yet exercised, **not** a pass or a
+failure. No allocations are forced for diagnostics. Shrink/Trim/reuse/growth
+activity emits copied summaries automatically, even if the game never calls
+Dump: the first four changed observations, powers of two thereafter, and the
+first successful decommit and recommit route. Dump and Finalize also report
+cumulative counters. Reclaim off adds no page sampler or page log lines.
+
+`reclaim_calls`/`recommit_calls` count actual optional provider calls; `*_ok`
+counts returning success. `*_requested_range_bytes` and
+`*_successful_range_bytes` count **callback interval coverage**, not newly freed
+or newly committed physical bytes. A rounded recommit can include an already
+committed live boundary; a concurrent raw SVC can make a call idempotent. The
+line explicitly says `ranges_not_physical_deltas`. Use authoritative `reserved`
+and `committed` snapshots for current state; no immediate RSS reduction or
+successful gameplay is implied by either counters or activation.
+
+`borrowed_reclaim_runs` counts observed borrowed runs skipped during cleanup;
+`borrowed_recommit` counts a borrowed preparation interval. `budget_denials`
+counts definite insufficient-headroom recommit prechecks, **not** every failed
+allocation or the deliberate backed-first search. `change_no_memory` and
+`change_busy` separately record provider callback results without guessing their
+cause. `page_failures` records operational page query/contract/other callback
+failures; diagnostic stats queries do not increment it. `publication_busy`
+records unavailable payload/source revalidation, which retains new owned pages
+rather than rolling them back unsafely. Best-effort cleanup failure still cannot
+turn a successful logical shrink into failure. `route=attempted` has calls but
+no successful callback; `skipped` has observations but no callback; `observed`
+means at least one callback succeeded, with the two directions shown separately.
+
+Counters and sequence saturate at `UINT64_MAX`. They are updated under the core
+mutex, kept only in a fixed-size optional host-metadata tail, and copied without
+provider callbacks for sampling. There is no per-operation allocation or IO in
+the core. Extra stats scans happen only for emitted samples. An in-flight or
+exclusive lifecycle reference protects every copy; notification contains no
+live-core pointer and runs after all locks/references are released. Finalize
+captures its final counters before destroying the core. Sequence orders copied
+state, **not console delivery** across threads; match self/generation/sequence.
+At sequence saturation periodic sampling stops, but the first successful route
+still forces a sample; Dump/Finalize continue to copy the saturated totals. The observer must not reenter the adapter or call guest code.
 
 ## Source-only verification
 
 ```sh
 make -C dm/host/tests memory-experiment standard-allocator-events
 ASAN_OPTIONS=detect_leaks=0 make -C dm/host/tests memory-experiment-sanitize standard-allocator-events-sanitize
-make -C dm/host/tests standard-allocator-events-tsan
+make -C dm/host/tests standard-allocator-events-tsan memory-runtime-reclaim-tsan
+make -C dm/host/tests memory-runtime-reclaim standard-allocator-provider
+ASAN_OPTIONS=detect_leaks=0 make -C dm/host/tests memory-runtime-reclaim-sanitize standard-allocator-provider-sanitize
 python3 -m unittest discover -s dm/tools/tests -p 'test_full_build_identity.py'
 python3 -m unittest discover -s dm/tools/tests -p 'test_memory_experiment_startup_order.py'
 ```

@@ -189,7 +189,7 @@ class ActivationSourceContract(unittest.TestCase):
     def test_actual_runtime_factory_loader_and_failure_cleanup(self):
         source = (HOST / 'hle_memory_experiment.c').read_text()
         body = source[source.index('int dm_memory_experiment_startup('):]
-        create = body.index('create_contract_runtime(selected, &runtime)')
+        create = body.index('create_contract_runtime(selected, reclaim, &runtime)')
         self.assertLess(body.index('preflight_contract(selected,'), create)
         constructor = source[source.index('static inline dm_sa_result create_contract_runtime('):source.index('int dm_memory_experiment_startup(')]
         self.assertIn('validate_contract(c)', constructor)
