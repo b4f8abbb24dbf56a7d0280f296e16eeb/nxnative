@@ -45,9 +45,13 @@ forwarding. The loader's normal relocation resolver gives the published memory
 group precedence over forced HLE entries. This is not a promise that arbitrary
 private symbol lookup, computed calls or inline object access is intercepted.
 
-`DM_HLECOUNT` currently returns unwrapped targets after counting pages are sealed.
-If that differs from a slot's existing wrapper, preflight rejects installation
-without modifying it. There is no guessed wrapper unwrapping or special bypass.
+`DM_HLECOUNT` keeps cached `(name, implementation)` wrapper identities stable
+after counting pages are sealed, so the ordinary resolver still agrees with
+already-relocated slots. Reuse only reads existing stubs; new names or changed
+implementations still return the unwrapped target with the existing diagnostic,
+without generating code or reopening executable pages. Sealing an empty pool
+also closes stub creation. Preflight still requires
+an exact slot match; there is no guessed wrapper unwrapping or special bypass.
 
 ## Native lifetime contract, not permission to enable
 
@@ -103,5 +107,9 @@ without fixture macros; a complete real-shaped census cannot bypass production.
 
 The Apple fixture additionally drives ordinary `relocate`, the existing forced
 Allocate policy, and `loader_install_memory_hooks`, then verifies published
-`bind_sym` precedence. It is part of the Apple host aggregate, not claimed as run
-on Linux. No proprietary binaries or fixed private offsets are included.
+`bind_sym` precedence. Separate runs disable and enable real `DM_HLECOUNT`;
+the counted run seals before installation, verifies exact wrapper rollback,
+immutable RX stub pages, late-entry fallback, executable host-only counters and
+the TSV report. A third run seals an empty pool and rejects late stub creation.
+It is part of the Apple host aggregate, not claimed as run on
+Linux. No proprietary binaries or fixed private offsets are included.

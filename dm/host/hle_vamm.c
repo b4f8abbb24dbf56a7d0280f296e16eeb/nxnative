@@ -97,13 +97,18 @@ dm_vamm_resource_usage dm_vamm_resources(dm_vamm *v) {
     pthread_mutex_unlock(&v->mutex); return r;
 }
 uint32_t dm_vamm_allocate(dm_vamm *v, uintptr_t *out, size_t size, int commit) {
-    if (!v || !out || !size || size % PAGE || (commit != 0 && commit != 1)) return DM_VAMM_INVALID;
+    return dm_vamm_allocate_aligned(v, out, size,
+                                   size < LARGE_ALIGNMENT ? SMALL_ALIGNMENT : LARGE_ALIGNMENT, commit);
+}
+uint32_t dm_vamm_allocate_aligned(dm_vamm *v, uintptr_t *out, size_t size,
+                                  size_t alignment, int commit) {
+    if (!v || !out || !size || size % PAGE || !power_two(alignment) || alignment < PAGE ||
+        (commit != 0 && commit != 1)) return DM_VAMM_INVALID;
     pthread_mutex_lock(&v->mutex);
     uint32_t result = DM_VAMM_INVALID;
     if (!v->initialized) goto done;
     if (v->count == v->config.max_regions) { result = DM_VAMM_NO_MEMORY; goto done; }
     result = DM_VAMM_NO_SPACE;
-    size_t alignment = size < LARGE_ALIGNMENT ? SMALL_ALIGNMENT : LARGE_ALIGNMENT;
     // Descending free intervals, lowest aligned address within the chosen hole.
     for (size_t k = v->count + 1; k; --k) {
         size_t i = k - 1; uintptr_t base;
@@ -145,14 +150,16 @@ uint32_t dm_vamm_free(dm_vamm *v, uintptr_t base) {
 done:
     pthread_mutex_unlock(&v->mutex); return result;
 }
-uint32_t dm_vamm_get_stats(dm_vamm *v, size_t alignment, dm_vamm_stats *out) {
-    if (!v || !out || !power_two(alignment)) return DM_VAMM_INVALID;
+static uint32_t get_stats(dm_vamm *v, size_t alignment, int explicit_alignment, dm_vamm_stats *out) {
+    if (!v || !out || !power_two(alignment) || (explicit_alignment && alignment < PAGE))
+        return DM_VAMM_INVALID;
     pthread_mutex_lock(&v->mutex);
     dm_vamm_stats s = {v->count, v->reserved, sizeof *v + v->config.max_regions * sizeof(region), 0, 0};
     if (v->initialized && v->count < v->config.max_regions) {
         size_t usable_gaps = 0;
         for (size_t i = 0; i <= v->count; ++i) {
-            size_t n = largest_gap(v, i, alignment);
+            uintptr_t ignored;
+            size_t n = explicit_alignment ? gap(v, i, alignment, &ignored) : largest_gap(v, i, alignment);
             s.available_bytes += n; usable_gaps += n != 0;
             if (n > s.largest_region) s.largest_region = n;
         }
@@ -161,4 +168,10 @@ uint32_t dm_vamm_get_stats(dm_vamm *v, size_t alignment, dm_vamm_stats *out) {
         if (usable_gaps > v->config.max_regions - v->count) s.available_bytes = s.largest_region;
     }
     *out = s; pthread_mutex_unlock(&v->mutex); return 0;
+}
+uint32_t dm_vamm_get_stats(dm_vamm *v, size_t alignment, dm_vamm_stats *out) {
+    return get_stats(v, alignment, 0, out);
+}
+uint32_t dm_vamm_get_aligned_stats(dm_vamm *v, size_t alignment, dm_vamm_stats *out) {
+    return get_stats(v, alignment, 1, out);
 }

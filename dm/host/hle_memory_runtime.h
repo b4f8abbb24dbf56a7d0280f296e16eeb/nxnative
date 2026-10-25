@@ -4,6 +4,11 @@
 #include "hle_standard_allocator_adapter.h"
 #include "hle_vamm_adapter.h"
 
+// This runtime uses alignment-aware exact leases and matching feasibility
+// statistics. It does not promise that any particular alignment/size fits the
+// current guarded address domain or physical budget, and does not enable hooks.
+#define DM_MEMORY_RUNTIME_ALIGNED_LEASES 1
+
 typedef struct dm_memory_runtime dm_memory_runtime;
 // Preallocates one native Vamm owner and its exact-lease provider. Does not
 // initialize Vamm, call guest code, reserve guest addresses or publish hooks.

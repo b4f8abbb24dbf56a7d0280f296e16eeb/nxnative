@@ -443,11 +443,13 @@ run: memory-hooks
 # loader.c itself uses Mach-O/CommonCrypto/AArch64 TSD, so this end-to-end wrapper
 # fixture joins the existing Apple host run, not the portable Linux target.
 MEMORY_HOOK_NATIVE_FLAGS ?= -O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations
-$(B)/t_memory_hooks_loader: t_memory_hooks_loader.c $(MEMORY_HOOK_DEPS) ../loader.c $(GAME_H) | $(B)
+$(B)/t_memory_hooks_loader: t_memory_hooks_loader.c $(MEMORY_HOOK_DEPS) ../loader.c ../hle_count.c $(GAME_H) | $(B)
 	clang $(MEMORY_HOOK_NATIVE_FLAGS) -DDM_MEMORY_HOOKS_TESTING -DDM_SA_ADAPTER_TESTING -DDM_VAMM_ADAPTER_TESTING -I.. $(GINC) -o $@ t_memory_hooks_loader.c $(MEMORY_HOOK_SRCS)
 .PHONY: memory-hooks-loader
 memory-hooks-loader: $(B)/t_memory_hooks_loader
 	$(B)/t_memory_hooks_loader
+	$(B)/t_memory_hooks_loader $(B)/memory-hooks-count.tsv
+	$(B)/t_memory_hooks_loader $(B)/memory-hooks-count-empty.tsv --empty
 run: memory-hooks-loader
 
 $(B)/t_memory_hooks_tsan: $(MEMORY_HOOK_DEPS) | $(B)

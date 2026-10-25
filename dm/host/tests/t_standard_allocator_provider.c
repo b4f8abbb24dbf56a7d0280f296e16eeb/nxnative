@@ -199,7 +199,7 @@ int main(void) {
     uintptr_t alias = info(I_AliasAddr), stack = info(I_StackAddr);
     uintptr_t aligned = (alias + 0xffff) & ~(uintptr_t)0xffff;
     owner o = {.mutex = PTHREAD_MUTEX_INITIALIZER, .base = aligned + SLOT_SIZE, .stack = stack};
-    dm_sa_sdk_owner callbacks = {&o, allocate_original, free_original, reservations, context_active, POOL};
+    dm_sa_sdk_owner callbacks = {&o, allocate_original, free_original, reservations, context_active, POOL, NULL};
     dm_sa_sdk_provider *provider = NULL;
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
     dm_sa_allocator *a = make_allocator(provider);
@@ -262,7 +262,18 @@ int main(void) {
     size_t calls = o.allocation_calls;
     assert(dm_sa_allocate(a, 32, 16, &p) == DM_SA_PROVIDER_FAILED && p == (void *)1);
     assert(o.allocation_calls == calls); guest_active = 1;
+    // An original SDK owner without the explicit-alignment operation remains
+    // truthfully capped: no speculative call, padded map or lucky placement.
     assert(dm_sa_allocate(a, 32, 0x20000, &p) == DM_SA_NO_MEMORY && p == (void *)1);
+    dm_sa_provider fixed = dm_sa_sdk_provider_interface(provider);
+    dm_sa_provider_stats unsupported = {1, 1};
+    dm_sa_span unsupported_lease = {(void *)1, 3, 5};
+    fixed.begin(fixed.context);
+    assert(fixed.query(fixed.context, 0x20000, &unsupported) == DM_SA_OK);
+    assert(!unsupported.available_bytes && !unsupported.largest_span);
+    assert(fixed.acquire(fixed.context, POOL, 0x20000, &unsupported_lease) == DM_SA_NO_MEMORY);
+    fixed.end(fixed.context);
+    assert(unsupported_lease.base == (void *)1 && unsupported_lease.size == 3 && unsupported_lease.token == 5);
     assert(o.allocation_calls == calls);
 
     // Every returned block is backed; source borrow blocks mutations and shows

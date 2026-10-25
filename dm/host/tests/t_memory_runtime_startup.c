@@ -272,7 +272,8 @@ int main(void) {
         assert(dm_sa_adapter_shutdown() == DM_SA_BUSY); // even zero-backing config pins
         assert(dm_memory_runtime_destroy(startup_runtime) == DM_SA_BUSY);
         assert(!ALLOC(self, 0));
-        void *pointer = ALLOC(self, SMALL); assert(pointer && !((uintptr_t)pointer % SMALL));
+        ALIGNED_RUNTIME_TESTS(self, startup_vamm.shared_owner, &startup_allocator);
+        void *pointer = ALLOC(self, SMALL); assert(pointer && !((uintptr_t)pointer % startup_allocator.allocation_alignment(self, SMALL)));
         memset(pointer, 0x71, SMALL);
         query_state((uintptr_t)pointer, 5, 0, 3);
         dm_vamm_stats stats;

@@ -1,4 +1,4 @@
-// Existing-owner SDK leases for the StandardAllocator core. This does NOT
+// Existing-owner exact leases for the StandardAllocator core. This does NOT
 // install hooks, reserve alias addresses itself, or enable the adapter gate.
 #pragma once
 #include "standard_allocator_core.h"
@@ -6,8 +6,9 @@
 typedef struct dm_sa_sdk_provider dm_sa_sdk_provider;
 typedef struct {
     void *context;
-    // These are captured ORIGINAL owner operations, not intercepted allocator
-    // entry points. Zero means success. AllocateMemory returns exactly size
+    // Existing owner operations, not intercepted allocator entry points. SDK
+    // integrations capture ORIGINAL operations; native owners supply their own
+    // verified equivalents. Zero means success. AllocateMemory returns exactly size
     // mapped bytes; FreeAddressRegion releases that exact complete reservation.
     // A returning failure MUST preserve the reservation and mapped bytes.
     uint32_t (*allocate_memory)(void *context, uintptr_t *out, size_t size);
@@ -18,13 +19,20 @@ typedef struct {
     // separately against the real SVC accounting after this callback returns.
     dm_sa_result (*query_reservations)(void *context, size_t alignment,
                                        dm_sa_provider_stats *out);
-    // Verify caller is already in the correct guest thread/TLS/gate context.
+    // SDK owner: verify the correct guest thread/TLS/gate context. Native owner:
+    // verify its retained, initialized capability without creating guest TLS.
     // No provider callback creates guest TLS or runs an SDK on a host worker.
     int (*guest_context_active)(void *context);
     // Guaranteed absolute alignment of EVERY successful original allocation.
-    // Requests above this fail without calling the owner: no padding hidden
-    // from physical accounting and no fabricated larger contiguous region.
+    // Without allocate_memory_aligned, requests above this fail without calling
+    // the owner: no hidden padding or fabricated larger contiguous region.
     size_t guaranteed_alignment;
+    // Optional verified owner operation, used for EVERY lease when present.
+    // Returns exactly size mapped bytes at the explicit absolute alignment;
+    // no padded mapping/interior pointer. query_reservations must use this same
+    // alignment policy. Original SDK owners leave this NULL unless proven.
+    uint32_t (*allocate_memory_aligned)(void *context, uintptr_t *out, size_t size,
+                                        size_t alignment);
 } dm_sa_sdk_owner;
 
 // Callbacks are trusted, verified integration boundaries, not plugin hooks.

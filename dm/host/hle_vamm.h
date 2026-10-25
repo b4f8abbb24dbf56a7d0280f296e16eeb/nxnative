@@ -25,7 +25,7 @@ typedef struct {
 typedef struct {
     size_t regions, reserved_bytes, metadata_bytes;
     // One maximal legal payload per current free interval, after guards and
-    // size-dependent alignment. Sum is conservative if holes could be split.
+    // the queried alignment policy. Sum is conservative if holes could be split.
     // Not a physical budget; provider must clamp separately under its guard.
     size_t available_bytes, largest_region;
 } dm_vamm_stats;
@@ -44,8 +44,17 @@ dm_vamm_resource_usage dm_vamm_resources(dm_vamm *owner);
 // 4 KiB guard on EACH side (neighbors may share their separating guard page).
 // No rounding or smaller success.
 uint32_t dm_vamm_allocate(dm_vamm *owner, uintptr_t *out, size_t size, int commit);
+// Internal native-lease operation, NOT an SDK entry point. Exact power-of-two
+// absolute alignment >= 4 KiB replaces the SDK's size-dependent default; same
+// guards, exact payload/backing size, placement order and rollback contract.
+uint32_t dm_vamm_allocate_aligned(dm_vamm *owner, uintptr_t *out, size_t size,
+                                  size_t alignment, int commit);
 uint32_t dm_vamm_pages(dm_vamm *owner, uintptr_t base, size_t size, int commit);
 // Decommit exact entire payload before removing its record. Any backend error
 // (including borrowed-source rejection) retains reservation and page ownership.
 uint32_t dm_vamm_free(dm_vamm *owner, uintptr_t base);
+// SDK-default placement with alignment as an additional minimum constraint.
 uint32_t dm_vamm_get_stats(dm_vamm *owner, size_t alignment, dm_vamm_stats *out);
+// Exact explicit-alignment placement used by dm_vamm_allocate_aligned. These
+// virtual-only bounds must be clamped to the current physical budget separately.
+uint32_t dm_vamm_get_aligned_stats(dm_vamm *owner, size_t alignment, dm_vamm_stats *out);
