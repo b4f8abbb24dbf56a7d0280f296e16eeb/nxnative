@@ -12,6 +12,12 @@ void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (
 void bf_want_note(const char *key);
 
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
+// Ordinary pools use an exact, non-recycled registration token, not CPU identity.
+// This owns registration metadata/Metal references, not the caller's storage.
+uint64_t mtl_pool_register(const void *mem, uint64_t size);
+void mtl_pool_unregister(uint64_t registration);
+// Identity-only registrations for sparse runs and direct replay fixtures. These
+// cannot unregister an ordinary pool, even if its CPU start is identical.
 void mtl_pool_add(const void *mem, uint64_t size);
 void mtl_pool_del(const void *mem);
 // memory pool Finalize: evict the textures built on this pool (pool object address) from the storage-sharing table
