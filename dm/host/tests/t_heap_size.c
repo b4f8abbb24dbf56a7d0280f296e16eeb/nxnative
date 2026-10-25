@@ -30,6 +30,9 @@ void guest_clock_read_wait(void) {}
 uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
+pthread_key_t g_keytlr;
+int dm_ue_heap_owns(uint64_t address, uint64_t size) { (void)address; (void)size; return 0; }
+void dm_entropy_bytes(void *out, size_t size) { (void)out; (void)size; assert(!"unexpected IPC entropy request"); }
 void dm_guest_write_prepare(void *addr, size_t size) { (void)addr; (void)size; }
 
 static size_t page, old_size, requested;

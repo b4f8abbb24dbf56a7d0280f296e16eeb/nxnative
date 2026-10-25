@@ -1,6 +1,7 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
+#include "hle_ipc.h"
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
@@ -251,11 +252,113 @@ static void *alias_windows_thread(void *arg) {
     return NULL;
 }
 
+// Synchronous service buffers borrow only known guest domains. g_map_lock
+// stabilizes heap/alias/mapped-destination backing through parsing and writes;
+// static module backing and this caller's own active stack/TLR are permanent
+// for the call. In particular, do NOT use dm_ue_heap_owns here: host RW mapping
+// is not proof of guest allocation ownership. NRO lifetime is not integrated.
+static int ipc_memory_locked(uint64_t address, uint64_t size, int write, const void *tlr) {
+    if (size > SIZE_MAX || size > UINT64_MAX - address) return 0;
+    if (!size) return 1;
+    if (!address || map_source_busy(address, size)) return 0;
+    if (tlr && memory_contains((uintptr_t)tlr, DM_IPC_TLS_CAPACITY, address, size)) return 1;
+    if (memory_contains((uintptr_t)g_heap, g_heap_cur, address, size)) return 1;
+    if (memory_contains((uintptr_t)g_alias, g_alias_cap, address, size)) {
+        uint64_t first = (address - (uintptr_t)g_alias) & ~UINT64_C(0xfff);
+        uint64_t end = (address - (uintptr_t)g_alias + size + 0xfff) & ~UINT64_C(0xfff);
+        return !alias_unmapped(first, end - first);
+    }
+    int k = map_find(address, size);
+    if (k && memory_contains(g_map[k - 1].base, g_map[k - 1].size, address, size)) return 1;
+    module_t *m = module_of((void *)(uintptr_t)address);
+    if (m && !m->nro && m->loaded && memory_contains((uintptr_t)m->base, m->size, address, size)) {
+        if (!write) return 1;
+        uint64_t lo = m->data_off ? m->data_off : (m->ro_off ? m->ro_off : m->text_end);
+        uint64_t hi = m->patch_off > 0 ? (uint64_t)m->patch_off : m->size;
+        uint64_t off = address - (uintptr_t)m->base, perm = 3;
+        module_data_query(m, off, &lo, &hi, &perm);
+        return perm == 3 && hi >= lo && memory_contains(lo, hi - lo, off, size);
+    }
+    // The same existing current-stack metadata used by QueryMemory below. This
+    // admits the guest main caller's stack, not another thread's or arbitrary VM.
+    uint64_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+    uint64_t count = pthread_get_stacksize_np(pthread_self());
+    return top >= count && memory_contains(top - count, count, address, size);
+}
+static int ipc_output_valid(void *context, uint64_t address, uint64_t size) {
+    return ipc_memory_locked(address, size, 1, context);
+}
+static void ipc_output_fill(void *context, uint64_t address, size_t size) {
+    (void)context;
+    if (!size) return;
+    void dm_entropy_bytes(void *out, size_t size);
+    dm_guest_write_prepare((void *)(uintptr_t)address, size);
+    dm_entropy_bytes((void *)(uintptr_t)address, size);
+}
+static void ipc_message_prepare(void *context, void *message, size_t size) {
+    (void)context; dm_guest_write_prepare(message, size);
+}
+static dm_ipc *g_ipc;
+static void ipc_initialize(void) { g_ipc = dm_ipc_create(DM_IPC_MAX_SESSIONS); }
+dm_ipc *dm_ipc_host(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ipc_initialize); return g_ipc;
+}
+uint32_t dm_ipc_host_send(uint32_t handle, void *message, size_t capacity) {
+    dm_ipc *ipc = dm_ipc_host();
+    if (!ipc) return DM_IPC_OUT_OF_HANDLES;
+    mem_init();
+    void *tlr = pthread_getspecific(g_keytlr);
+    pthread_mutex_lock(&g_map_lock);
+    uint32_t result = DM_IPC_INVALID_MEMORY;
+    if (message && capacity && ipc_memory_locked((uintptr_t)message, capacity, 1, tlr)) {
+        dm_ipc_memory memory = {tlr, ipc_output_valid, ipc_output_fill, ipc_message_prepare};
+        result = dm_ipc_dispatch(ipc, handle, message, capacity, &memory);
+    }
+    pthread_mutex_unlock(&g_map_lock); return result;
+}
+static int ipc_svc(int num, uint64_t *regs) {
+    if (num == 0x16 && dm_ipc_owns_handle((uint32_t)regs[0])) {
+        regs[0] = dm_ipc_close(dm_ipc_host(), (uint32_t)regs[0]); return 1;
+    }
+    if (num == 0x1f) {
+        char name[12]; size_t length = 0;
+        uint64_t address = regs[1];
+        void *tlr = pthread_getspecific(g_keytlr);
+        uint32_t result = DM_IPC_INVALID_MEMORY, handle;
+        pthread_mutex_lock(&g_map_lock);
+        while (length < sizeof name && address <= UINT64_MAX - length && ipc_memory_locked(address + length, 1, 0, tlr)) {
+            name[length] = *(const char *)(uintptr_t)(address + length);
+            if (!name[length]) { result = dm_ipc_host() ? dm_ipc_connect_port(dm_ipc_host(), name, length, &handle) : DM_IPC_OUT_OF_HANDLES; break; }
+            ++length;
+        }
+        pthread_mutex_unlock(&g_map_lock);
+        regs[0] = result; if (!result) regs[1] = handle;
+        return 1;
+    }
+    if (num == 0x21) {
+        void *message = pthread_getspecific(g_keytlr);
+        regs[0] = dm_ipc_host_send((uint32_t)regs[0], message, DM_IPC_TLS_CAPACITY); return 1;
+    }
+    if (num == 0x22) {
+        uint64_t address = regs[0], size = regs[1];
+        uint32_t result;
+        if (address & 0xfff) result = DM_IPC_INVALID_ADDRESS;
+        else if (!size || (size & 0xfff)) result = DM_IPC_INVALID_SIZE;
+        else if (size > SIZE_MAX || size > UINT64_MAX - address) result = DM_IPC_INVALID_MEMORY;
+        else result = dm_ipc_host_send((uint32_t)regs[2], (void *)(uintptr_t)address, (size_t)size);
+        regs[0] = result; return 1;
+    }
+    return 0;
+}
+
 int svc_thread(int num, uint64_t *regs);   // hle_thread.c: thread and synchronization kind
 
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT: svc counts by number
     mem_init();
+    // Owned service CloseHandle must be routed before the generic handle path.
+    if (ipc_svc(num, regs)) return regs[0];
     if (svc_thread(num, regs)) return regs[0];
     switch (num) {
     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base

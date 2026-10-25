@@ -37,8 +37,8 @@ nro: $(B)/t_nro
 	$(B)/t_nro
 $(GAME_H):
 	$(MAKE) -C .. game_profile GAME=$(GAME)
-$(B)/t_heap_size: t_heap_size.c ../hle_svc.c ../dm.h $(GAME_H) | $(B)
-	clang -O1 -Wall -Werror -Wno-unused-function -fsanitize=undefined -I.. $(GINC) -o $@ t_heap_size.c
+$(B)/t_heap_size: t_heap_size.c ../hle_svc.c ../hle_ipc.c ../hle_ipc.h ../dm.h $(GAME_H) | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -fsanitize=undefined -I.. $(GINC) -o $@ t_heap_size.c ../hle_ipc.c
 .PHONY: heap_size
 heap_size: $(B)/t_heap_size
 	$(B)/t_heap_size
@@ -94,17 +94,17 @@ tsan: $(B)/t_audio_spsc_tsan
 	$(B)/t_audio_spsc_tsan
 
 MEM_FLAGS = -O1 -Wall -Werror -Wno-unused-function -Imemory_profile -I..
-MEM_DEPS = t_svc_memory.c memory_profile/game_profile.h ../hle_svc.c ../hle_guestthread.c ../hle.h ../dm.h
+MEM_DEPS = t_svc_memory.c memory_profile/game_profile.h ../hle_svc.c ../hle_ipc.c ../hle_ipc.h ../hle_guestthread.c ../hle.h ../dm.h
 $(B)/t_svc_memory: $(MEM_DEPS) | $(B)
-	clang $(MEM_FLAGS) -fsanitize=undefined -o $@ t_svc_memory.c
+	clang $(MEM_FLAGS) -fsanitize=undefined -o $@ t_svc_memory.c ../hle_ipc.c
 $(B)/t_svc_memory_unlimited: $(MEM_DEPS) | $(B)
-	clang $(MEM_FLAGS) -fsanitize=undefined -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_svc_memory.c
+	clang $(MEM_FLAGS) -fsanitize=undefined -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_svc_memory.c ../hle_ipc.c
 $(B)/t_svc_memory_16k: $(MEM_DEPS) | $(B)
-	clang $(MEM_FLAGS) -fsanitize=address,undefined -DTEST_PAGE_16K -o $@ t_svc_memory.c
+	clang $(MEM_FLAGS) -fsanitize=address,undefined -DTEST_PAGE_16K -o $@ t_svc_memory.c ../hle_ipc.c
 $(B)/t_svc_memory_tsan: $(MEM_DEPS) | $(B)
-	clang $(MEM_FLAGS) -fsanitize=thread -o $@ t_svc_memory.c
+	clang $(MEM_FLAGS) -fsanitize=thread -o $@ t_svc_memory.c ../hle_ipc.c
 $(B)/t_svc_memory_dirty: $(MEM_DEPS) ../../gfx/nvn/nvn_dirty.c ../../gfx/nvn/nvn_dirty.h | $(B)
-	clang $(MEM_FLAGS) -DTEST_REAL_DIRTY -o $@ t_svc_memory.c ../../gfx/nvn/nvn_dirty.c
+	clang $(MEM_FLAGS) -DTEST_REAL_DIRTY -o $@ t_svc_memory.c ../hle_ipc.c ../../gfx/nvn/nvn_dirty.c
 .PHONY: memory memory-tsan memory-dirty memory-profile
 memory: $(B)/t_svc_memory $(B)/t_svc_memory_unlimited $(B)/t_svc_memory_16k
 	$(B)/t_svc_memory
@@ -117,3 +117,31 @@ memory-dirty: $(B)/t_svc_memory_dirty
 memory-profile: $(B)/t_svc_memory
 	$(PYTHON) test_memory_profile.py
 run: memory memory-dirty memory-profile
+
+# Portable original-protocol fixtures, independent of game binaries and Apple APIs.
+IPC_CC ?= cc
+IPC_FLAGS = -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread
+IPC_CORE = ../hle_ipc.c ../hle_ipc.h ipc_wire_fixture.h
+IPC_NATIVE = t_ipc_native.c $(IPC_CORE) ../hle_svc.c ../hle_sf.c ../hle.h ../dm.h memory_profile/game_profile.h
+$(B)/t_ipc_adversarial: t_ipc_adversarial.c $(IPC_CORE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -I.. -o $@ t_ipc_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_adversarial_asan: t_ipc_adversarial.c $(IPC_CORE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -fsanitize=address,undefined -I.. -o $@ t_ipc_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_native: $(IPC_NATIVE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -Imemory_profile -I.. -o $@ t_ipc_native.c ../hle_ipc.c
+$(B)/t_ipc_native_16k: $(IPC_NATIVE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -DTEST_PAGE_16K -Imemory_profile -I.. -o $@ t_ipc_native.c ../hle_ipc.c
+$(B)/t_ipc_native_asan: $(IPC_NATIVE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -fsanitize=address,undefined -Imemory_profile -I.. -o $@ t_ipc_native.c ../hle_ipc.c
+$(B)/t_ipc_native_16k_asan: $(IPC_NATIVE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -fsanitize=address,undefined -DTEST_PAGE_16K -Imemory_profile -I.. -o $@ t_ipc_native.c ../hle_ipc.c
+.PHONY: ipc ipc-asan
+ipc: $(B)/t_ipc_adversarial $(B)/t_ipc_native $(B)/t_ipc_native_16k
+	$(B)/t_ipc_adversarial
+	$(B)/t_ipc_native
+	$(B)/t_ipc_native_16k
+ipc-asan: $(B)/t_ipc_adversarial_asan $(B)/t_ipc_native_asan $(B)/t_ipc_native_16k_asan
+	$(B)/t_ipc_adversarial_asan
+	$(B)/t_ipc_native_asan
+	$(B)/t_ipc_native_16k_asan
+run: ipc
