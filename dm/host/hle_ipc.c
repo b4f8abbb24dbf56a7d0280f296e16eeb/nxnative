@@ -3,6 +3,7 @@
 // Atmosphere stratosphere/sm/source/sm_user_service.cpp (no code copied).
 #include "hle_ipc.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,6 +16,11 @@ struct dm_ipc {
     pthread_mutex_t mutex;
     unsigned capacity;
     ipc_session sessions[DM_IPC_MAX_SESSIONS];
+    _Atomic unsigned probe_active;
+    pthread_t probe_thread;
+    uint64_t probe_address;
+    size_t probe_size;
+    dm_ipc_csrng_probe probe;
 };
 
 #define HANDLE_PREFIX UINT32_C(0xd0000000)
@@ -44,6 +50,7 @@ static uint32_t create_session(dm_ipc *ipc, unsigned service, const ipc_session 
         *s = copy ? *copy : (ipc_session){0};
         s->generation = generation; s->service = service; s->closed = 0;
         *out = HANDLE_PREFIX | (generation << 6) | i;
+        if (ipc->probe_active && service == SERVICE_CSRNG) ++ipc->probe.csrng_connections;
         return 0;
     }
     return DM_IPC_OUT_OF_HANDLES;
@@ -66,12 +73,50 @@ dm_ipc *dm_ipc_create(unsigned max_sessions) {
     if (!max_sessions || max_sessions > DM_IPC_MAX_SESSIONS) return NULL;
     dm_ipc *ipc = calloc(1, sizeof *ipc);
     if (!ipc) return NULL;
+    atomic_init(&ipc->probe_active, 0);
     if (pthread_mutex_init(&ipc->mutex, NULL)) { free(ipc); return NULL; }
     ipc->capacity = max_sessions;
     return ipc;
 }
 void dm_ipc_destroy(dm_ipc *ipc) {
     if (ipc) { pthread_mutex_destroy(&ipc->mutex); free(ipc); }
+}
+static unsigned live_sessions(dm_ipc *ipc) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < ipc->capacity; ++i) n += ipc->sessions[i].service != 0;
+    return n;
+}
+uint32_t dm_ipc_csrng_probe_begin(dm_ipc *ipc, uint64_t address, size_t size) {
+    if (!ipc) return DM_IPC_INVALID_HANDLE;
+    if (size > 4097 || size > UINT64_MAX - address) return DM_IPC_INVALID_SIZE;
+    pthread_mutex_lock(&ipc->mutex);
+    uint32_t result = ipc->probe_active ? DM_IPC_NOT_SUPPORTED : 0;
+    if (!result) {
+        ipc->probe = (dm_ipc_csrng_probe){.sessions_before = live_sessions(ipc)};
+        ipc->probe_address = address; ipc->probe_size = size;
+        ipc->probe_thread = pthread_self(); ipc->probe_active = 1;
+    }
+    pthread_mutex_unlock(&ipc->mutex); return result;
+}
+uint32_t dm_ipc_csrng_probe_end(dm_ipc *ipc, dm_ipc_csrng_probe *out) {
+    if (!ipc || !out) return DM_IPC_INVALID_MEMORY;
+    pthread_mutex_lock(&ipc->mutex);
+    uint32_t result = !ipc->probe_active || !pthread_equal(ipc->probe_thread, pthread_self()) ? DM_IPC_NOT_SUPPORTED : 0;
+    if (!result) {
+        ipc->probe.sessions_after = live_sessions(ipc); *out = ipc->probe;
+        ipc->probe_active = 0; ipc->probe_address = 0; ipc->probe_size = 0;
+    }
+    pthread_mutex_unlock(&ipc->mutex); return result;
+}
+void dm_ipc_csrng_probe_route(dm_ipc *ipc, unsigned route) {
+    if (!ipc || !atomic_load(&ipc->probe_active)) return;
+    pthread_mutex_lock(&ipc->mutex);
+    if (ipc->probe_active) {
+        if (route < DM_IPC_PROBE_ROUTES) ++ipc->probe.route[route];
+        else ++ipc->probe.mismatches;
+        if (!pthread_equal(ipc->probe_thread, pthread_self())) ++ipc->probe.mismatches;
+    }
+    pthread_mutex_unlock(&ipc->mutex);
 }
 uint32_t dm_ipc_connect_port(dm_ipc *ipc, const char *name, size_t length, uint32_t *out) {
     if (!ipc || !name || !out) return DM_IPC_INVALID_MEMORY;
@@ -194,6 +239,7 @@ static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t 
     request r;
     uint32_t result = parse(m, capacity, s->domain, &r);
     if (result) return result;
+    if (ipc->probe_active && s->service == SERVICE_SM) ++ipc->probe.sm_requests;
     if (r.type == 2) { s->closed = 1; return 0; } // endpoint close, handle still owned
     if (r.domain_close) {
         // Existing olsc adapter regards closing its single synthetic object as a
@@ -232,6 +278,14 @@ static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t 
         else {
             if (r.nx || r.na || r.nb != 1 || r.nw || r.special || r.domain || r.output_mode) return DM_IPC_NOT_SUPPORTED;
             uint64_t a = r.output_address, n = r.output_size, base = (uintptr_t)m;
+            if (ipc->probe_active) {
+                ++ipc->probe.requests;
+                if (!pthread_equal(ipc->probe_thread, pthread_self()) || ipc->probe.requests != 1 ||
+                    (a != ipc->probe_address && !(n == 0 && a == 0)) || n != ipc->probe_size || r.type != 6 ||
+                    r.version != 1 || r.raw_size != 32 || capacity != DM_IPC_TLS_CAPACITY) {
+                    ++ipc->probe.mismatches; return DM_IPC_NOT_SUPPORTED;
+                }
+            }
             if (n > SIZE_MAX || n > UINT64_MAX - a || capacity > UINT64_MAX - base) return DM_IPC_INVALID_MEMORY;
             if (n && a < base + capacity && base < a + n) return DM_IPC_INVALID_MEMORY;
             if (!memory || !memory->validate_output || !memory->fill_output || !memory->validate_output(memory->context, a, n)) return DM_IPC_INVALID_MEMORY;
@@ -255,16 +309,21 @@ static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t 
     size_t publish = s->service == SERVICE_OLSC && !control ? (capacity < 0x1000 ? capacity : 0x1000) : end;
     if (publish > end) write32(reply + 4, (uint32_t)((publish - 8) / 4));
     if (memory && memory->prepare_message) memory->prepare_message(memory->context, m, publish);
-    if (fill && !service_result) memory->fill_output(memory->context, r.output_address, (size_t)r.output_size);
+    if (fill && !service_result) {
+        memory->fill_output(memory->context, r.output_address, (size_t)r.output_size);
+        if (ipc->probe_active) ipc->probe.filled_bytes += r.output_size;
+    }
+    if (ipc->probe_active && service_result) ++ipc->probe.service_errors;
     if (initialize && !service_result) s->initialized = 1;
     if (convert && !service_result) s->domain = 1;
     memset(m, 0, publish); memcpy(m, reply, end);
     return 0;
 }
 uint32_t dm_ipc_dispatch(dm_ipc *ipc, uint32_t handle, void *message, size_t capacity, const dm_ipc_memory *memory) {
-    if (!ipc || !message) return DM_IPC_INVALID_MEMORY;
+    if (!ipc) return DM_IPC_INVALID_MEMORY;
     pthread_mutex_lock(&ipc->mutex);
     ipc_session *s = lookup(ipc, handle);
-    uint32_t result = !s ? DM_IPC_INVALID_HANDLE : s->closed ? DM_IPC_SESSION_CLOSED : dispatch_locked(ipc, s, message, capacity, memory);
+    uint32_t result = !message ? DM_IPC_INVALID_MEMORY : !s ? DM_IPC_INVALID_HANDLE : s->closed ? DM_IPC_SESSION_CLOSED : dispatch_locked(ipc, s, message, capacity, memory);
+    if (ipc->probe_active && result) ++ipc->probe.transport_errors;
     pthread_mutex_unlock(&ipc->mutex); return result;
 }

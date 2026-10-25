@@ -57,3 +57,24 @@ uint32_t dm_ipc_dispatch(dm_ipc *ipc, uint32_t handle, void *message,
 // Typed HIPC adapters and raw SVCs share this process-lifetime session owner.
 dm_ipc *dm_ipc_host(void);
 uint32_t dm_ipc_host_send(uint32_t handle, void *message, size_t capacity);
+
+// Bounded diagnostic for one reviewed original-CSRNG call. Inactive by default;
+// no output bytes/addresses are logged. The expected span is checked before any
+// entropy write (an empty buffer may use its expected address or null). A probe
+// owns one call, not a persistent service policy.
+enum {
+    DM_IPC_PROBE_FORCE_CRYPTO, DM_IPC_PROBE_ADAPTER_CONNECT,
+    DM_IPC_PROBE_ADAPTER_SEND, DM_IPC_PROBE_NATIVE_PORT,
+    DM_IPC_PROBE_NATIVE_SEND, DM_IPC_PROBE_NATIVE_BUFFER, DM_IPC_PROBE_ROUTES
+};
+typedef struct {
+    uint64_t filled_bytes;
+    unsigned requests, csrng_connections, sm_requests;
+    unsigned transport_errors, service_errors, mismatches;
+    unsigned sessions_before, sessions_after;
+    unsigned route[DM_IPC_PROBE_ROUTES];
+} dm_ipc_csrng_probe;
+uint32_t dm_ipc_csrng_probe_begin(dm_ipc *ipc, uint64_t address, size_t size);
+uint32_t dm_ipc_csrng_probe_end(dm_ipc *ipc, dm_ipc_csrng_probe *out);
+void dm_ipc_csrng_probe_route(dm_ipc *ipc, unsigned route);
+void dm_ipc_host_csrng_probe_route(unsigned route);

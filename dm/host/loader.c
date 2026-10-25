@@ -180,8 +180,28 @@ static void read_layout(module_t *m, const char *dir) {
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[32]; unsigned long v; unsigned seen = 0;
+    int seen_full_build = 0;
+    m->build_id[0] = m->full_build_id[0] = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
+        if (sscanf(line, "# %31s", key) != 1) die("%s: invalid rewriter header", path);
+        if (!strcmp(key, "BUILD_ID_FULL")) {
+            char id[66], extra;
+            // Reject overlong tokens, extra fields, uppercase/non-hex digits,
+            // and duplicates: an exact identity must never be truncated.
+            if (seen_full_build++ || sscanf(line, "# %*s %65s %c", id, &extra) != 1 ||
+                strlen(id) != 64 || strspn(id, "0123456789abcdef") != 64)
+                die("%s: invalid or duplicate BUILD_ID_FULL", path);
+            memcpy(m->full_build_id, id, sizeof m->full_build_id);
+            continue;
+        }
+        if (!strcmp(key, "BUILD_ID")) {
+            // Preserve the old header parser's numeric-token prerequisite even
+            // for legacy short-only metadata; do not accept empty/nonhex rows.
+            if (sscanf(line, "# %*s %lx", &v) != 1 || sscanf(line, "# %*s %32s", m->build_id) != 1)
+                die("%s: invalid BUILD_ID", path);
+            continue;
+        }
+        if (sscanf(line, "# %*s %lx", &v) != 1) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
@@ -191,7 +211,6 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
-        else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
         else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
             if (!strncmp(key, "KEY_", 4) && !strncmp(key + 4, kn[k], n) && !strcmp(key + 4 + n, "_IDX")) {
@@ -200,6 +219,8 @@ static void read_layout(module_t *m, const char *dir) {
         }
     }
     fclose(f);
+    if (seen_full_build && (strlen(m->build_id) != 32 || strncmp(m->build_id, m->full_build_id, 32)))
+        die("%s: BUILD_ID and BUILD_ID_FULL disagree", path);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))

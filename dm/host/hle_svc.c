@@ -298,7 +298,10 @@ static void ipc_output_fill(void *context, uint64_t address, size_t size) {
 static void ipc_message_prepare(void *context, void *message, size_t size) {
     (void)context; dm_guest_write_prepare(message, size);
 }
-static dm_ipc *g_ipc;
+static _Atomic(dm_ipc *) g_ipc;
+void dm_ipc_host_csrng_probe_route(unsigned route) {
+    dm_ipc_csrng_probe_route(g_ipc, route);
+}
 static void ipc_initialize(void) { g_ipc = dm_ipc_create(DM_IPC_MAX_SESSIONS); }
 dm_ipc *dm_ipc_host(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -322,6 +325,7 @@ static int ipc_svc(int num, uint64_t *regs) {
         regs[0] = dm_ipc_close(dm_ipc_host(), (uint32_t)regs[0]); return 1;
     }
     if (num == 0x1f) {
+        dm_ipc_host_csrng_probe_route(DM_IPC_PROBE_NATIVE_PORT);
         char name[12]; size_t length = 0;
         uint64_t address = regs[1];
         void *tlr = pthread_getspecific(g_keytlr);
@@ -337,10 +341,12 @@ static int ipc_svc(int num, uint64_t *regs) {
         return 1;
     }
     if (num == 0x21) {
+        dm_ipc_host_csrng_probe_route(DM_IPC_PROBE_NATIVE_SEND);
         void *message = pthread_getspecific(g_keytlr);
         regs[0] = dm_ipc_host_send((uint32_t)regs[0], message, DM_IPC_TLS_CAPACITY); return 1;
     }
     if (num == 0x22) {
+        dm_ipc_host_csrng_probe_route(DM_IPC_PROBE_NATIVE_BUFFER);
         uint64_t address = regs[0], size = regs[1];
         uint32_t result;
         if (address & 0xfff) result = DM_IPC_INVALID_ADDRESS;

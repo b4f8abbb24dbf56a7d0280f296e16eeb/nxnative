@@ -1,6 +1,7 @@
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
 #include "front.h"
+#include "hle_csrng_smoke.h"
 #include <stdatomic.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -12,6 +13,7 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
+static int g_csrng_smoke;
 
 static void guest_main(void) {
     guest_thread_init();
@@ -23,6 +25,7 @@ static void guest_main(void) {
     LOG(">>> nnosInitialize"); ((fn2)req("nnosInitialize"))(hmain, 0);
     ((fn0)req("_init_libc1"))();
     LOG(">>> nninitInitializeSdkModule"); ((fn0)req("nninitInitializeSdkModule"))();
+    if (g_csrng_smoke) { dm_csrng_smoke_run(); return; } // no game startup, constructors or nnMain
     // The game arguments are in place before nninitStartup, as on hardware (nn::os takes them from the process argument area in nnosInitialize): Unreal Engine's nninitStartup
     // (Octopath Traveler 0, main+0x12afc) reads -SwitchVirtualAddressSpaceSize= and its other memory options there
     ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
@@ -130,6 +133,7 @@ int main(int argc, char **argv) {
         void crash_thread_init(void); crash_thread_init();   // The signal alternate stack is per thread: loading installed it on another thread, so add it for this thread
         LOG("host loading already finished early in the background (dm_host_preload_start)");
     } else host_preload(argc, argv);
+    g_csrng_smoke = dm_csrng_smoke_prepare(); // before front-end/window or any guest initialization
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
     front_run(guest_main);
     return 0;

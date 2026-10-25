@@ -2,6 +2,7 @@
 // (The former 136 HLE entries for nn::os/mem/lmem/C++ ABI have been deleted: the SDK brings its own nn::os, and at load time not one of these entries was resolved and used.)
 #include <pthread.h>
 #include "hle.h"
+#include "hle_ipc.h"
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 
@@ -114,6 +115,7 @@ HLE("getentropy", int, g_getentropy, void *p, size_t n) {
 // Pokémon Legends: Z-A (SDK 19) calls it first thing in nnMain (main+0x1734b4)
 // (InitializeCsrng → sm::Initialize, the game aborted there). The call goes through the sdk's PLT, so the takeover gives it the same stream as getentropy above
 HLE_FORCE("_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm", "csrng service; host entropy (the getentropy stream)", void, g_csrng_bytes, void *p, size_t n) {
+    dm_ipc_host_csrng_probe_route(DM_IPC_PROBE_FORCE_CRYPTO);
     g_getentropy(p, n);
 }
 
