@@ -124,7 +124,8 @@ static void release_config(void *context, void *self, const dm_sa_config *config
     free(client);
 }
 
-dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_regions) {
+static dm_sa_result create_runtime(dm_memory_runtime **out, size_t max_regions,
+                                   int with_allocator) {
     if (!out || !max_regions) return DM_SA_INVALID;
     dm_vamm_config config;
     if (dm_vamm_native_configure(&config, max_regions)) return DM_SA_INVALID;
@@ -134,25 +135,41 @@ dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_region
     uint32_t result = dm_vamm_create(&r->owner, &config);
     dm_sa_result status = result == DM_VAMM_NO_MEMORY ? DM_SA_NO_MEMORY : DM_SA_INVALID;
     if (result) goto fail;
-    dm_sa_sdk_owner owner = {.context = r, .allocate_memory = owner_allocate,
-        .free_address_region = owner_free, .query_reservations = owner_stats,
-        .guest_context_active = native_owner_active, .guaranteed_alignment = 0x10000,
-        .allocate_memory_aligned = owner_allocate_aligned};
-    status = dm_sa_sdk_provider_create(&r->provider, &owner);
-    if (status != DM_SA_OK) { if (dm_vamm_destroy(r->owner)) abort(); goto fail; }
+    if (with_allocator) {
+        dm_sa_sdk_owner owner = {.context = r, .allocate_memory = owner_allocate,
+            .free_address_region = owner_free, .query_reservations = owner_stats,
+            .guest_context_active = native_owner_active, .guaranteed_alignment = 0x10000,
+            .allocate_memory_aligned = owner_allocate_aligned};
+        status = dm_sa_sdk_provider_create(&r->provider, &owner);
+        if (status != DM_SA_OK) { if (dm_vamm_destroy(r->owner)) abort(); goto fail; }
+    }
     *out = r; return DM_SA_OK;
 fail:
     pthread_mutex_destroy(&r->mutex); free(r); return status;
 }
+dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_regions) {
+    return create_runtime(out, max_regions, 1);
+}
+dm_sa_result dm_memory_runtime_create_vamm_only(dm_memory_runtime **out, size_t max_regions) {
+    return create_runtime(out, max_regions, 0);
+}
+static dm_vamm_adapter_config vamm_config(dm_memory_runtime *r) {
+    return (dm_vamm_adapter_config){.context = r, .shared_owner = r->owner,
+        .retain_owner = retain_owner, .release_owner = release_owner};
+}
 dm_sa_result dm_memory_runtime_configs(dm_memory_runtime *r, dm_vamm_adapter_config *v,
                                       dm_sa_adapter_config *a) {
-    if (!r || !v || !a) return DM_SA_INVALID;
-    *v = (dm_vamm_adapter_config){.context = r, .shared_owner = r->owner,
-        .retain_owner = retain_owner, .release_owner = release_owner};
+    if (!r || !v || !a || !r->provider) return DM_SA_INVALID;
+    *v = vamm_config(r);
     *a = (dm_sa_adapter_config){.context = r, .make_config = make_config,
         .release_config = release_config, .retain_context = retain_context,
         .release_context = release_context, .allocation_alignment = dm_sa_host_allocation_alignment,
         .forward_allocate = dm_sa_host_forward_allocate};
+    return DM_SA_OK;
+}
+dm_sa_result dm_memory_runtime_vamm_config(dm_memory_runtime *r, dm_vamm_adapter_config *v) {
+    if (!r || !v || r->provider) return DM_SA_INVALID;
+    *v = vamm_config(r);
     return DM_SA_OK;
 }
 dm_sa_result dm_memory_runtime_destroy(dm_memory_runtime *r) {
@@ -165,8 +182,10 @@ dm_sa_result dm_memory_runtime_destroy(dm_memory_runtime *r) {
     dm_vamm_stats stats;
     if (dm_vamm_get_stats(r->owner, 0x10000, &stats)) return DM_SA_PROVIDER_FAILED;
     if (stats.regions) return DM_SA_BUSY;
-    dm_sa_result result = dm_sa_sdk_provider_destroy(r->provider);
-    if (result != DM_SA_OK) return result;
+    if (r->provider) {
+        dm_sa_result result = dm_sa_sdk_provider_destroy(r->provider);
+        if (result != DM_SA_OK) return result;
+    }
     // No remaining caller, config, lease or native reservation can exist here.
     if (dm_vamm_destroy(r->owner)) abort();
     pthread_mutex_destroy(&r->mutex); free(r); return DM_SA_OK;

@@ -122,3 +122,48 @@ and cached post-shutdown Vamm hooks. Six normal variants include limited/unlimit
 budgets, 4/16 KiB page behavior, disabled resources and the production gate.
 `memory-runtime-startup-sanitize` adds five ASan/UBSan variants. This is synthetic
 startup coverage, not proof that any title's complete SDK caller set is intercepted.
+
+## Owner-only runtime
+
+`dm_memory_runtime_create_vamm_only` creates only the native Vamm owner, with no
+StandardAllocator provider or guest callbacks. `dm_memory_runtime_vamm_config`
+returns only that owner's lifetime configuration. Full-mode `configs` rejects an
+owner-only runtime without changing outputs; the owner-only config API rejects
+a full-mode runtime. Destruction still rejects retained/live ownership and skips
+the absent provider. `memory-runtime-owner-only` and its sanitizer target verify
+that provider creation/interface/guest-forwarding functions are never invoked.
+
+The [bounded SDK-only experiment](bounded-sdk-memory-experiment.md) uses these
+APIs and its own native startup permit. `sdk-memory-experiment` exercises the real
+production authorization without fixture activation macros, including full/SDK
+permit separation, original SA bindings and exact oversized-request failure.
+
+## SDK-only operational integration fixture
+
+`make -C dm/host/tests memory-runtime-vamm-only` independently exercises the
+fixture-authorized Vamm transaction without `DM_SA_ADAPTER_TESTING`. The six variants
+cover 4/16 KiB page behavior, limited/unlimited direct-SVC mapping policy, disabled
+system resources and the production gate. `memory-runtime-vamm-only-sanitize`
+runs the five enabled variants under ASan/UBSan; on restricted Linux use
+`ASAN_OPTIONS=detect_leaks=0` (not a leak-check pass).
+
+The synthetic ELF images preserve every original StandardAllocator slot and
+never prepare, capture or retain an allocator adapter table. Calls through those
+unchanged slots exercise a synthetic original constructor, the fixture's
+original-only size-allocation shim, and synthetic original allocate/free methods
+that call the committed Vamm imports. These originals model dispatch only: they
+are not Nintendo SDK implementations or evidence of game allocator compatibility.
+All 18 Vamm wrapper paths execute over the existing runtime's one retained native
+owner and actual bitmap-backed SVC storage; no second reservation manager or
+replacement StandardAllocator core is used. Both constructor aliases are covered
+in separate processes because a live manager identity cannot be replaced.
+
+The same test verifies cancellation at all 36 selected resolver positions,
+prepublication rollback, original-slot preservation, owner-only retention,
+borrowed-source failure/retry, no SA factory activation after Vamm initialization,
+stopped cached-hook rejection and native runtime destruction without an SA-table
+shutdown. This establishes a working source-only transaction path, not native
+loader activation by itself. Native SDK-only installation is a separate default-off
+bounded path and rejects the existing full-group experiment permit. No SDK/game identity is
+newly authorized and every SDK/game patch remains in place. Real SDK caller,
+bootstrap, ABI, compatibility and Apple-device evidence remain necessary.

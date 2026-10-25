@@ -1,9 +1,11 @@
 #include "hle_memory_hooks.h"
+#include "hle_memory_experiment.h"
 #include <stdatomic.h>
 
 // Only a single startup writer may own the window. Reentry rejects rather than
 // deadlocking; even a resolver callback cannot open guest entry while staging.
 enum { COLD, READY, INSTALLING, RUNNING };
+enum { BOTH_GROUPS = 1, VAMM_ONLY = 2 };
 static _Atomic int phase, published;
 int dm_memory_hooks_open_startup(void) {
     int expected = COLD;
@@ -13,10 +15,11 @@ int dm_memory_hooks_enter_guest(void) {
     int expected = READY;
     return atomic_compare_exchange_strong(&phase, &expected, RUNNING) || expected == RUNNING;
 }
-int dm_memory_hooks_active(void) { return atomic_load_explicit(&published, memory_order_acquire); }
+int dm_memory_hooks_active(void) { return atomic_load_explicit(&published, memory_order_acquire) != 0; }
 void *dm_memory_hooks_lookup(const char *name) {
-    if (!dm_memory_hooks_active()) return NULL;
-    dm_sa_guest_fn sa = dm_sa_adapter_lookup(name);
+    int groups = atomic_load_explicit(&published, memory_order_acquire);
+    if (!groups) return NULL;
+    dm_sa_guest_fn sa = groups == BOTH_GROUPS ? dm_sa_adapter_lookup(name) : NULL;
     return sa ? (void *)sa : (void *)dm_vamm_adapter_lookup(name);
 }
 enum { TOTAL = DM_SA_ADAPTER_SYMBOL_COUNT + DM_VAMM_SYMBOL_COUNT };
@@ -28,6 +31,10 @@ static int index_of(const char *name) {
     if (!name) return -1;
     for (unsigned i = 0; i < TOTAL; ++i) if (!strcmp(name, name_at(i))) return (int)i;
     return -1;
+}
+static int selected_index(const char *name, int with_allocator) {
+    int index = index_of(name);
+    return !with_allocator && index < (int)DM_SA_ADAPTER_SYMBOL_COUNT ? -1 : index;
 }
 static int owned_member(const char *name, const char *owner_name) {
     // Itanium nested names encode the owning class before the member, whereas
@@ -107,9 +114,9 @@ static int relative_slots_clear(module_t *m, const relocations *r, const write_e
     }
     return 1;
 }
-int dm_memory_hooks_install(module_t *modules, size_t count,
+static int install_groups(module_t *modules, size_t count,
     const dm_sa_adapter_config *allocator, const dm_vamm_adapter_config *vamm,
-    dm_memory_hook_resolver resolve) {
+    dm_memory_hook_resolver resolve, int with_allocator) {
     int expected = READY;
     if (!atomic_compare_exchange_strong(&phase, &expected, INSTALLING)) return DM_MEMORY_HOOKS_BUSY;
     int result = DM_MEMORY_HOOKS_INVALID;
@@ -119,7 +126,8 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
     dm_sa_adapter_symbol sas[DM_SA_ADAPTER_SYMBOL_COUNT] = {0};
     dm_vamm_symbol vas[DM_VAMM_SYMBOL_COUNT] = {0};
     module_t *definition_owner = NULL;
-    if (dm_memory_hooks_active() || !modules || !count || count > MAX_MOD || !allocator || !vamm || !resolve) goto done;
+    if (dm_memory_hooks_active() || !modules || !count || count > MAX_MOD ||
+        (with_allocator && !allocator) || !vamm || !resolve) goto done;
     for (size_t k = 0; k < count; ++k) {
         module_t *m = &modules[k];
         if (!m->base || m->nro || !m->loaded || !m->size || m->size > UINTPTR_MAX - (uintptr_t)m->base ||
@@ -134,9 +142,9 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
         for (unsigned i = 1; i < m->nsym; ++i) {
             const Elf64_Sym *s = &m->symtab[i]; const char *name = symbol_name(m, s);
             if (!name) goto done;
-            int index = index_of(name);
+            int index = selected_index(name, with_allocator);
             if (index < 0) {
-                if (owned_member(name, "2nn3mem17StandardAllocator") ||
+                if ((with_allocator && owned_member(name, "2nn3mem17StandardAllocator")) ||
                     owned_member(name, "2nn2os6detail11VammManager")) goto done;
                 continue;
             }
@@ -160,11 +168,17 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
         }
     }
     // Resolution failures and missing definitions are not HLE/stub fallbacks.
-    for (unsigned i = 0; i < DM_SA_ADAPTER_SYMBOL_COUNT; ++i) if (!sas[i].function) goto done;
+    if (with_allocator)
+        for (unsigned i = 0; i < DM_SA_ADAPTER_SYMBOL_COUNT; ++i) if (!sas[i].function) goto done;
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i) if (!vas[i].function) goto done;
-    dm_sa_adapter_config sc = *allocator; sc.symbols = sas; sc.symbol_count = DM_SA_ADAPTER_SYMBOL_COUNT;
     dm_vamm_adapter_config vc = *vamm; vc.symbols = vas; vc.symbol_count = DM_VAMM_SYMBOL_COUNT;
-    if (dm_sa_adapter_prepare(&sc, &sa) != DM_SA_OK || dm_vamm_adapter_prepare(&vc, &va)) {
+    if (with_allocator) {
+        dm_sa_adapter_config sc = *allocator; sc.symbols = sas; sc.symbol_count = DM_SA_ADAPTER_SYMBOL_COUNT;
+        if (dm_sa_adapter_prepare(&sc, &sa) != DM_SA_OK) {
+            result = DM_MEMORY_HOOKS_DISABLED; goto done;
+        }
+    }
+    if (dm_vamm_adapter_prepare(&vc, &va)) {
         result = DM_MEMORY_HOOKS_DISABLED; goto done;
     }
     journal = calloc(capacity ? capacity : 1, sizeof *journal);
@@ -179,7 +193,7 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
             if (ELF64_R_SYM(r->r_info) >= m->nsym) goto done;
             const Elf64_Sym *s = &m->symtab[ELF64_R_SYM(r->r_info)]; const char *name = symbol_name(m, s);
             if (!name) goto done;
-            int index = index_of(name);
+            int index = selected_index(name, with_allocator);
             if (index < 0) continue;
             if (r->r_addend || ELF64_ST_BIND(s->st_info) != 1 || ELF64_ST_VISIBILITY(s->st_other) != STV_DEFAULT) goto done;
             uint64_t *slot = (uint64_t *)(m->base + r->r_offset), original = resolve(m, s);
@@ -197,7 +211,7 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
         for (unsigned t = 0; t < 2; ++t) for (size_t i = 0; i < rl->count[t]; ++i) {
             const Elf64_Rela *r = &rl->tab[t][i];
             if (ELF64_R_TYPE(r->r_info) != R_AARCH64_RELATIVE &&
-                index_of(symbol_name(m, &m->symtab[ELF64_R_SYM(r->r_info)])) >= 0) continue;
+                selected_index(symbol_name(m, &m->symtab[ELF64_R_SYM(r->r_info)]), with_allocator) >= 0) continue;
             if (overlaps(journal, writes, (uint64_t *)(m->base + r->r_offset))) goto done;
         }
     }
@@ -212,8 +226,8 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
     }
 #endif
     dm_vamm_adapter_publish(va); va = NULL;
-    dm_sa_adapter_publish(sa); sa = NULL;
-    atomic_store_explicit(&published, 1, memory_order_release);
+    if (sa) { dm_sa_adapter_publish(sa); sa = NULL; }
+    atomic_store_explicit(&published, with_allocator ? BOTH_GROUPS : VAMM_ONLY, memory_order_release);
     result = DM_MEMORY_HOOKS_OK;
 done:
     if (va) dm_vamm_adapter_cancel(va);
@@ -221,4 +235,24 @@ done:
     free(journal);
     atomic_store_explicit(&phase, READY, memory_order_release);
     return result;
+}
+int dm_memory_hooks_install(module_t *modules, size_t count,
+    const dm_sa_adapter_config *allocator, const dm_vamm_adapter_config *vamm,
+    dm_memory_hook_resolver resolve) {
+    return install_groups(modules, count, allocator, vamm, resolve, 1);
+}
+int dm_memory_hooks_install_vamm_only(module_t *modules, size_t count,
+    const dm_vamm_adapter_config *vamm, dm_memory_hook_resolver resolve) {
+#if defined(DM_MEMORY_HOOKS_TESTING) && defined(DM_VAMM_ADAPTER_TESTING) && \
+    (!defined(DM_EXPERIMENTAL_SHARED_MEMORY) || !DM_EXPERIMENTAL_SHARED_MEMORY)
+    return install_groups(modules, count, NULL, vamm, resolve, 0);
+#elif defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY
+    if (!vamm || !dm_memory_experiment_authorized_sdk_only(vamm->experimental_startup, vamm->context))
+        return DM_MEMORY_HOOKS_DISABLED;
+    return install_groups(modules, count, NULL, vamm, resolve, 0);
+#else
+    // A full-group permit does not authorize this different ownership mode.
+    (void)modules; (void)count; (void)vamm; (void)resolve;
+    return DM_MEMORY_HOOKS_DISABLED;
+#endif
 }
