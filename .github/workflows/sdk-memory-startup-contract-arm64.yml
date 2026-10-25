@@ -34,13 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          ref: 8a72eb665cd95ecc6637405a53f31b1edacae835
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
-          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(git rev-parse HEAD)" = 8a72eb665cd95ecc6637405a53f31b1edacae835
+          test "$(git rev-parse HEAD^{tree})" = 24a226eafb7b5a67b8ca27fe3a2a16f364158f68
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -83,13 +83,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          ref: 8a72eb665cd95ecc6637405a53f31b1edacae835
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
-          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(git rev-parse HEAD)" = 8a72eb665cd95ecc6637405a53f31b1edacae835
+          test "$(git rev-parse HEAD^{tree})" = 24a226eafb7b5a67b8ca27fe3a2a16f364158f68
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -126,13 +126,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          ref: 8a72eb665cd95ecc6637405a53f31b1edacae835
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
-          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(git rev-parse HEAD)" = 8a72eb665cd95ecc6637405a53f31b1edacae835
+          test "$(git rev-parse HEAD^{tree})" = 24a226eafb7b5a67b8ca27fe3a2a16f364158f68
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -178,13 +178,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          ref: 8a72eb665cd95ecc6637405a53f31b1edacae835
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
-          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(git rev-parse HEAD)" = 8a72eb665cd95ecc6637405a53f31b1edacae835
+          test "$(git rev-parse HEAD^{tree})" = 24a226eafb7b5a67b8ca27fe3a2a16f364158f68
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -214,13 +214,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: f801b4f6f02ad9456aacda0fba661cbdae55a217
+          ref: 8a72eb665cd95ecc6637405a53f31b1edacae835
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = f801b4f6f02ad9456aacda0fba661cbdae55a217
-          test "$(git rev-parse HEAD^{tree})" = c8f4bb0d9c6c78bf1dbd8fd76433bbacda0526a2
+          test "$(git rev-parse HEAD)" = 8a72eb665cd95ecc6637405a53f31b1edacae835
+          test "$(git rev-parse HEAD^{tree})" = 24a226eafb7b5a67b8ca27fe3a2a16f364158f68
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
