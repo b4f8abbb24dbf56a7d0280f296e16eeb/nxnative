@@ -162,6 +162,8 @@ static void sdk_vamm_fatal(void *context, const char *operation) {
 
 // Construction grants no permit and publishes no hooks. This helper is kept
 // private: production reaches it only through exact registry selection/preflight.
+// Default-off builds have no caller; Clang diagnoses even unused static inline functions.
+__attribute__((unused))
 static inline dm_sa_result create_contract_runtime(const startup_contract *c, dm_memory_runtime **out) {
     if (validate_contract(c)) return DM_SA_INVALID;
     return c->mode == SDK_MEMORY ?
