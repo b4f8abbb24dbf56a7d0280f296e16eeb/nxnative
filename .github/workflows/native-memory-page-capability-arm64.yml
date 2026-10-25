@@ -1,7 +1,7 @@
 # Tests that need no game files, keys or GPU. GitHub's macOS runners are virtual Macs without Metal 4 (issue #112), so the tests that go through mtl_init
 # (t_nvn, t_mip_extent, t_rt_range and the rest of dm/gfx/tests' run list) stay local: run `make -C dm/gfx/tests GAME=<id> run` on an Apple-silicon Mac.
 # `profile_guess.py --check` stays local too: it compares the guesses with the extractions of the games (it needs their files).
-name: Sparse core accounting and recommit exact-head ARM64 validation
+name: Partial reclaim and explicit runtime exact-head ARM64 validation
 
 on:
   push:
@@ -34,13 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
+          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
-          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
+          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
+          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -83,13 +83,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
+          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
-          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
+          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
+          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -126,13 +126,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
+          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
-          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
+          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
+          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -178,13 +178,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
+          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
-          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
+          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
+          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -202,7 +202,7 @@ jobs:
           retention-days: 7
 
   memory-matrix:
-    name: Sparse core and SDK-memory ARM64 (${{ matrix.mode }})
+    name: Reclaim and SDK-memory ARM64 (${{ matrix.mode }})
     runs-on: macos-26
     timeout-minutes: 25
     strategy:
@@ -214,13 +214,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
+          ref: e907c545595900a7e55f6ca4efc295f829e80b6b
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
-          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
+          test "$(git rev-parse HEAD)" = e907c545595900a7e55f6ca4efc295f829e80b6b
+          test "$(git rev-parse HEAD^{tree})" = 337770579f5819ee8e10353b74442b35b35075ee
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -268,6 +268,13 @@ jobs:
         run: |
           make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" SA_FLAGS="$FLAGS" \
             memory-runtime 2>&1 | tee logs/memory-runtime.log
+      - name: Explicit page-capable runtime without admitted startup activation (six variants)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-reclaim-runtime-$MODE" AS_FLAGS="$FLAGS" SA_FLAGS="$FLAGS" \
+            memory-runtime-reclaim 2>&1 | tee logs/memory-runtime-reclaim.log
+          grep -Fq 'explicit page-capable runtime: full native reclamation/recommit cycle: PASS' logs/memory-runtime-reclaim.log
+          grep -Fq 'page-capable construction grants no production activation: PASS' logs/memory-runtime-reclaim.log
       - name: Combined startup relocation to actual shared runtime (six variants)
         if: ${{ !cancelled() }}
         run: |
@@ -324,7 +331,7 @@ jobs:
         if: ${{ !cancelled() && matrix.mode == 'normal' }}
         run: |
           make -C dm/host/tests CC=clang B=build/ci-combined \
-            guest-thread-stack-sanitize vamm-native-sanitize memory-runtime-sanitize memory-runtime-startup-sanitize memory-hooks-sanitize guest-thread-imports-sanitize memory-experiment-sanitize standard-allocator-events-sanitize 2>&1 | tee logs/stack-native-vamm-combined.log
+            guest-thread-stack-sanitize vamm-native-sanitize memory-runtime-sanitize memory-runtime-reclaim-sanitize memory-runtime-startup-sanitize memory-hooks-sanitize guest-thread-imports-sanitize memory-experiment-sanitize standard-allocator-events-sanitize 2>&1 | tee logs/stack-native-vamm-combined.log
       - name: Combined ASan and UBSan SDK-memory compatibility targets
         if: ${{ !cancelled() && matrix.mode == 'normal' }}
         run: |
@@ -336,7 +343,7 @@ jobs:
         if: ${{ !cancelled() && matrix.mode == 'thread' }}
         run: |
           make -C dm/host/tests CC=clang B=build/ci-native-tsan \
-            vamm-native-tsan memory-runtime-tsan memory-hooks-tsan guest-thread-imports-tsan standard-allocator-events-tsan 2>&1 | tee logs/native-vamm-transaction-tsan.log
+            vamm-native-tsan memory-runtime-tsan memory-runtime-reclaim-tsan memory-hooks-tsan guest-thread-imports-tsan standard-allocator-events-tsan 2>&1 | tee logs/native-vamm-transaction-tsan.log
       - name: Authoritative upstream SVC and extended MapMemory full matrix
         if: ${{ !cancelled() }}
         run: |
@@ -384,8 +391,8 @@ jobs:
       - name: Independent sparse statistics, recommit, candidate oracle and lifetime model
         if: ${{ !cancelled() }}
         run: |
-          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_sparse_core_independent.c"
-          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 415f50c28b47067e1f02f39c28fe0dd0c3b85356e856ecd77889ff53e910166a
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_sparse_core_regression_stage3.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 135a03ccca131cf9e0fdafcf489dcfa27dbadb92f185a1d8c6160585206fb573
           cd dm/host/tests
           mkdir -p "build/ci-independent-$MODE"
           modes=("$MODE")
@@ -404,7 +411,110 @@ jobs:
                 binary="build/ci-independent-$MODE/$name"
                 clang "${flags[@]}" -o "$binary" "$fixture" ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c 2>&1 | tee "../../../logs/$name-build.log"
                 "$binary" 2>&1 | tee "../../../logs/$name.log"
-                grep -Fq 'independent sparse core: missing-cost, live boundaries, metadata, realloc race and sparse finalize passed' "../../../logs/$name.log"
+                grep -Fq 'independent sparse core stage3 regression: missing-cost, candidate oracle, protected-source races and sparse finalize passed' "../../../logs/$name.log"
+              done
+            done
+          done
+      - name: Independent reclaim oracle, finer borrows and best-effort cleanup
+        if: ${{ !cancelled() }}
+        run: |
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_core_reclaim_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 0de790f83d378baa136edad597256f77e9c9e020cf39575f381bae10cbc4e598
+          cd dm/host/tests
+          mkdir -p "build/ci-reclaim-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          # Apple ARM64 uses its native page size. This is default vs forced 16K,
+          # not a claim of an actual 4K-host run. No game or SDK inputs are used.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for budget in limited unlimited; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -pthread -I. -I.. -Imap_memory_profile -Iaddress_space_profile)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$budget" = unlimited ]; then flags+=(-DDM_GAME_MEM_MAP_LIMIT=0); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                name="reclaim-$sanitizer-$page-$budget"
+                binary="build/ci-reclaim-$MODE/$name"
+                clang "${flags[@]}" -o "$binary" "$fixture" ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c 2>&1 | tee "../../../logs/$name-build.log"
+                "$binary" 2>&1 | tee "../../../logs/$name.log"
+                grep -Fq 'independent core reclaim: 3600 live cycles, cross-word/high-alignment, finer borrows, best-effort failures and recommit preservation passed' "../../../logs/$name.log"
+              done
+            done
+          done
+      - name: Independent explicit runtime factory across all domain and placement contracts
+        if: ${{ !cancelled() }}
+        run: |
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_runtime_pages_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 5ed24f04f1bc8b48aa7223774e54db168aa45177aec24684eacb15d84030bcc7
+          cd dm/host/tests
+          mkdir -p "build/ci-independent-runtime-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          sources=(../hle_memory_runtime.c ../hle_standard_allocator_policy.c
+                   ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c
+                   ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+                   ../hle_standard_allocator_adapter.c)
+          # Five sanitizer modes x four native/forced-page and budget variants
+          # x six explicit domain/placement contracts = 120 executions overall.
+          # Native Apple default may already be 16K; no actual 4K-host claim.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for budget in limited unlimited; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -pthread
+                       -I. -I.. -Imap_memory_profile -Iaddress_space_profile
+                       -DDM_SA_ADAPTER_TESTING -DDM_VAMM_ADAPTER_TESTING -DDM_GAME_ALLOC_BIG_ALIGN=0)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$budget" = unlimited ]; then flags+=(-DDM_GAME_MEM_MAP_LIMIT=0); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                name="runtime-independent-$sanitizer-$page-$budget"
+                binary="build/ci-independent-runtime-$MODE/$name"
+                clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" 2>&1 | tee "../../../logs/$name-build.log"
+                for domain in 0 1; do
+                  for placement in 0 1 2; do
+                    "$binary" "$domain" "$placement" 2>&1 | tee "../../../logs/$name-domain$domain-placement$placement.log"
+                    grep -Fq 'independent runtime pages: real factory/adapter/Vamm/SVC, strict budget, forwarding/Walk gates, borrow/trim/recommit and teardown passed' "../../../logs/$name-domain$domain-placement$placement.log"
+                  done
+                done
+              done
+            done
+          done
+      - name: Independent explicit runtime disabled-resource and production-authority gates
+        if: ${{ !cancelled() }}
+        run: |
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_runtime_pages_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 5ed24f04f1bc8b48aa7223774e54db168aa45177aec24684eacb15d84030bcc7
+          cd dm/host/tests
+          mkdir -p "build/ci-independent-runtime-gates-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          sources=(../hle_memory_runtime.c ../hle_standard_allocator_policy.c
+                   ../hle_vamm_native.c ../hle_vamm.c ../hle_vamm_adapter.c
+                   ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+                   ../hle_standard_allocator_adapter.c)
+          # Ten disabled-resource and ten production-gate executions overall.
+          for sanitizer in "${modes[@]}"; do
+            for page in default simulated16k; do
+              for gate in resource-disabled production; do
+                flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-format -pthread
+                       -I. -I.. -Imap_memory_profile -Iaddress_space_profile -DDM_GAME_ALLOC_BIG_ALIGN=0)
+                if [ "$page" = simulated16k ]; then flags+=(-DDM_TEST_HOST_PAGE_16K); fi
+                if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+                elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+                # Production omits BOTH adapter-testing defines; it is not a
+                # testing-enabled fixture with only the resource switched off.
+                if [ "$gate" = resource-disabled ]; then
+                  flags+=(-DDM_SA_ADAPTER_TESTING -DDM_VAMM_ADAPTER_TESTING -DDM_TEST_SYS_RESOURCE=0)
+                  marker='independent page-capable constructor retains disabled-resource rejection: PASS'
+                else
+                  marker='independent page-capable constructor grants no production hook authority: PASS'
+                fi
+                name="runtime-gate-$gate-$sanitizer-$page"
+                binary="build/ci-independent-runtime-gates-$MODE/$name"
+                clang "${flags[@]}" -o "$binary" "$fixture" "${sources[@]}" 2>&1 | tee "../../../logs/$name-build.log"
+                "$binary" 2>&1 | tee "../../../logs/$name.log"
+                grep -Fq "$marker" "../../../logs/$name.log"
               done
             done
           done

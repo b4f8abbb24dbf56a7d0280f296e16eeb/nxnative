@@ -223,6 +223,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** a mask that covers every channel the format has is a whole clear (`mtl_pf_chmask`).
 - **Found on:** [FINAL FANTASY TACTICS - The Ivalice Chronicles](../../dm/games/010038B015560000/README.md).
 
+### Texture clears with partial channel masks or regions
+
+- **Symptom:** `texture clear case not implemented … mask 0x8` while entering a rendered scene.
+- **Cause:** `ClearTexture` only handled whole-level clears whose mask covered every channel. Persona 5 Royal clears only alpha on a 1920x1080 RGBA8 target; a load-action clear cannot preserve its RGB channels.
+- **Fix:** partial colour texture clears use the existing clear-triangle shaders in a load/store pass, with the requested channel mask and rectangle. The viewport comes from the selected mip, the region selects the slices or depth planes, and the current draw scissor does not affect the operation. Whole-level whole-channel clears keep the load-action path. `t_clear_tex` checks pixel and channel preservation, mip/layer selection, integer values, an empty mask and the whole-clear path under Metal validation.
+- **Found on:** [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md), the opening casino.
+
 ### Scissored colour clears
 
 - **Cause:** NVN `ClearColor` honours the scissor. Clears are normally folded into the next pass's load action, which only works for a full-target clear; Mario clears sub-rectangles of small targets to zero (pyramid levels packed into 480×272, 256×256 and 64×36 targets).

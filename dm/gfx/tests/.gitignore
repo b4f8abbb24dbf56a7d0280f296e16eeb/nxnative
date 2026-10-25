@@ -74,6 +74,8 @@ t_primitive_restart
 t_primitive_restart.dSYM/
 t_clear_ds
 t_clear_ds.dSYM/
+t_clear_tex
+t_clear_tex.dSYM/
 t_upgrade_alias
 t_upgrade_alias.dSYM/
 t_stencil_view

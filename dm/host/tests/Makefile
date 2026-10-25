@@ -562,6 +562,52 @@ $(B)/t_memory_runtime_tsan_disabled: $(MEMORY_RUNTIME_DEPS) | $(B)
 	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RUNTIME_SRCS)
 memory-runtime-tsan: $(B)/t_memory_runtime_tsan $(B)/t_memory_runtime_tsan_unlimited $(B)/t_memory_runtime_tsan_16k $(B)/t_memory_runtime_tsan_16k_unlimited $(B)/t_memory_runtime_tsan_disabled
 	@set -e; for test in $^; do $$test; done
+# Explicit page-capable construction only; no admitted startup selects it.
+MEMORY_RECLAIM_SRCS = t_memory_runtime_reclaim.c $(filter-out t_memory_runtime.c,$(MEMORY_RUNTIME_SRCS))
+MEMORY_RECLAIM_DEPS = $(MEMORY_RECLAIM_SRCS) $(MEMORY_RUNTIME_DEPS)
+$(B)/t_memory_runtime_reclaim: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1  -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_unlimited: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_GAME_MEM_MAP_LIMIT=0  -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_16k: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_HOST_PAGE_16K  -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_16k_unlimited: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0  -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_disabled: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0  -o $@ $(MEMORY_RECLAIM_SRCS)
+.PHONY: memory-runtime-reclaim
+memory-runtime-reclaim: $(B)/t_memory_runtime_reclaim $(B)/t_memory_runtime_reclaim_unlimited $(B)/t_memory_runtime_reclaim_16k $(B)/t_memory_runtime_reclaim_16k_unlimited $(B)/t_memory_runtime_reclaim_disabled $(B)/t_memory_runtime_reclaim_gate
+	@set -e; for test in $^; do $$test; done
+$(B)/t_memory_runtime_reclaim_sanitize: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_sanitize_unlimited: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_sanitize_16k: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_sanitize_16k_unlimited: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_sanitize_disabled: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+.PHONY: memory-runtime-reclaim-sanitize
+memory-runtime-reclaim-sanitize: $(B)/t_memory_runtime_reclaim_sanitize $(B)/t_memory_runtime_reclaim_sanitize_unlimited $(B)/t_memory_runtime_reclaim_sanitize_16k $(B)/t_memory_runtime_reclaim_sanitize_16k_unlimited $(B)/t_memory_runtime_reclaim_sanitize_disabled
+	@set -e; for test in $^; do $$test; done
+$(B)/t_memory_runtime_reclaim_tsan: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_tsan_unlimited: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_tsan_16k: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_HOST_PAGE_16K -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_tsan_16k_unlimited: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=0 -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+$(B)/t_memory_runtime_reclaim_tsan_disabled: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MEMORY_RUNTIME_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -DDM_TEST_SYS_RESOURCE=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(MEMORY_RECLAIM_SRCS)
+.PHONY: memory-runtime-reclaim-tsan
+memory-runtime-reclaim-tsan: $(B)/t_memory_runtime_reclaim_tsan $(B)/t_memory_runtime_reclaim_tsan_unlimited $(B)/t_memory_runtime_reclaim_tsan_16k $(B)/t_memory_runtime_reclaim_tsan_16k_unlimited $(B)/t_memory_runtime_reclaim_tsan_disabled
+	@set -e; for test in $^; do $$test; done
+$(B)/t_memory_runtime_reclaim_gate: $(MEMORY_RECLAIM_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_ALLOC_BIG_ALIGN=1 -o $@ $(MEMORY_RECLAIM_SRCS)
+run: memory-runtime-reclaim
+
 # Explicit immutable domain/placement construction; no new SDK eligibility.
 MEMORY_CONTRACT_SRCS = t_memory_runtime_contract.c ../hle_memory_runtime.c ../hle_vamm_native.c ../hle_vamm.c
 MEMORY_CONTRACT_DEPS = $(MEMORY_CONTRACT_SRCS) ../hle_memory_runtime.h ../hle_vamm_native.h ../hle_vamm.h ../hle_standard_allocator_provider.h

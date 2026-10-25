@@ -1,4 +1,6 @@
-// Independent synthetic sparse-core tests over the real provider/SVC.
+// Stage-3 regression derivative of the frozen independent 2b fixture.
+// Only the two obsolete no-decommit assertions are removed; all budget,
+// candidate, protected-source and output transaction checks remain unchanged.
 #define main implementation_fixture_main
 #include "t_standard_allocator_provider.c"
 #undef main
@@ -51,7 +53,6 @@ static dm_sa_result cap_budget(void *ctx, size_t *out) {
 }
 static dm_sa_result cap_change(void *ctx, const dm_sa_span *s, size_t off, size_t n, int commit) {
     capture *c = ctx; ++c->changes; c->last_change_offset = off; c->last_change_size = n;
-    assert(commit); // This slice must never add automatic decommit.
     return c->inner.pages.change(c->inner.context, s, off, n, commit);
 }
 static void *cap_metadata_alloc(void *ctx, size_t n) {
@@ -292,9 +293,9 @@ static void randomized_sparse_lifetimes(void) {
                 b->ptr = out; b->n = rounded; memset(out, b->value, b->n);
             } else assert(r == DM_SA_NO_MEMORY && out == SENTINEL);
         } else {
-            size_t n = (1 + rnd() % (b->n / 16)) * 16, actual = SIZE_MAX, changes = f.c.changes;
+            size_t n = (1 + rnd() % (b->n / 16)) * 16, actual = SIZE_MAX;
             OK(dm_sa_shrink(f.a, b->ptr, n, &actual)); assert(actual == n);
-            b->n = n; assert(f.c.changes == changes); // no automatic Shrink decommit
+            b->n = n; // Stage 3 may reclaim the successfully released free tail.
         }
         size_t count = 0, used = 0;
         model_block sorted[32];
@@ -655,7 +656,7 @@ int main(void) {
     stats_shared_physical_budget();
     randomized_sparse_lifetimes();
     commit_failure_and_postcommit_borrow();
-    puts("independent sparse core: missing-cost, live boundaries, metadata, realloc race and sparse finalize passed");
+    puts("independent sparse core stage3 regression: missing-cost, candidate oracle, protected-source races and sparse finalize passed");
 #endif
     return 0;
 }

@@ -31,7 +31,7 @@ Queries remain snapshots rather than a promise that the SDK reservation topology
 
 Requests above the callback's guaranteed absolute alignment fail before calling the owner. This slice does not hide padded physical mappings, claim unsupported alignment, or return fragmented memory as one contiguous span.
 
-## Optional page capability: provider layer only
+## Optional page capability
 
 An explicitly supplied `change_pages` owner callback exposes an optional
 `dm_sa_provider.pages` capability. It inspects runs from the authoritative SVC
@@ -44,10 +44,12 @@ finer and query prefixes may be clipped. It is not merely a minimum callback
 alignment or the host protection-page size. The native capability remains
 4 KiB on both 4 KiB and 16 KiB hosts. Finer existing commitment states are not
 supported by an advertised coarser capability.
-The production runtime does **not** supply this callback. Shrink and activation
-gates remain unchanged. Sparse commitment statistics, whole-lease draining and
-recommit-on-reuse/growth are implemented as staged core layers below. No core
-operation initiates decommit of free runs.
+Existing runtime constructors and admitted startup descriptors do **not** supply
+this callback. The [explicit page-capable constructor](shared-memory-runtime.md#explicit-page-capable-construction-not-startup-admission)
+is currently exercised only by synthetic runtime integration fixtures; activation
+gates remain unchanged. Sparse commitment statistics, whole-lease draining,
+recommit-on-reuse/growth and optional native reclamation are implemented as
+staged core layers below. These policies are not active in production.
 
 Queries run without dropping the source guard and never read payload bytes.
 Page changes mark the lease in-flight, drop the guard before the owner callback,
@@ -56,7 +58,7 @@ scope even under legacy-unlimited profiles. A returning failure preserves page
 state and accounting; host-protection failures retain the backend's fatal policy.
 Decommit rejects borrowed bytes, while recommit preserves previously committed
 bytes. Successful recommit can already be borrowed when the guard is restored:
-a future core caller must revalidate before exposing or copying any allocation.
+the core revalidates before exposing or copying any allocation.
 
 The caller must prove that decommitted pages contain no live allocations; the
 provider owns lease/budget/borrow validation, not block lifetime metadata. Direct
@@ -71,9 +73,8 @@ generation/range validation, preserved live neighbors on simulated 16 KiB hosts,
 idempotent accounting, failure retention, in-flight serialization, borrow races,
 zero-reservation-gap recommit, stale-budget rejection and release through holes.
 The native Vamm fixture also exercises the capability through `dm_vamm_pages`
-and the real SVC backend without wiring it into production. Core reclamation,
-runtime wiring and transactional Shrink policy still
-require a separate implementation/review. This establishes no SDK policy parity,
+and the real SVC backend. Explicit runtime construction is separately tested;
+startup selection still requires review and native CI. This establishes no SDK policy parity,
 new admission, gameplay result or permission to remove an existing cut.
 
 ### Sparse accounting and whole-lease draining
@@ -93,10 +94,9 @@ cost; borrowed runs are barriers. No persistent residency ledger is introduced.
 Query failures leave the entire caller output unchanged.
 
 Page-capable free-space statistics describe budgeted recommit potential, not a
-promise against a competing physical commit after a snapshot. Production
-callbacks stay absent. Tests create holes only through exact captured leases
-and only in known wholly free granules; no automatic Shrink/Trim reclamation is
-enabled.
+promise against a competing physical commit after a snapshot. Admitted startup
+callbacks stay absent. Synthetic tests create holes through exact captured leases
+in proven wholly free granules, or through the core reclamation policy below.
 
 Sparse release and finalize preflight validate lease ownership and borrowed
 ranges independently of commitment. Missing pages are not a reason for `BUSY`.
@@ -135,12 +135,47 @@ Synthetic cases cover both split-metadata failures before the page callback,
 owner rejection, exact missing-only budgets across live page boundaries,
 zero-budget selection of a later backed run, protected-old-prefix growth races,
 postcommit target borrows and retained-page retry. Providers without page
-capabilities retain their original allocation/growth path. Runtime opt-in,
-automatic reclamation policy and gameplay validation remain separate work.
+capabilities retain their original allocation/growth path. Runtime opt-in
+and gameplay validation remain separate work.
 A synthetic coarser-capability fixture also rejects unsupported finer holes in
 stats, allocation and in-place growth without changing pages, outputs or the
 old allocation. A separate valid case keeps commitment uniform while borrowing
 a finer boundary neighbor; rounded recommit preserves that borrow and its bytes.
+
+### Best-effort free-page reclamation
+
+This is an optional **native policy**, not a claim about the original SDK's
+reclamation timing. Shrink and realloc-shrink finish all needed metadata
+allocation, validate the old allocation, then publish the smaller live block
+before attempting page cleanup in its coalesced free tail. A returning cleanup
+failure or raced borrow retains backing and cannot change successful Shrink into
+an error. Metadata allocation failure still leaves the original allocation,
+outputs and commitment unchanged. Free does not eagerly reclaim partial spans;
+its existing whole-dead-span release behavior is unchanged.
+
+Trim additionally attempts cleanup inside free blocks of live spans. The core
+rounds **inward** to the free block and then to each authoritative committed,
+unborrowed run. Thus no live boundary page is touched, and any finer borrowed
+subrange excludes its entire logical granule. Existing holes need no operation.
+Each change preserves the lease, token and virtual reservation. Physical
+headroom and `committed_bytes` reflect successfully returned pages; subsequent
+reuse recommits only missing pages before publication, with zero-filled holes
+and preserved neighboring bytes.
+
+The source guard may be released during a change; the provider rejects borrows
+that race the attempted decommit. Later runs are queried afresh after its return.
+Queries with errors or malformed lengths stop that free block's cleanup; a
+returning change failure advances past the queried interval without retrying.
+This bounds progress even when an optional provider fails. Trim ignores these
+optional cleanup errors, but still reports the first error from releasing a
+wholly dead span. Such failures retain exact ownership for a later retry.
+
+Synthetic tests cover full shrink/reclaim/recommit lifetimes, interior free
+blocks between live neighbors, exact budget recovery, zero-filled reuse,
+metadata failure, query/change failure, malformed zero/oversized query runs,
+borrow races and finer borrowed boundaries in a coarser logical granule.
+Providers without the capability, including malloc-backed fixtures, take the
+unchanged whole-lease path and perform no page operations.
 
 ## Verification and remaining boundary
 

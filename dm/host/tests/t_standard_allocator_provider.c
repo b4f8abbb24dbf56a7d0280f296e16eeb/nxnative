@@ -259,7 +259,7 @@ static dm_sa_result (*captured_acquire)(void *, size_t, size_t, dm_sa_span *);
 static dm_sa_result (*captured_run)(void *, const dm_sa_span *, size_t, size_t, dm_sa_page_run *);
 static dm_sa_result (*captured_budget)(void *, size_t *);
 static dm_sa_span captured_lease;
-static int fail_run_query, fail_budget_query, short_run_queries;
+static int fail_run_query, fail_budget_query, short_run_queries, bad_run_query;
 static dm_sa_result capture_acquire(void *context, size_t size, size_t alignment, dm_sa_span *out) {
     dm_sa_result r = captured_acquire(context, size, alignment, out);
     if (r == DM_SA_OK) captured_lease = *out;
@@ -268,6 +268,10 @@ static dm_sa_result capture_acquire(void *context, size_t size, size_t alignment
 static dm_sa_result capture_run(void *context, const dm_sa_span *span,
                                  size_t offset, size_t maximum, dm_sa_page_run *out) {
     if (fail_run_query) { fail_run_query = 0; return DM_SA_PROVIDER_FAILED; }
+    if (bad_run_query) {
+        *out = (dm_sa_page_run){bad_run_query == 1 ? 0 : maximum + 1, DM_SA_PAGE_COMMITTED};
+        bad_run_query = 0; return DM_SA_OK;
+    }
     if (short_run_queries && maximum > 17) maximum = 17;
     return captured_run(context, span, offset, maximum, out);
 }
@@ -422,7 +426,7 @@ static void test_sparse_core_recommit(owner *o, dm_sa_sdk_owner callbacks) {
     page_calls = o->page_calls;
     size_t usable;
     assert(dm_sa_shrink(a, out, 32, &usable) == DM_SA_OK && usable == 32);
-    assert(o->page_calls == page_calls && stats(a).committed_bytes == 3 * PAGE);
+    assert(o->page_calls == page_calls + 1 && stats(a).committed_bytes == PAGE);
     assert(dm_sa_free(a, out) == DM_SA_OK && dm_sa_free(a, anchor) == DM_SA_OK);
     assert(dm_sa_destroy(a) == DM_SA_OK && !pages(0, budget_page, PAGE) && !call(1, 0, 0, 0));
 
@@ -529,9 +533,127 @@ static void test_capability_granularity(owner *o, dm_sa_sdk_owner callbacks) {
     assert(!call(1, 0, 0, 0) && !owned_count(o) && !alias_mapped());
     assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
 }
+static void test_core_reclamation(owner *o, dm_sa_sdk_owner callbacks) {
+    callbacks.change_pages = change_original;
+    dm_sa_sdk_provider *provider = NULL;
+    assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
+    dm_sa_provider p = dm_sa_sdk_provider_interface(provider);
+    captured_acquire = p.acquire; captured_run = p.pages.query_run;
+    dm_sa_config config = {.provider = p, .capacity = POOL, .pool_size = POOL,
+        .metadata_alloc = sparse_metadata_alloc, .metadata_free = sparse_metadata_free};
+    config.provider.acquire = capture_acquire; config.provider.pages.query_run = capture_run;
+    dm_sa_allocator *a; void *anchor, *reuse; size_t usable;
+
+    // Full cycle: logical shrink -> inward tail reclamation -> recommit reuse
+    // -> explicit trim -> realloc shrink -> exact whole-lease release retry.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, POOL, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x71, POOL);
+    dm_sa_span lease = captured_lease;
+    size_t before_budget, after_budget;
+    p.begin(p.context); assert(p.pages.budget(p.context, &before_budget) == DM_SA_OK); p.end(p.context);
+    assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK && usable == 32);
+    dm_sa_stats st = stats(a);
+    assert(st.backing_bytes == POOL && st.committed_bytes == PAGE && st.allocated_bytes == 32 && st.allocation_count == 1);
+    assert(o->sizes[0] == POOL && captured_lease.token == lease.token);
+    p.begin(p.context); assert(p.pages.budget(p.context, &after_budget) == DM_SA_OK); p.end(p.context);
+    assert(after_budget == before_budget + POOL - PAGE);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x71);
+    assert(dm_sa_allocate(a, 2 * PAGE + 16, 16, &reuse) == DM_SA_OK && reuse == (unsigned char *)anchor + 32);
+    assert(stats(a).committed_bytes == 3 * PAGE);
+    for (size_t i = PAGE; i < 2 * PAGE + 48; ++i) assert(!((unsigned char *)anchor)[i]);
+    size_t calls = o->page_calls;
+    assert(dm_sa_free(a, reuse) == DM_SA_OK && o->page_calls == calls); // no eager partial-Free policy
+    assert(stats(a).committed_bytes == 3 * PAGE);
+    assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == PAGE);
+    calls = o->page_calls;
+    assert(dm_sa_trim(a) == DM_SA_OK && o->page_calls == calls); // idempotent holes
+    assert(dm_sa_reallocate(a, anchor, 3 * PAGE, &reuse) == DM_SA_OK && reuse == anchor);
+    memset(anchor, 0x82, 3 * PAGE);
+    assert(dm_sa_reallocate(a, anchor, 48, &reuse) == DM_SA_OK && reuse == anchor);
+    assert(stats(a).allocated_bytes == 48 && stats(a).committed_bytes == PAGE);
+    for (size_t i = 0; i < 48; ++i) assert(((unsigned char *)anchor)[i] == 0x82);
+    o->fail_release = 1;
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && stats(a).backing_bytes == POOL);
+    o->fail_release = 1;
+    assert(dm_sa_trim(a) == DM_SA_PROVIDER_FAILED && stats(a).backing_bytes == POOL);
+    assert(dm_sa_trim(a) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+
+    // Interior free blocks and both partial boundary pages remain safe. Trim
+    // also reclaims unused pool tail pages without moving either live neighbor.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    void *left, *middle, *right;
+    assert(dm_sa_allocate(a, PAGE + 16, 16, &left) == DM_SA_OK);
+    assert(dm_sa_allocate(a, 3 * PAGE, 16, &middle) == DM_SA_OK);
+    assert(dm_sa_allocate(a, PAGE, 16, &right) == DM_SA_OK);
+    memset(left, 0x19, PAGE + 16); memset(middle, 0x28, 3 * PAGE); memset(right, 0x37, PAGE);
+    calls = o->page_calls;
+    assert(dm_sa_free(a, middle) == DM_SA_OK && o->page_calls == calls && stats(a).committed_bytes == POOL);
+    assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == 4 * PAGE);
+    for (size_t i = 0; i < PAGE + 16; ++i) assert(((unsigned char *)left)[i] == 0x19);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)right)[i] == 0x37);
+    assert(dm_sa_free(a, left) == DM_SA_OK && dm_sa_free(a, right) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+
+    // A shrink metadata failure precedes logical publication and any cleanup.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, POOL, 16, &anchor) == DM_SA_OK); memset(anchor, 0x46, POOL);
+    sparse_metadata_failure = sparse_metadata_calls + 1; usable = 123; calls = o->page_calls;
+    assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_NO_MEMORY && usable == 123);
+    assert(o->page_calls == calls && stats(a).allocated_bytes == POOL && stats(a).committed_bytes == POOL);
+    sparse_metadata_failure = 0;
+    for (size_t i = 0; i < POOL; ++i) assert(((unsigned char *)anchor)[i] == 0x46);
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+
+    // Returning query/change failures, including malformed zero/oversize runs,
+    // stop bounded cleanup but cannot turn a committed logical shrink into an
+    // error. Explicit trim retries later; no busy loop and no lost reservation.
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        assert(dm_sa_create(&a, &config) == DM_SA_OK);
+        assert(dm_sa_allocate(a, POOL, 16, &anchor) == DM_SA_OK); memset(anchor, 0x55, POOL);
+        if (mode == 0) fail_run_query = 1;
+        else if (mode == 1) o->fail_pages = 1;
+        else bad_run_query = (int)mode - 1;
+        assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK && usable == 32);
+        assert(stats(a).allocated_bytes == 32 && stats(a).committed_bytes == POOL);
+        assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == PAGE);
+        for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x55);
+        assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+    }
+
+    // Existing borrows reject Shrink before metadata publication. A new borrow
+    // racing optional decommit instead leaves the successful smaller allocation
+    // and backing intact. Trim can reclaim disjoint free pages around the borrow.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, POOL, 16, &anchor) == DM_SA_OK); memset(anchor, 0x64, POOL);
+    borrow(o, (uintptr_t)anchor + PAGE); usable = 123; calls = o->page_calls;
+    assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_BUSY && usable == 123 && o->page_calls == calls);
+    return_borrow(o); o->borrow_change = 1;
+    assert(dm_sa_shrink(a, anchor, 32, &usable) == DM_SA_OK && usable == 32);
+    assert(stats(a).committed_bytes == POOL && o->borrowed == (uintptr_t)anchor + PAGE);
+    assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == 2 * PAGE);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)o->stack)[i] == 0x64);
+    return_borrow(o);
+    assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == PAGE);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x64);
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+
+    // Finer borrowed boundaries exclude their ENTIRE logical commitment
+    // granule, not merely the borrowed subrange; no outward decommit rounding.
+    config.provider.granule = config.provider.pages.granule = 4 * PAGE;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, PAGE, 16, &anchor) == DM_SA_OK); memset(anchor, 0x73, PAGE);
+    borrow(o, (uintptr_t)anchor + 5 * PAGE);
+    assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == 8 * PAGE);
+    return_borrow(o);
+    assert(dm_sa_trim(a) == DM_SA_OK && stats(a).committed_bytes == 4 * PAGE);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)anchor)[i] == 0x73);
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+    assert(!owned_count(o) && !alias_mapped());
+    assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
+}
 static void test_partial_pages(owner *o, dm_sa_sdk_owner callbacks) {
-    // Direct lease operations only. Production runtime and allocator Shrink,
-    // Free, Trim and reuse have NOT opted in to this experimental capability.
+    // Direct provider-layer lease operations, separate from core policy tests.
+    // The production runtime still does not supply this optional callback.
     callbacks.change_pages = change_original;
     dm_sa_sdk_provider *provider = NULL;
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
@@ -862,6 +984,7 @@ int main(void) {
     test_sparse_core_stats(&o, callbacks);
     test_sparse_core_recommit(&o, callbacks);
     test_capability_granularity(&o, callbacks);
+    test_core_reclamation(&o, callbacks);
     assert(!pthread_mutex_destroy(&o.mutex));
     alarm(0);
     puts("standard allocator SDK provider: real-SVC ownership, rollback, races, budget and shared-core tests passed");

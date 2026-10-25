@@ -58,6 +58,48 @@ code at native and simulated 16 KiB host-page sizes. It combines a 40 GiB lazy
 managed allocator with an independently reserved sparse range committed at
 both ends, shared physical-budget exhaustion, unchanged-output no-space,
 provided-buffer child forwarding and borrowed-source free failure/retention.
+
+### Explicit page-capable construction, not startup admission
+
+`dm_memory_runtime_create_page_capable_with_contract` constructs a full-mode
+runtime whose optional provider callback invokes `dm_vamm_pages` on its one
+retained owner. It is currently used only by synthetic integration fixtures.
+**No admitted startup descriptor selects it.** All existing constructors,
+`za-base-v1` and `za-base-sdk-v1` retain their previous behavior; default hook
+activation stays disabled. There is no SDK-only counterpart because that mode
+does not create a StandardAllocator provider. Construction grants no additional
+SDK, game, lifetime or relocation authority.
+
+The callback preserves the existing reservation and translates returning native
+results into provider success, no-memory, busy or provider-failed status. It
+does not call an SDK original, acquire guest TLS, duplicate the commitment
+bitmap, or release/recreate a lease. The provider retains its source-guard
+suspension, in-flight serialization and strict physical-budget transaction;
+the core retains its metadata-before-recommit and postcommit-borrow validation.
+Shrink and live-span Trim use the [optional native reclamation policy](standard-allocator-provider.md#best-effort-free-page-reclamation).
+
+The `memory-runtime-reclaim`, `memory-runtime-reclaim-sanitize` and
+`memory-runtime-reclaim-tsan` targets drive the actual runtime factory, published
+adapter methods, native Vamm, provider and SVC backend. Cases cover a complete
+shrink/reclaim/recommit cycle, reservation retention, exact committed counters,
+zeroed holes, original live bytes, unchanged default capability absence,
+source-borrow races on separate threads, strict missing-only and stale budgets,
+sparse finalization/release retry, disabled resources and production gates.
+Only the portable platform harness and original constructor trampolines are
+synthetic. Race synchronization wraps the real native SVC bridge, not the
+runtime factory or owner callback. Host-protection failures retain the existing
+fatal policy and are tested separately from returning best-effort failures.
+
+No successful fixture authorizes game use. Before any startup descriptor can
+select this constructor, independent review and native CI must cover the full
+runtime/startup path. The existing game contract still requires callers to stop
+using freed bytes, a realloc-moved source, or a relinquished Shrink tail before
+that lifetime ends. MapMemory source guards cover registered borrows, not every
+possible in-flight GPU/Metal reference or unobserved guest pointer. Real Apple
+VM/GPU behavior and external lifetime correctness remain unproven here; no
+thread or texture-readback audit is implied. Returned logical commitment and
+physical-budget headroom are measurable; an immediate physical RSS reduction
+is not promised. Production startup still retains its owner for process lifetime.
 Guest originals are synthetic; these are not Paper Mario/Absolum ABI or gameplay
 tests, and no SDK is newly enabled.
 

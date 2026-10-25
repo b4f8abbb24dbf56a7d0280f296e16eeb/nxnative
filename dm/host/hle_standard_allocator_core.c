@@ -130,6 +130,29 @@ static dm_sa_result prepare_backing(dm_sa_allocator *a, span *s, size_t offset, 
     }
     return available(a, s, offset, size) ? DM_SA_OK : DM_SA_BUSY;
 }
+// Native optional policy, not SDK reclamation parity. Logical free/shrink has
+// already committed before this best-effort cleanup. Round INWARD twice: first
+// to the free block, then to each wholly committed and unborrowed run. Never
+// decommit a live or borrowed boundary granule, even if its neighbor is free.
+static void reclaim_free(dm_sa_allocator *a, span *s, const block *b) {
+    const dm_sa_provider *p = &a->config.provider;
+    size_t granule = p->pages.granule, lo;
+    if (!granule || b->live || !rounded(b->offset, granule, &lo)) return;
+    size_t hi = (b->offset + b->size) & ~(granule - 1);
+    for (size_t at = lo; at < hi;) {
+        dm_sa_page_run run;
+        if (page_run(a, s, at, hi - at, &run) != DM_SA_OK) return;
+        size_t end = at + run.size;
+        if ((run.flags & (DM_SA_PAGE_COMMITTED | DM_SA_PAGE_BORROWED)) == DM_SA_PAGE_COMMITTED) {
+            size_t first, last = end & ~(granule - 1);
+            if (rounded(at, granule, &first) && first < last)
+                (void)p->pages.change(p->context, &s->lease, first, last - first, 0);
+        }
+        // change may suspend the source guard. Inspect subsequent runs afresh;
+        // a raced borrow or backend rejection retains backing for a later trim.
+        at = end;
+    }
+}
 static void *address(const span *s, const block *b) {
     return (void *)((uintptr_t)s->lease.base + b->offset);
 }
@@ -400,7 +423,9 @@ static dm_sa_result shrink_locked(dm_sa_allocator *a, span *s, block *b, size_t 
         if (!tail) return DM_SA_NO_MEMORY;
         tail->offset = b->offset + n; tail->size = released; insert_after(b, tail);
     }
-    b->size = n; a->used -= released; s->free_bytes += released; return DM_SA_OK;
+    b->size = n; a->used -= released; s->free_bytes += released;
+    reclaim_free(a, s, tail); // failure cannot undo an already-published shrink
+    return DM_SA_OK;
 }
 dm_sa_result dm_sa_shrink(dm_sa_allocator *a, void *pointer, size_t size, size_t *out) {
     if (!a || !pointer || !out || !size) return DM_SA_INVALID;
@@ -573,6 +598,8 @@ dm_sa_result dm_sa_trim(dm_sa_allocator *a) {
     if (!a->closed) for (span *s = a->spans, *next; s; s = next) {
         next = s->next;
         if (!s->live_count) { dm_sa_result one = release_span(a, s); if (r == DM_SA_OK) r = one; }
+        else for (block *b = s->blocks; b; b = b->next)
+            if (!b->live) reclaim_free(a, s, b);
     }
     leave(a); return r;
 }
