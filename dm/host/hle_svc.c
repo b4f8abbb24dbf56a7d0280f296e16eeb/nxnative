@@ -1,6 +1,8 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
+#include "hle_standard_allocator_provider.h"
+#include "hle_vamm_native.h"
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
@@ -23,6 +25,17 @@ int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintp
 static uint8_t *g_alias; static size_t g_alias_cap;
 static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_pages)
 static uint64_t *g_alias_exposed;   // one bit per host page ever opened; protected by g_map_lock
+// Only provider-owned allocation callbacks opt into the stricter budget. The
+// original SDK callback runs outside g_map_lock and re-enters this same SVC path.
+static _Thread_local unsigned g_sa_owner_allocation_depth;
+void dm_sa_svc_owner_allocation_begin(void) {
+    if (g_sa_owner_allocation_depth == UINT32_MAX) abort();
+    ++g_sa_owner_allocation_depth;
+}
+void dm_sa_svc_owner_allocation_end(void) {
+    if (!g_sa_owner_allocation_depth) abort();
+    --g_sa_owner_allocation_depth;
+}
 static uint8_t *g_stack; static size_t g_stack_cap;
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
@@ -119,6 +132,7 @@ static int64_t alias_unmapped(uint64_t off, uint64_t n) {
     return c;
 }
 static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (page bitmap)
+static size_t alias_mapped(void) { return (size_t)atomic_load(&g_alias_mapped); }
 
 // Word-at-a-time boundaries of the bitmap run containing p (guest page index).
 static uint64_t alias_mask(unsigned n) { return n == 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; }
@@ -213,6 +227,44 @@ static int map_source_backed(uint64_t src, uint64_t size) {
     module_data_query(m, off, &lo, &hi, &perm);
     return perm == 3 && hi >= lo && memory_contains(lo, hi - lo, off, size);
 }
+// Provider leases inspect the SAME bitmap and borrowed-source registry as
+// upstream SVCs. They do not allocate competing physical or reservation state.
+void dm_sa_svc_scope_begin(void) { mem_init(); pthread_mutex_lock(&g_map_lock); }
+void dm_sa_svc_scope_end(void) { pthread_mutex_unlock(&g_map_lock); }
+int dm_sa_svc_alias_range_locked(uintptr_t base, size_t size) {
+    return size && memory_contains((uintptr_t)g_alias, g_alias_cap, base, size);
+}
+int dm_sa_svc_backed_locked(uintptr_t base, size_t size) {
+    if (!dm_sa_svc_alias_range_locked(base, size)) return 0;
+    uintptr_t lo = base & ~(uintptr_t)0xfff;
+    if (size > SIZE_MAX - (base - lo) - 0xfff) return 0;
+    size_t n = (size + (base - lo) + 0xfff) & ~(size_t)0xfff;
+    return !alias_unmapped(lo - (uintptr_t)g_alias, n);
+}
+int dm_sa_svc_available_locked(uintptr_t base, size_t size) {
+    return dm_sa_svc_alias_range_locked(base, size) && !map_source_busy(base, size) &&
+        dm_sa_svc_backed_locked(base, size);
+}
+size_t dm_sa_svc_physical_budget_locked(void) {
+    size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
+    if (image > floor) floor = image;
+    size_t heap = atomic_load(&g_heap_cur), mapped = alias_mapped();
+    size_t remaining = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
+    remaining = heap < remaining ? remaining - heap : 0;
+    return mapped < remaining ? remaining - mapped : 0;
+}
+// A preflight only: the helper retains allocation ownership and MapMemory later
+// performs its authoritative atomic borrow under this same lock.
+int dm_guest_map_source_available(const void *source, size_t size) {
+    uintptr_t src = (uintptr_t)source;
+    if (!size || ((src | size) & 0xfff) || size > UINTPTR_MAX - src) return 0;
+    mem_init();
+    pthread_mutex_lock(&g_map_lock);
+    int available = !map_source_busy(src, size) && map_source_backed(src, size);
+    pthread_mutex_unlock(&g_map_lock);
+    return available;
+}
+
 static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *attr, uint64_t *perm) {
     uint64_t lo = *base, remaining = *size; // the final free page can end at 2^64
     for (int i = 0; i < g_nmap; ++i) {
@@ -228,6 +280,14 @@ static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint
     }
     *base = lo; *size = remaining;
 }
+
+// Horizon MemoryInfo includes its final reserved word. Keep the whole ABI
+// initialized and use memcpy so guest output need not be host-aligned.
+typedef struct {
+    uint64_t base, size;
+    uint32_t state, attr, perm, ipc_refcount, device_refcount, reserved;
+} svc_memory_info;
+_Static_assert(sizeof(svc_memory_info) == 40, "MemoryInfo ABI size");
 
 // Diagnostic DM_ALIAS_WINDOWS=<window MB>: every 30 s, the mapped memory of each window of that size in the alias region (windows aligned to the size in absolute addresses, counted from the page
 // bitmap; windows with nothing mapped are left out). For sizing an allocator that reserves fixed, aligned windows and commits pages from each window's start: Unreal's FMallocBinned3 takes
@@ -247,6 +307,84 @@ static void *alias_windows_thread(void *arg) {
         LOG("[mem] alias windows of %llu MB (window offset:MB mapped), %.1f MB in all:%s", (unsigned long long)(win >> 20), tot * 4096 / 1048576.0, line);
     }
     return NULL;
+}
+
+// Narrow native bridge; raw values match GetInfo without changing SDK policy.
+uint64_t dm_vamm_svc_info(unsigned id) {
+    mem_init();
+    switch (id) {
+    case I_AliasAddr: return (uintptr_t)g_alias;
+    case I_AliasSize: return g_alias_cap;
+    case 28: return 0; // AliasRegionExtraSize: no extra alias reservation today
+    case I_SysResTotal: return DM_GAME_SYS_RESOURCE;
+    case I_SysResUsed: return DM_GAME_SYS_RESOURCE ? 0x400000 : 0;
+    default: abort();
+    }
+}
+
+// Native Vamm and SDK SVCs share this upstream bitmap transaction. Reservation
+// ownership lives only in the gated Vamm owner, not in a second page manager.
+uint32_t dm_vamm_svc_change_pages(uintptr_t a, size_t size, int commit) {
+    if (commit != 0 && commit != 1) return 0xD401;
+    mem_init();
+    unsigned num = commit ? 0x2C : 0x2D;
+    if (!size || ((a | size) & 0xfff) || !memory_contains((uintptr_t)g_alias, g_alias_cap, a, size)) {
+        LOG("SVC %#x outside the alias region %p+%#zx", num, (void *)a, size); return 0xD401;
+    }
+    pthread_mutex_lock(&g_map_lock);
+    // The SDK extends committed windows across borrowed stack sources
+    // (Raging Loop, StandardAllocator). Recommit preserves every live byte;
+    // only decommit can invalidate backing required for eventual copyback.
+    if (num == 0x2D && map_source_busy(a, size)) { pthread_mutex_unlock(&g_map_lock); return 0xD401; }
+    uint64_t off = a - (uintptr_t)g_alias;
+    int64_t need = alias_unmapped(off, size) * 4096;
+    // Profile mem_map_limit: a map that would take the process past the application pool fails with ResultLimitReached, as on Horizon (the pool less the used memory GetInfo reports).
+    // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped
+    // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
+    // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
+    // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
+    if ((DM_GAME_MEM_MAP_LIMIT || g_sa_owner_allocation_depth) && commit) {
+        int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
+        if (g_sa_owner_allocation_depth) {
+            // Provider snapshots cannot authorize an overdraw by a later SDK
+            // callback, even when ordinary legacy maps have no profile cap.
+            size_t strict = dm_sa_svc_physical_budget_locked();
+            if (!DM_GAME_MEM_MAP_LIMIT || room > (int64_t)strict) room = (int64_t)strict;
+        }
+        if (need && need > room) {
+            pthread_mutex_unlock(&g_map_lock);
+            static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
+                                                                   size, atomic_load(&g_alias_mapped) / 1073741824.0);
+            return 0x10801;
+        }
+    }
+    // Host pages are 16 KB, Horizon pages 4 KB: a map is rounded out to host pages (the extra neighboring 4K pages are inside the alias region and merely become writable early, harmless);
+    // An edge host page is reclaimed only when no live logical neighbor remains.
+    uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
+    uintptr_t mlo = lo & ~(pg - 1), mhi = (hi + pg - 1) & ~(pg - 1);
+    int64_t changed = commit ? need : (int64_t)size - need;
+    if (!commit) {
+        if ((lo - mlo) / 4096 != (uint64_t)alias_unmapped(mlo - (uintptr_t)g_alias, lo - mlo)) mlo += pg;
+        if ((mhi - hi) / 4096 != (uint64_t)alias_unmapped(hi - (uintptr_t)g_alias, mhi - hi)) mhi -= pg;
+    }
+    if (changed && mhi > mlo) {
+        if (mprotect((void *)mlo, mhi - mlo, commit ? PROT_READ | PROT_WRITE : PROT_NONE))
+            die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
+        if (commit) dm_guest_write_prepare((void *)mlo, mhi - mlo);
+        else (void)madvise((void *)mlo, mhi - mlo, MADV_FREE);
+    }
+    if (commit && changed) alias_initialize(off, size);
+    if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", commit ? "Map" : "Unmap", (void *)a, size);
+    // how deep the alias region is used (one line per 256 MB crossed): for sizing the reservation and alias region (iOS caps a single reservation at 6 GB)
+    if (num == 0x2C) { static _Atomic uint64_t hw; uint64_t end = off + size, old = atomic_load(&hw);
+        while (end > old && !atomic_compare_exchange_weak(&hw, &old, end)) {}
+        if (end > old && end >> 28 != old >> 28) LOG("[mem] alias region mapped up to +%.2f GB (alias region %.2f GB)", end / 1073741824.0, g_alias_cap / 1073741824.0); }
+    // Total actually mapped in the alias region (one line per 256 MB crossed, up or down): how much physical memory the game uses and whether it keeps growing. Counted with a page bitmap, only pages whose state really changed --
+    // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
+    { int64_t d = alias_pages(off, size, commit) * 4096, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
+      pthread_mutex_unlock(&g_map_lock);
+      if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
+    return 0;
 }
 
 int svc_thread(int num, uint64_t *regs);   // hle_thread.c: thread and synchronization kind
@@ -391,68 +529,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         map_source_query(addr, &base, &size, &attr, &perm);
         pthread_mutex_unlock(&g_map_lock);
         if (mi) {
-            struct { uint64_t base, size; uint32_t state, attr, perm, ipc, device, reserved; }
-                out = {base, size, (uint32_t)state, attr, (uint32_t)perm, 0, 0, 0};
-            _Static_assert(sizeof out == 40, "MemoryInfo ABI size");
+            svc_memory_info out = {base, size, (uint32_t)state, attr, (uint32_t)perm, 0, 0, 0};
             memcpy((void *)(uintptr_t)mi, &out, sizeof out);
         }
         regs[0] = 0; regs[1] = 0; return 0;
     }
-    case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
-        uintptr_t a = regs[0]; size_t size = regs[1];
-        if (!size || ((a | size) & 0xfff) || !memory_contains((uintptr_t)g_alias, g_alias_cap, a, size)) {
-            LOG("SVC %#x outside the alias region %p+%#zx", num, (void *)a, size); regs[0] = 0xD401; return 0;
-        }
-        pthread_mutex_lock(&g_map_lock);
-        // The SDK extends committed windows across borrowed stack sources
-        // (Raging Loop, StandardAllocator). Recommit preserves every live byte;
-        // only decommit can invalidate backing required for eventual copyback.
-        if (num == 0x2D && map_source_busy(a, size)) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0; }
-        uint64_t off = a - (uintptr_t)g_alias;
-        int64_t need = alias_unmapped(off, size) * 4096;
-        // Profile mem_map_limit: a map that would take the process past the application pool fails with ResultLimitReached, as on Horizon (the pool less the used memory GetInfo reports).
-        // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped
-        // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
-        // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
-        // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
-        if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
-            int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
-            if (need && need > room) {
-                pthread_mutex_unlock(&g_map_lock);
-                static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
-                                                                       size, atomic_load(&g_alias_mapped) / 1073741824.0);
-                regs[0] = 0x10801; return 0;
-            }
-        }
-        // Host pages are 16 KB, Horizon pages 4 KB: a map is rounded out to host pages (the extra neighboring 4K pages are inside the alias region and merely become writable early, harmless);
-        // An edge host page is reclaimed only when no live logical neighbor remains.
-        uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
-        uintptr_t mlo = lo & ~(pg - 1), mhi = (hi + pg - 1) & ~(pg - 1);
-        int commit = num == 0x2C;
-        int64_t changed = commit ? need : (int64_t)size - need;
-        if (!commit) {
-            if ((lo - mlo) / 4096 != (uint64_t)alias_unmapped(mlo - (uintptr_t)g_alias, lo - mlo)) mlo += pg;
-            if ((mhi - hi) / 4096 != (uint64_t)alias_unmapped(hi - (uintptr_t)g_alias, mhi - hi)) mhi -= pg;
-        }
-        if (changed && mhi > mlo) {
-            if (mprotect((void *)mlo, mhi - mlo, commit ? PROT_READ | PROT_WRITE : PROT_NONE))
-                die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
-            if (commit) dm_guest_write_prepare((void *)mlo, mhi - mlo);
-            else (void)madvise((void *)mlo, mhi - mlo, MADV_FREE);
-        }
-        if (commit && changed) alias_initialize(off, size);
-        if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", commit ? "Map" : "Unmap", (void *)a, size);
-        // how deep the alias region is used (one line per 256 MB crossed): for sizing the reservation and alias region (iOS caps a single reservation at 6 GB)
-        if (num == 0x2C) { static _Atomic uint64_t hw; uint64_t end = off + size, old = atomic_load(&hw);
-            while (end > old && !atomic_compare_exchange_weak(&hw, &old, end)) {}
-            if (end > old && end >> 28 != old >> 28) LOG("[mem] alias region mapped up to +%.2f GB (alias region %.2f GB)", end / 1073741824.0, g_alias_cap / 1073741824.0); }
-        // Total actually mapped in the alias region (one line per 256 MB crossed, up or down): how much physical memory the game uses and whether it keeps growing. Counted with a page bitmap, only pages whose state really changed --
-        // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
-        { int64_t d = alias_pages(off, size, commit) * 4096, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
-          pthread_mutex_unlock(&g_map_lock);
-          if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
-        regs[0] = 0; return 0;
-    }
+    case 0x2C: case 0x2D:
+        regs[0] = dm_vamm_svc_change_pages((uintptr_t)regs[0], regs[1], num == 0x2C);
+        return 0;
     case 0x26: {  // Break(reason, ptr, size): SDK fatal abort
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
         module_t *mm = module_of((void *)regs[30]);
