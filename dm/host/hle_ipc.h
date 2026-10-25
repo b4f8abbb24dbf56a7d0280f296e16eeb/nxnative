@@ -1,5 +1,5 @@
-// Bounded host-service CMIF compatibility. Protocol reference (no copied code):
-// switchbrew/libnx nx/include/switch/sf/{hipc,cmif}.h and services/{sm,csrng}.c.
+// Bounded host-service CMIF/TIPC compatibility. Protocol reference (no copied code):
+// switchbrew/libnx nx/include/switch/sf/{hipc,cmif,tipc}.h and services/{sm,csrng}.c.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -48,8 +48,10 @@ uint32_t dm_ipc_close(dm_ipc *ipc, uint32_t handle);
 uint32_t dm_ipc_clone(dm_ipc *ipc, uint32_t handle, uint32_t *out);
 uint32_t dm_ipc_convert_domain(dm_ipc *ipc, uint32_t handle, uint32_t *out);
 uint32_t dm_ipc_pointer_size(dm_ipc *ipc, uint32_t handle, uint16_t *out);
-// Return is transport Result; service failures are encoded in a valid SFCO reply.
-// Invalid packets/transport failures leave the message and all output untouched.
+// Return is transport Result; service failures use CMIF SFCO or a TIPC Result
+// reply. Invalid packets leave message, output and session state untouched.
+// A valid TIPC SM close returns SESSION_CLOSED without writing a reply, while
+// marking the endpoint closed; its handle must still be closed by the caller.
 uint32_t dm_ipc_dispatch(dm_ipc *ipc, uint32_t handle, void *message,
                          size_t capacity, const dm_ipc_memory *memory);
 

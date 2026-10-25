@@ -167,3 +167,40 @@ $(B)/t_ipc_probe: t_ipc_probe.c $(IPC_CORE) | $(B)
 	$(IPC_CC) $(IPC_FLAGS) -I.. -o $@ t_ipc_probe.c ../hle_ipc.c
 $(B)/t_ipc_probe_asan: t_ipc_probe.c $(IPC_CORE) | $(B)
 	$(IPC_CC) $(IPC_FLAGS) -fsanitize=address,undefined -I.. -o $@ t_ipc_probe.c ../hle_ipc.c
+
+# TIPC SM uses the same owner and CMIF service sessions; no original SDK input.
+$(B)/t_ipc_tipc: t_ipc_tipc.c $(IPC_CORE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -I.. -o $@ t_ipc_tipc.c ../hle_ipc.c
+$(B)/t_ipc_tipc_asan: t_ipc_tipc.c $(IPC_CORE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -fsanitize=address,undefined -I.. -o $@ t_ipc_tipc.c ../hle_ipc.c
+.PHONY: ipc-tipc ipc-tipc-asan
+ipc-tipc: $(B)/t_ipc_tipc
+ipc-tipc-asan: $(B)/t_ipc_tipc_asan
+ipc: ipc-tipc
+ipc-asan: ipc-tipc-asan
+
+# Separately authored wire/mutation checks, including production SVC routing.
+TIPC_A = tipc_adversarial_fixture.h $(IPC_CORE)
+TIPC_NATIVE_A = t_ipc_tipc_native_adversarial.c $(TIPC_A) $(IPC_NATIVE)
+$(B)/t_ipc_tipc_adversarial: t_ipc_tipc_adversarial.c $(TIPC_A) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -I.. -o $@ t_ipc_tipc_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_tipc_adversarial_asan: t_ipc_tipc_adversarial.c $(TIPC_A) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -fsanitize=address,undefined -I.. -o $@ t_ipc_tipc_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_tipc_native_adversarial: $(TIPC_NATIVE_A) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -Imemory_profile -I.. -o $@ t_ipc_tipc_native_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_tipc_native_adversarial_16k: $(TIPC_NATIVE_A) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -DTEST_PAGE_16K -Imemory_profile -I.. -o $@ t_ipc_tipc_native_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_tipc_native_adversarial_asan: $(TIPC_NATIVE_A) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -fsanitize=address,undefined -Imemory_profile -I.. -o $@ t_ipc_tipc_native_adversarial.c ../hle_ipc.c
+$(B)/t_ipc_tipc_native_adversarial_16k_asan: $(TIPC_NATIVE_A) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Wno-unused-function -Wno-format -fsanitize=address,undefined -DTEST_PAGE_16K -Imemory_profile -I.. -o $@ t_ipc_tipc_native_adversarial.c ../hle_ipc.c
+ipc-tipc: $(B)/t_ipc_tipc_adversarial $(B)/t_ipc_tipc_native_adversarial $(B)/t_ipc_tipc_native_adversarial_16k
+	$(B)/t_ipc_tipc
+	$(B)/t_ipc_tipc_adversarial
+	$(B)/t_ipc_tipc_native_adversarial
+	$(B)/t_ipc_tipc_native_adversarial_16k
+ipc-tipc-asan: $(B)/t_ipc_tipc_adversarial_asan $(B)/t_ipc_tipc_native_adversarial_asan $(B)/t_ipc_tipc_native_adversarial_16k_asan
+	$(B)/t_ipc_tipc_asan
+	$(B)/t_ipc_tipc_adversarial_asan
+	$(B)/t_ipc_tipc_native_adversarial_asan
+	$(B)/t_ipc_tipc_native_adversarial_16k_asan

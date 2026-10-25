@@ -81,6 +81,43 @@ static void random_request(uint32_t handle, uint8_t *tlr, void *out, size_t n, u
     if (expected) { assert(!memcmp(old, tlr, sizeof old)); assert(calls == entropy_calls && prep == prepared); }
     else assert(!ipc_test_decode(tlr, DM_IPC_TLS_CAPACITY).result);
 }
+static void tipc_native_paths(uint8_t *tlr) {
+    strcpy((char *)g_heap, "sm:");
+    uint64_t regs[31] = {0, (uintptr_t)g_heap}; svc(0x1f, regs);
+    assert(!regs[0]); uint32_t sm = (uint32_t)regs[1];
+    ipc_test_packet q = ipc_test_tipc(0, 1, NULL, 0);
+    memcpy(tlr, q.bytes, sizeof q.bytes);
+    assert(!svc3(0x21, sm, 0, 0));
+    assert(!ipc_test_tipc_decode(tlr, DM_IPC_TLS_CAPACITY, 0).result);
+    q = ipc_test_tipc(1, 0, "csrng\0\0", 8);
+    memcpy(g_heap + 0x4000, q.bytes, sizeof q.bytes);
+    assert(!svc3(0x22, (uintptr_t)g_heap + 0x4000, 4096, sm));
+    ipc_test_reply r = ipc_test_tipc_decode(g_heap + 0x4000, 4096, 1);
+    assert(!r.result && r.move_handle); uint32_t rng = r.move_handle;
+    random_request(rng, tlr, g_heap + 0x1001, 17, 0);
+    // Adapter sends and native SVCs see the same registration state. Detach
+    // must not revoke the CMIF service handle obtained through TIPC.
+    q = ipc_test_tipc(4, 1, NULL, 0); memcpy(tlr, q.bytes, sizeof q.bytes);
+    assert(!h_sf_Send(sm, (uint32_t *)tlr, DM_IPC_TLS_CAPACITY));
+    assert(!ipc_test_tipc_decode(tlr, DM_IPC_TLS_CAPACITY, 4).result);
+    assert(native_request(sm, tlr, ipc_test_service("csrng\0\0")).result == DM_IPC_INVALID_CLIENT);
+    random_request(rng, tlr, g_heap + 0x1001, 17, 0);
+    assert(!native_request(sm, tlr, ipc_test_register()).result);
+    q = ipc_test_tipc(1, 0, "csrng\0\0", 8); memcpy(tlr, q.bytes, sizeof q.bytes);
+    assert(!svc3(0x21, sm, 0, 0));
+    r = ipc_test_tipc_decode(tlr, DM_IPC_TLS_CAPACITY, 1);
+    assert(!r.result && r.move_handle); assert(!svc3(0x16, r.move_handle, 0, 0));
+    q = ipc_test_tipc_close(); memcpy(g_heap + 0x4000, q.bytes, sizeof q.bytes);
+    unsigned old_prepared = prepared, old_fills = entropy_calls;
+    assert(svc3(0x22, (uintptr_t)g_heap + 0x4000, 4096, sm) == DM_IPC_SESSION_CLOSED);
+    assert(!memcmp(g_heap + 0x4000, q.bytes, sizeof q.bytes));
+    assert(prepared == old_prepared && entropy_calls == old_fills);
+    assert(svc3(0x21, sm, 0, 0) == DM_IPC_SESSION_CLOSED);
+    assert(!svc3(0x16, sm, 0, 0));
+    assert(svc3(0x16, sm, 0, 0) == DM_IPC_INVALID_HANDLE);
+    random_request(rng, tlr, g_heap + 0x1001, 17, 0);
+    assert(!svc3(0x16, rng, 0, 0));
+}
 int main(void) {
     assert(!pthread_key_create(&g_keytlr, NULL));
     uint8_t *tlr = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -205,8 +242,10 @@ int main(void) {
     assert(svc3(0x21, duplicate, 0, 0) == DM_IPC_SESSION_CLOSED);
     assert(!svc3(0x16, duplicate, 0, 0));
     assert(!svc3(0x16, adapter_rng, 0, 0)); assert(!svc3(0x16, sm, 0, 0));
+    tipc_native_paths(tlr);
     assert(!pthread_setspecific(g_keytlr, NULL)); pthread_key_delete(g_keytlr);
     dm_ipc_destroy(g_ipc); free(g_alias_bits); free(g_alias_exposed);
     assert(!munmap(g_as, RESERVE) && !munmap(tlr, 0x4000) && !munmap(outside, 0x4000));
     puts("IPC synthetic native dispatch/adapters and memory-domain checks passed");
+    return 0;
 }

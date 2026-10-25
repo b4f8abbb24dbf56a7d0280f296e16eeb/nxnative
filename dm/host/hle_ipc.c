@@ -1,5 +1,5 @@
-// Original implementation of a deliberately small HIPC/CMIF service boundary.
-// Semantic references: libnx sf/{hipc,cmif}.h, services/{sm,csrng}.c;
+// Original implementation of a deliberately small HIPC/CMIF/TIPC service boundary.
+// Semantic references: libnx sf/{hipc,cmif,tipc}.h, services/{sm,csrng}.c;
 // Atmosphere stratosphere/sm/source/sm_user_service.cpp (no code copied).
 #include "hle_ipc.h"
 #include <pthread.h>
@@ -167,7 +167,7 @@ uint32_t dm_ipc_pointer_size(dm_ipc *ipc, uint32_t handle, uint16_t *out) {
 }
 
 typedef struct {
-    unsigned type, nx, na, nb, nw, pid, special, domain, domain_close;
+    unsigned type, nx, na, nb, nw, pid, special, domain, domain_close, tipc;
     uint32_t version, command, token;
     size_t raw, raw_size, arguments, argument_capacity;
     uint64_t output_address, output_size;
@@ -202,8 +202,16 @@ static uint32_t parse(const uint8_t *m, size_t capacity, unsigned domain, reques
     }
     p += descriptors; r->raw = p;
     if (!fits(p, r->raw_size, capacity)) return DM_IPC_INVALID_SIZE;
-    if (r->type == 2) {
-        return h0 == 2 && h1 == 0 ? 0 : DM_IPC_NOT_SUPPORTED;
+    r->tipc = r->type >= 15;
+    if (r->type == 2 || r->type == 15) {
+        return h0 == r->type && h1 == 0 ? 0 : DM_IPC_NOT_SUPPORTED;
+    }
+    if (r->tipc) {
+        // TIPC puts the command in the HIPC tag and arguments immediately in
+        // raw data: no CMIF header or sixteen-byte alignment padding.
+        r->command = r->type - 16;
+        r->arguments = p; r->argument_capacity = r->raw_size;
+        return 0;
     }
     if (r->type != 4 && r->type != 5 && r->type != 6 && r->type != 7) return DM_IPC_NOT_SUPPORTED;
     size_t cm = (p + 15u) & ~(size_t)15;
@@ -236,11 +244,19 @@ static uint32_t parse(const uint8_t *m, size_t capacity, unsigned domain, reques
 }
 
 static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t capacity, const dm_ipc_memory *memory) {
-    request r;
+    request r = {0};
     uint32_t result = parse(m, capacity, s->domain, &r);
     if (result) return result;
+    // Only SM's bounded TIPC client surface is implemented. In particular a
+    // TIPC tag must not reach olsc's synthetic CMIF success policy or CSRNG.
+    if (r.tipc && s->service != SERVICE_SM) return DM_IPC_NOT_SUPPORTED;
     if (ipc->probe_active && s->service == SERVICE_SM) ++ipc->probe.sm_requests;
-    if (r.type == 2) { s->closed = 1; return 0; } // endpoint close, handle still owned
+    if (r.type == 2 || r.type == 15) {
+        s->closed = 1; // endpoint close, handle still owned until CloseHandle
+        // TIPC closes the peer without replying. Preserve the existing CMIF
+        // type-2 convention, but report the new TIPC peer close to the caller.
+        return r.tipc ? DM_IPC_SESSION_CLOSED : 0;
+    }
     if (r.domain_close) {
         // Existing olsc adapter regards closing its single synthetic object as a
         // no-op; preserve that behavior, without accepting another object ID.
@@ -263,16 +279,22 @@ static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t 
         } else service_result = DM_IPC_NOT_SUPPORTED;
     } else if (s->service == SERVICE_SM) {
         if (descriptor_count) return DM_IPC_NOT_SUPPORTED;
-        if (r.command == 0) {
-            if (!r.pid || r.argument_capacity < 8) return DM_IPC_INVALID_SIZE;
-            initialize = 1; // PID is supplied by this single-process host, never trusted from the packet
+        if (r.command == 0 || r.command == 4) {
+            if (!r.pid || (r.tipc ? r.argument_capacity != 0 : r.argument_capacity < 8)) return DM_IPC_INVALID_SIZE;
+            // PID is supplied by this single-process host, never trusted from
+            // the packet. Detach only clears registration on this SM session;
+            // already issued service sessions remain owned and usable.
+            initialize = r.command == 0 ? 1 : 2;
         } else if (r.command == 1) {
             if (r.special) return DM_IPC_NOT_SUPPORTED;
-            if (r.argument_capacity < 8) return DM_IPC_INVALID_SIZE;
+            if (r.tipc ? r.argument_capacity != 8 : r.argument_capacity < 8) return DM_IPC_INVALID_SIZE;
             if (!s->initialized) service_result = DM_IPC_INVALID_CLIENT;
             else if (!service_name_valid(m + r.arguments)) service_result = DM_IPC_INVALID_SERVICE_NAME;
             else if (!(create_service = service_id(m + r.arguments))) service_result = DM_IPC_NOT_REGISTERED;
-        } else service_result = DM_IPC_UNKNOWN_COMMAND;
+        } else {
+            if (r.tipc) return DM_IPC_NOT_SUPPORTED;
+            service_result = DM_IPC_UNKNOWN_COMMAND;
+        }
     } else if (s->service == SERVICE_CSRNG) {
         if (r.command) service_result = DM_IPC_UNKNOWN_COMMAND;
         else {
@@ -295,17 +317,27 @@ static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t 
 
     uint8_t reply[64] = {0};
     size_t cm = 16 + (r.domain ? 16 : 0);
-    size_t end = (cm + 16 + value_size + 3) & ~(size_t)3;
+    size_t end = r.tipc ? (r.command == 1 ? 20 : 12) : (cm + 16 + value_size + 3) & ~(size_t)3;
     if (capacity < end) return DM_IPC_INVALID_SIZE;
     // No session allocation or visible state change occurs until parsing and
     // response capacity are known valid. Allocation failure is a service error.
     if (!service_result && (create_service || clone))
         service_result = create_session(ipc, clone ? s->service : create_service, clone ? s : NULL, &moved);
-    write32(reply + 4, (uint32_t)((end - (moved ? 16 : 8) + 3) / 4) | (moved ? UINT32_C(0x80000000) : 0));
-    if (moved) { write32(reply + 8, 1u << 5); write32(reply + 12, moved); }
-    write32(reply + cm, UINT32_C(0x4f434653)); write32(reply + cm + 4, r.version);
-    write32(reply + cm + 8, service_result); write32(reply + cm + 12, r.token);
-    if (value_size && !service_result) write32(reply + cm + 16, value);
+    // TIPC GetServiceHandle has a static output signature even on failure:
+    // publish its moved-handle slot as InvalidHandle (zero), never allocate a
+    // live handle for an error. The capacity check above covers that slot.
+    unsigned move_slot = moved || (r.tipc && r.command == 1);
+    if (r.tipc) {
+        write32(reply, r.type);
+        write32(reply + 4, 1u | (move_slot ? UINT32_C(0x80000000) : 0));
+        write32(reply + (move_slot ? 16 : 8), service_result);
+    } else {
+        write32(reply + 4, (uint32_t)((end - (moved ? 16 : 8) + 3) / 4) | (moved ? UINT32_C(0x80000000) : 0));
+        write32(reply + cm, UINT32_C(0x4f434653)); write32(reply + cm + 4, r.version);
+        write32(reply + cm + 8, service_result); write32(reply + cm + 12, r.token);
+        if (value_size && !service_result) write32(reply + cm + 16, value);
+    }
+    if (move_slot) { write32(reply + 8, 1u << 5); write32(reply + 12, moved); }
     size_t publish = s->service == SERVICE_OLSC && !control ? (capacity < 0x1000 ? capacity : 0x1000) : end;
     if (publish > end) write32(reply + 4, (uint32_t)((publish - 8) / 4));
     if (memory && memory->prepare_message) memory->prepare_message(memory->context, m, publish);
@@ -314,7 +346,7 @@ static uint32_t dispatch_locked(dm_ipc *ipc, ipc_session *s, uint8_t *m, size_t 
         if (ipc->probe_active) ipc->probe.filled_bytes += r.output_size;
     }
     if (ipc->probe_active && service_result) ++ipc->probe.service_errors;
-    if (initialize && !service_result) s->initialized = 1;
+    if (initialize && !service_result) s->initialized = initialize == 1;
     if (convert && !service_result) s->domain = 1;
     memset(m, 0, publish); memcpy(m, reply, end);
     return 0;

@@ -1,7 +1,8 @@
-/* Independent, synthetic HIPC/CMIF wire producer for the IPC tests.
+/* Independent, synthetic HIPC/CMIF/TIPC wire producer for the IPC tests.
  * Protocol references (not copied implementation code):
  * https://github.com/switchbrew/libnx/blob/master/nx/include/switch/sf/hipc.h
  * https://github.com/switchbrew/libnx/blob/master/nx/include/switch/sf/cmif.h
+ * https://github.com/switchbrew/libnx/blob/b156b4774fb2df7b93402169509266da7547fc4c/nx/include/switch/sf/tipc.h
  * All addresses are supplied by the fixture; no guest binary is involved. */
 #ifndef DM_TEST_IPC_WIRE_FIXTURE_H
 #define DM_TEST_IPC_WIRE_FIXTURE_H
@@ -93,10 +94,52 @@ static inline ipc_test_packet ipc_test_close(void) {
     return q;
 }
 
+/* TIPC has no magic or alignment padding. These packets deliberately have
+ * nonzero slack, making accidental CMIF parsing/overpublication observable. */
+static inline ipc_test_packet ipc_test_tipc(unsigned command, int pid,
+                                          const void *payload, size_t size) {
+    ipc_test_packet q;
+    memset(&q, 0xa5, sizeof q);
+    assert(command <= 0xffef && size <= 128 && size % 4 == 0);
+    q.raw = pid ? 20 : 8; q.cmif = 0; q.extent = q.raw + size;
+    ipc_test_put32(q.bytes, command + 16);
+    ipc_test_put32(q.bytes + 4, (uint32_t)(size / 4) | (pid ? UINT32_C(0x80000000) : 0));
+    if (pid) {
+        ipc_test_put32(q.bytes + 8, 1);
+        ipc_test_put64(q.bytes + 12, UINT64_C(0xfefdfcfbfaf9f8f7));
+    }
+    if (size) memcpy(q.bytes + q.raw, payload, size);
+    return q;
+}
+static inline ipc_test_packet ipc_test_tipc_close(void) {
+    ipc_test_packet q = ipc_test_close();
+    ipc_test_put32(q.bytes, 15);
+    return q;
+}
+
 typedef struct {
     uint32_t result, version, token, move_handle;
     size_t payload, raw_end;
 } ipc_test_reply;
+
+static inline ipc_test_reply ipc_test_tipc_decode(const void *buffer, size_t size,
+                                                 unsigned command) {
+    const unsigned char *b = buffer;
+    ipc_test_reply r = {0};
+    assert(size >= 12 && ipc_test_get32(b) == command + 16);
+    uint32_t header = ipc_test_get32(b + 4);
+    assert(header == (command == 1 ? UINT32_C(0x80000001) : 1));
+    size_t raw = 8;
+    if (header >> 31) {
+        assert(size >= 20 && ipc_test_get32(b + 8) == 32);
+        r.move_handle = ipc_test_get32(b + 12);
+        raw = 16;
+    }
+    r.result = ipc_test_get32(b + raw);
+    if (command == 1) assert(r.result ? r.move_handle == 0 : r.move_handle != 0);
+    r.payload = r.raw_end = raw + 4;
+    return r;
+}
 
 /* Deliberately independent response decoder: checks only the supported reply
  * shapes and exposes exact raw bounds so tests cannot read zero-filled slack. */
