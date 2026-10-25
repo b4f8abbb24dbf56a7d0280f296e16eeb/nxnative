@@ -23,6 +23,35 @@ SDK calls and system services the host answers (`dm/host/hle_*.c`). Each entry: 
 - **Found on:** source-level follow-up to the existing [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) and [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) entropy workaround, and [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) HIPC adapter. The new transport has synthetic coverage, not a new game-run claim.
 - **Protocol references:** independent code written from the [libnx SM client](https://github.com/switchbrew/libnx/blob/master/nx/source/services/sm.c), [CSRNG client](https://github.com/switchbrew/libnx/blob/master/nx/source/services/csrng.c), [HIPC layout](https://github.com/switchbrew/libnx/blob/master/nx/include/switch/sf/hipc.h), [CMIF controls](https://github.com/switchbrew/libnx/blob/master/nx/include/switch/sf/cmif.h) and [SVC declarations](https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h). [Atmosphere SM](https://github.com/Atmosphere-NX/Atmosphere/blob/master/stratosphere/sm/source/sm_user_service.cpp) and [IPC SVC validation](https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/svc/kern_svc_ipc.cpp) were semantic cross-checks only; no GPL implementation or literal reply arrays were copied.
 
+### Opt-in original CSRNG client smoke
+
+- **Symptom:** synthetic IPC tests pass, but they do not show that an original SDK constructs a request and accepts the response from the shared backend.
+- **Cause:** the crypto and HIPC compatibility hooks remain installed. Disabling only crypto would still leave the HIPC adapters in the path, so a successful call must not be described as native SM/raw-SVC closure.
+- **Fix:** the Mac-only `DM_CSRNG_SMOKE=1` diagnostic calls the original SDK crypto export directly with `module_sym`, without changing any loader force policy. Admission requires exactly the reviewed static `main` / `sdk` pair in that order: main `7222e13ecf6adb3249b5dd5c57fa40b102245fce000000000000000000000000`, SDK `df7a3960c74c3a4803f826c5871532523aa9cf2a000000000000000000000000` (19.3.11). All 32 build-ID bytes are checked; missing full metadata, a matching display prefix with a different tail, or a nonterminated value is rejected. The normal 2.0.2 profile's different main build is not silently admitted. Preflight precedes guest initialization; the probe runs after `nninitInitializeSdkModule`, then returns before game `nninitStartup`, global constructors and `nnMain`. This avoids the game's allocator/probe and gameplay, but still needs the existing loader and SDK initialization. Instruction/SDK patches stay intact.
+- **Checks:** four finite calls (0, 1, 17 and 4097 bytes) use deliberately unaligned stack storage with canaries. A scoped backend observer checks type 6, CMIF version 1, one normal B descriptor, eight raw words, a 0x100-byte message and the exact expected output span before entropy writes; an empty descriptor may use null. It checks successful fills totaling 4115 bytes, one initial CSRNG connection reused by later calls, unchanged guards, no errors, and distinct adapter/native/forced-crypto route counts. No output bytes or pointer values are logged. A cached SDK service handle remains live at process exit by design; this is not a close/lifetime test.
+- **Limits:** a passing Mac run proves only **original crypto/client request generation through the shared backend with HIPC adapters retained**. It does not prove native SM registration, raw SVC closure, other SDKs, gameplay, cryptographic strength of deterministic mode, or permission to remove hooks/rewriter patches. The repository's driver, observer and production-dispatch fixtures use synthetic callbacks and packets, never private SDK code. Their success is not an original-SDK execution result.
+- **Found on:** source-level follow-up to [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md)'s entropy workaround. Original-SDK Mac execution remains a separate user-run check.
+
+Unset the mode for normal behavior; any value other than `1` is rejected. For a smoke run, `DM_WINDOW`, `DM_PRELOAD`, `DM_OODLE_SERVE`, `DM_OODLE_JOB`, `DM_GUEST_SPAWN_TEST`, `DM_TEST_KEYRACE`, `DM_PROBE` and `DM_SAVE` must be unset. In particular, `DM_WINDOW=0` still requests a window, and an unexpected save mount must fail instead of touching a real save. Use the reviewed original pair, not an inferred profile match. Rewrite it into a **new smoke-only directory** with this follow-up's normal rewriter to emit `BUILD_ID_FULL`; old short-only metadata remains usable in normal mode but is rejected by the smoke. Do not hand-edit identity rows or overwrite the GPU trial's prepared modules:
+
+```sh
+mkdir -p "$SMOKE_OUT" "$PREPARED_MODULE_DIR"
+python3 dm/tools/patch_nso.py "$ORIGINAL_MAIN_NSO" "$PREPARED_MODULE_DIR" main
+python3 dm/tools/patch_nso.py "$ORIGINAL_SDK_NSO" "$PREPARED_MODULE_DIR" sdk
+make -C dm/host GAME=0100F43008C44000
+env -u DM_WINDOW -u DM_PRELOAD -u DM_OODLE_SERVE -u DM_OODLE_JOB \
+    -u DM_GUEST_SPAWN_TEST -u DM_TEST_KEYRACE -u DM_PROBE -u DM_SAVE \
+    -u DM_FORCE_STRICT DM_CSRNG_SMOKE=1 DM_IMPORTS=1 DM_SVC=1 \
+    DM_HLECOUNT="$SMOKE_OUT/hle.tsv" \
+    python3 -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], timeout=60).returncode)' \
+    dm/host/dmhost "$PREPARED_MODULE_DIR" main sdk \
+    >"$SMOKE_OUT/csrng-smoke.log" 2>&1
+```
+
+The external 60-second watchdog bounds a stuck SDK call; a timeout or missing final PASS is failure, not native-service evidence. Return the log, HLE-count TSV, host revision and exit status; do not upload SDK contents. Each call's six route counts are ordered: forced crypto, adapter Connect, adapter Send, native port, native TLS send, native explicit-buffer send. Expected first-call routes are `0,1,1,0,0,0`; later calls are `0,0,1,0,0,0`. `sm=0` is expected here and explicitly means native SM was **not** exercised.
+
+Portable checks: `make -C dm/host/tests csrng-smoke ipc` and `make -C dm/host/tests csrng-smoke-asan ipc-asan` (use `ASAN_OPTIONS=detect_leaks=0` only on ptrace runners). Full Apple compilation and the user-owned original-SDK run are separate from these synthetic checks. The metadata refresh and host rebuild are required; no shader-chain files change and no shader regeneration is needed. Conflict checks precede the front end and guest initialization, but follow host module preloading; invalid diagnostic settings may already have caused host-side preload activity before rejection.
+
 ### SDK 3.6.0 answered as SDK 4
 
 - The oldest SDK so far booted to its frame loop with the provisional profile as generated and no host change: the services, the NVN API version (53, as for every SDK up to 10), the audio output and the heap all answered as for SDK 4.

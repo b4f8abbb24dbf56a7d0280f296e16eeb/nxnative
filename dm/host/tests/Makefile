@@ -145,3 +145,25 @@ ipc-asan: $(B)/t_ipc_adversarial_asan $(B)/t_ipc_native_asan $(B)/t_ipc_native_1
 	$(B)/t_ipc_native_asan
 	$(B)/t_ipc_native_16k_asan
 run: ipc
+
+# Default-off original-CSRNG smoke driver, using only synthetic callbacks.
+CSRNG_SMOKE = t_csrng_smoke.c ../hle_csrng_smoke.c ../hle_csrng_smoke.h $(IPC_CORE) ../dm.h memory_profile/game_profile.h
+$(B)/t_csrng_smoke: $(CSRNG_SMOKE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -Imemory_profile -I.. -o $@ t_csrng_smoke.c ../hle_ipc.c
+$(B)/t_csrng_smoke_asan: $(CSRNG_SMOKE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -fsanitize=address,undefined -Imemory_profile -I.. -o $@ t_csrng_smoke.c ../hle_ipc.c
+.PHONY: csrng-smoke csrng-smoke-asan
+csrng-smoke: $(B)/t_csrng_smoke $(B)/t_ipc_probe
+	$(B)/t_ipc_probe
+	$(B)/t_csrng_smoke
+	$(PYTHON) test_csrng_smoke_wiring.py
+	$(PYTHON) ../../tools/tests/test_full_build_identity.py
+csrng-smoke-asan: $(B)/t_csrng_smoke_asan $(B)/t_ipc_probe_asan
+	$(B)/t_ipc_probe_asan
+	$(B)/t_csrng_smoke_asan
+run: csrng-smoke
+
+$(B)/t_ipc_probe: t_ipc_probe.c $(IPC_CORE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -I.. -o $@ t_ipc_probe.c ../hle_ipc.c
+$(B)/t_ipc_probe_asan: t_ipc_probe.c $(IPC_CORE) | $(B)
+	$(IPC_CC) $(IPC_FLAGS) -fsanitize=address,undefined -I.. -o $@ t_ipc_probe.c ../hle_ipc.c

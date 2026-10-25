@@ -78,6 +78,7 @@ def load_patches():
     return tables, where
 PATCHES, PATCH_WHERE = load_patches()
 BUILD_ID = d[0x40:0x50].hex()
+BUILD_ID_FULL = d[0x40:0x60].hex()   # complete identity; retain short IDs for existing patch/profile keys
 cuts = list(PATCHES['CUTS'].get(BUILD_ID, []))
 for off, ob, nb, why in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
@@ -1211,6 +1212,7 @@ with open(P('fixups.tsv'), 'w') as f:
     if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps there
     if RENDER_SCALE: f.write('# RENDER_SCALE\t1\n')   # a render-scale stub reads state +0x10 (the loader ignores the key; dm/games/settings.py offers the setting by it)
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')   # the host identifies the build by it: features with hard-coded addresses only run on the build they belong to
+    f.write(f'# BUILD_ID_FULL\t{BUILD_ID_FULL}\n')   # exact diagnostic identity; never a prefix match
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
 with open(P('sites.tsv'), 'w') as f:

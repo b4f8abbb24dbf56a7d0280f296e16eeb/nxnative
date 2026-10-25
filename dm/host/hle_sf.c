@@ -12,6 +12,7 @@ HLE_FORCE("_ZN2nn2sf4hipc31InitializeHipcServiceResolutionEv", "service resoluti
 HLE_FORCE("_ZN2nn2sf4hipc29FinalizeHipcServiceResolutionEv", "service resolution compatibility adapter", void, h_sf_FinRes, void) {}
 HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect through the shared host IPC session owner", Result, h_sf_Connect,
           uint32_t *out, const char *name) {
+    dm_ipc_host_csrng_probe_route(DM_IPC_PROBE_ADAPTER_CONNECT);
     if (!out || !name) return DM_IPC_INVALID_MEMORY;
     uint8_t service[8] = {0};
     for (unsigned i = 0; i < sizeof service && name[i]; ++i) service[i] = (uint8_t)name[i];
@@ -36,6 +37,7 @@ HLE_FORCE("_ZN2nn2sf4hipc6client18DuplicateSessionExEPNS_3svc6HandleES4_j", "dup
           uint32_t *out, uint32_t h, unsigned tag) { (void)tag; return h_sf_Dup(out, h); }
 HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "dispatch through the checked shared host IPC backend", Result, h_sf_Send,
           uint32_t h, uint32_t *m, uint64_t size) {
+    dm_ipc_host_csrng_probe_route(DM_IPC_PROBE_ADAPTER_SEND);
     if (size > SIZE_MAX) return DM_IPC_INVALID_SIZE;
     uint32_t result = dm_ipc_host_send(h, m, (size_t)size);
     static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));

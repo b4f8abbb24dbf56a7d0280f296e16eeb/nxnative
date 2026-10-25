@@ -33,6 +33,7 @@ typedef struct {
     int64_t patch_off;         // patch area relative to the base; negative = before the base (image too large, see patch_nso.py FAR), and size does not include it
     uint64_t image_size, file_image_len, patch_len;   // only with the patch area before the base: whole image (with bss and key page), length of the image part of the file, patch area length
     char build_id[33];         // First 16 bytes of the NSO build ID (hex); empty for older build outputs
+    char full_build_id[65];    // All 32 NSO build-ID bytes (hex); empty unless BUILD_ID_FULL metadata is present
     unsigned key_idx[4];       // key page index of each thread slot (K18, KTLS, KTLR, KGATE)
     const Elf64_Dyn *dyn;
     const Elf64_Sym *symtab;

@@ -112,6 +112,26 @@ int main(void) {
     assert(!h_sf_Send(rng, (uint32_t *)(g_heap + 0x4001), 256));
     uint32_t adapter_rng = 0; assert(!h_sf_Connect(&adapter_rng, "csrng"));
     random_request(adapter_rng, tlr, g_heap + 0x1001, 7, 0);
+    // The opt-in observer is shared with real host routes. Its shape/range
+    // restriction cannot write entropy or a reply on a mismatched diagnostic.
+    dm_ipc_csrng_probe probe;
+    assert(!dm_ipc_csrng_probe_begin(dm_ipc_host(), (uintptr_t)g_heap + 0x1001, 17));
+    q = ipc_test_request(6, 0, 0, (uintptr_t)g_heap + 0x1001, 17, 1, NULL, 0);
+    assert(!native_request(adapter_rng, tlr, q).result);
+    assert(!dm_ipc_csrng_probe_end(dm_ipc_host(), &probe));
+    assert(probe.requests == 1 && probe.filled_bytes == 17 && !probe.mismatches && !probe.transport_errors);
+    assert(probe.route[DM_IPC_PROBE_NATIVE_SEND] == 1 && !probe.route[DM_IPC_PROBE_ADAPTER_SEND]);
+    assert(!dm_ipc_csrng_probe_begin(dm_ipc_host(), (uintptr_t)g_heap + 0x1001, 17));
+    memcpy(tlr, q.bytes, sizeof q.bytes); assert(!h_sf_Send(adapter_rng, (uint32_t *)tlr, 256));
+    assert(!dm_ipc_csrng_probe_end(dm_ipc_host(), &probe));
+    assert(probe.requests == 1 && probe.filled_bytes == 17 && probe.route[DM_IPC_PROBE_ADAPTER_SEND] == 1);
+    assert(!probe.route[DM_IPC_PROBE_NATIVE_SEND]);
+    assert(!dm_ipc_csrng_probe_begin(dm_ipc_host(), (uintptr_t)g_heap + 0x1002, 17));
+    memcpy(tlr, q.bytes, sizeof q.bytes); unsigned fills_before = entropy_calls, prepares_before = prepared;
+    assert(h_sf_Send(adapter_rng, (uint32_t *)tlr, 256) == DM_IPC_NOT_SUPPORTED);
+    assert(!memcmp(tlr, q.bytes, sizeof q.bytes) && entropy_calls == fills_before && prepared == prepares_before);
+    assert(!dm_ipc_csrng_probe_end(dm_ipc_host(), &probe));
+    assert(probe.mismatches == 1 && probe.transport_errors == 1 && !probe.filled_bytes);
     uint16_t pointer_size = 99; assert(!h_sf_PtrBuf(&pointer_size, rng) && !pointer_size);
     uint32_t duplicate = 0; assert(!h_sf_Dup(&duplicate, rng));
     h_sf_Close(rng); random_request(duplicate, tlr, g_heap + 0x1001, 1, 0);
