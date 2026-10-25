@@ -1,6 +1,6 @@
 # SDK memory compatibility: mechanism versus activation
 
-Scope: **38 node-area cuts + six alignment cuts in 19 SDK builds** in
+Scope: **40 node-area cuts + 6 alignment cuts in 20 SDK builds (46 entries)** in
 [sdk_patches.py](../dm/tools/sdk_patches.py). All existing cuts remain enabled.
 Game-specific arena cuts, audio and unrelated fixes are outside this scope.
 Source-tested mechanisms are not verified SDK contracts or passed game tests.
@@ -75,7 +75,7 @@ require build-specific native code.
 
 This establishes SDK-side reuse only. **20.5.8 remains unauthorized** without
 reviewed main and other module closure. Nearby versions are not inferred from
-version numbers. SDK 9.6 is a structural reference, **not one of these 19 builds**.
+version numbers. SDK 9.6 is a structural reference, **not one of these 20 builds**.
 
 ## Legacy structural reference, not added coverage
 
@@ -83,7 +83,7 @@ The supplied SDK 9.6 uses the raw-alias domain rather than modern
 alias-minus-extra. Its inspected paths match the legacy-original alignment
 tiers, operation-specific result translations and resource-return ABI. This
 supports an explicit domain mechanism, not selecting it for unreviewed SDKs.
-The 19-build matrix and all activation eligibility below remain unchanged.
+The 20-build matrix and all activation eligibility below remain unchanged.
 
 That reference also exports a weak reserved-region helper and weak
 AddressRegionManager constructor in addition to the familiar 18 global exports.
@@ -130,8 +130,9 @@ execution authorization. Shared SDKs do not prove each game executes Vamm.
 | `d9add76fc264863d85fbbd1d70076c76` | 10.4.1 | 2N+A | Advance Wars 1+2; Great Ace Attorney Chronicles | L |
 | `30a1e87b52f5a2ac9879685cbfb93d7c` | 10.4.8 | 2N+A | Pikmin 4 | L |
 | `7bba185a35ee9b4d0af66a4df910a823` | 19.3.13 | 2N | Octopath Traveler 0 | U |
+| `5bcf525f24eb28658a8d67ac27800d9b` | 12.3.2 | 2N | Octopath Traveler II | U |
 
-Two SDKs have reviewed modern contracts; **17 complete SDK contracts are still
+Two SDKs have reviewed modern contracts; **18 complete SDK contracts are still
 unreviewed**, including the ten with documented legacy alignment. No alignment
 cut does not imply modern semantics: some node-only older builds document
 stronger request-size alignment too.
@@ -146,7 +147,7 @@ stronger request-size alignment too.
 2. **Evidence-gated adapter work:** exact API/alias census, detail and aggregate
    return ABI, constructor forwarding safety, direct/computed/inlined caller
    closure, GetInfo domain/resource contract, result/abort translations, guards,
-   placement and rollback for the 17 unreviewed SDKs. Differences found will need
+   placement and rollback for the 18 unreviewed SDKs. Differences found will need
    concrete adapters; an alignment table or build-ID label is not that evidence.
 3. **Evidence-gated policy selection:** determine where original legacy alignment
    must remain versus the existing reviewed 32 MiB relaxation. Both mechanisms
