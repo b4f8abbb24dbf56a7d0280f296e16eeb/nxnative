@@ -81,8 +81,8 @@ typedef struct {
     int (*available)(void *context, const dm_sa_span *span, size_t offset, size_t size);
     dm_sa_result (*query)(void *context, size_t alignment, dm_sa_provider_stats *out);
     // All-zero for whole-lease/malloc providers. Partial capabilities are
-    // invalid. This low-level capability is not yet consumed by allocator
-    // operations; never change commitment beneath a live core allocation.
+    // invalid. Statistics and lease draining consume this capability; allocation
+    // reuse/growth do not yet recommit. Never decommit live allocation bytes.
     dm_sa_page_provider pages;
 } dm_sa_provider;
 
@@ -98,10 +98,15 @@ typedef struct {
 } dm_sa_config;
 
 typedef struct {
+    // backing_bytes is the exact outstanding lease extent/capacity charge,
+    // including reserved holes; committed_bytes is actual logical commitment.
     size_t capacity, backing_bytes, allocated_bytes, allocation_count, span_count;
-    size_t total_free, largest_free; // backed free runs + real provider budget
+    // Page-capable configurations include budgeted recommit potential. Runtime
+    // wiring remains disabled until allocation reuse/growth implements recommit.
+    size_t total_free, largest_free; // backed free bytes + once-budgeted recommit/new leases
     size_t metadata_bytes;
     int closed;
+    size_t committed_bytes;
 } dm_sa_stats;
 typedef struct {
     uint64_t block_count, allocated_bytes;

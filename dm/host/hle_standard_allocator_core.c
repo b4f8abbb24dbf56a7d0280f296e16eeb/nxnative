@@ -50,6 +50,44 @@ static void leave(dm_sa_allocator *a) {
 static int available(dm_sa_allocator *a, const span *s, size_t offset, size_t size) {
     return a->config.provider.available(a->config.provider.context, &s->lease, offset, size);
 }
+static dm_sa_result raw_page_run(dm_sa_allocator *a, const span *s, size_t offset,
+                              size_t maximum, dm_sa_page_run *out) {
+    const dm_sa_provider *p = &a->config.provider;
+    dm_sa_page_run run;
+    dm_sa_result r = p->pages.query_run(p->context, &s->lease, offset, maximum, &run);
+    if (r != DM_SA_OK) return r;
+    if (!run.size || run.size > maximum ||
+        (run.flags & ~(DM_SA_PAGE_COMMITTED | DM_SA_PAGE_BORROWED))) return DM_SA_PROVIDER_FAILED;
+    *out = run; return DM_SA_OK;
+}
+static dm_sa_result page_run(dm_sa_allocator *a, const span *s, size_t offset,
+                              size_t maximum, dm_sa_page_run *out) {
+    dm_sa_page_run run;
+    dm_sa_result r = raw_page_run(a, s, offset, maximum, &run);
+    if (r != DM_SA_OK) return r;
+    // Providers may return short prefixes. Merge identical adjacent states so
+    // a complete free hole is charged in granules, not arbitrary query chunks.
+    while (run.size < maximum) {
+        dm_sa_page_run next;
+        r = raw_page_run(a, s, offset + run.size, maximum - run.size, &next);
+        if (r != DM_SA_OK) return r;
+        if (next.flags != run.flags) break;
+        run.size += next.size;
+    }
+    *out = run; return DM_SA_OK;
+}
+static dm_sa_result releasable(dm_sa_allocator *a, const span *s) {
+    if (!a->config.provider.pages.granule)
+        return available(a, s, 0, s->lease.size) ? DM_SA_OK : DM_SA_BUSY;
+    for (size_t offset = 0; offset < s->lease.size;) {
+        dm_sa_page_run run;
+        dm_sa_result r = page_run(a, s, offset, s->lease.size - offset, &run);
+        if (r != DM_SA_OK) return r;
+        if (run.flags & DM_SA_PAGE_BORROWED) return DM_SA_BUSY;
+        offset += run.size;
+    }
+    return DM_SA_OK;
+}
 static void *address(const span *s, const block *b) {
     return (void *)((uintptr_t)s->lease.base + b->offset);
 }
@@ -92,7 +130,8 @@ static void delete_span_metadata(dm_sa_allocator *a, span *s) {
     metadata_delete(a, s, sizeof *s);
 }
 static dm_sa_result release_span(dm_sa_allocator *a, span *s) {
-    if (!available(a, s, 0, s->lease.size)) return DM_SA_BUSY;
+    dm_sa_result ready = releasable(a, s);
+    if (ready != DM_SA_OK) return ready;
     dm_sa_result r = a->config.provider.release(a->config.provider.context, &s->lease);
     if (r != DM_SA_OK) return r;
     span **link = &a->spans;
@@ -302,26 +341,94 @@ dm_sa_result dm_sa_get_size(dm_sa_allocator *a, const void *pointer, size_t *out
     if (r == DM_SA_OK) *out = b->size;
     leave(a); return r;
 }
+// A two-cursor window over authoritative runs, not a second residency ledger.
+// Whole free granules may be holes; live block boundary granules stay backed.
+// Each missing granule consumes physical headroom once. Borrowed runs are hard
+// barriers; already-backed free runs require no additional physical budget.
+static dm_sa_result sparse_free_stats(dm_sa_allocator *a, const span *s, const block *b,
+                                       size_t budget, size_t *backed, size_t *holes,
+                                       size_t *largest) {
+    size_t left = b->offset, right = left, limit = left + b->size, cost = 0;
+    size_t granule = a->config.provider.pages.granule;
+    while (right < limit) {
+        dm_sa_page_run run;
+        dm_sa_result r = page_run(a, s, right, limit - right, &run);
+        if (r != DM_SA_OK) return r;
+        size_t end = right + run.size;
+        if (run.flags & DM_SA_PAGE_BORROWED) {
+            left = right = end; cost = 0; continue;
+        }
+        if (run.flags & DM_SA_PAGE_COMMITTED) *backed += run.size;
+        else {
+            // A hole split by a live boundary would violate the page-provider
+            // lifetime contract. Never advertise that malformed run as usable.
+            if ((right | run.size) & (granule - 1)) return DM_SA_PROVIDER_FAILED;
+            *holes += run.size;
+            size_t prefix = right - left + lesser(run.size, budget - cost);
+            if (prefix > *largest) *largest = prefix;
+            cost += run.size;
+        }
+        right = end;
+        while (cost > budget) {
+            dm_sa_page_run old;
+            r = page_run(a, s, left, right - left, &old);
+            if (r != DM_SA_OK) return r;
+            size_t remove = old.flags & DM_SA_PAGE_COMMITTED ? old.size : lesser(old.size, cost - budget);
+            if (!(old.flags & DM_SA_PAGE_COMMITTED)) cost -= remove;
+            left += remove;
+        }
+        if (right - left > *largest) *largest = right - left;
+    }
+    return DM_SA_OK;
+}
+static dm_sa_result committed_stats(dm_sa_allocator *a, size_t *out) {
+    size_t committed = 0;
+    for (span *s = a->spans; s; s = s->next)
+        for (size_t offset = 0; offset < s->lease.size;) {
+            dm_sa_page_run run;
+            dm_sa_result r = page_run(a, s, offset, s->lease.size - offset, &run);
+            if (r != DM_SA_OK) return r;
+            if (run.flags & DM_SA_PAGE_COMMITTED) committed += run.size;
+            offset += run.size;
+        }
+    *out = committed; return DM_SA_OK;
+}
 dm_sa_result dm_sa_get_stats(dm_sa_allocator *a, dm_sa_stats *out) {
     if (!a || !out) return DM_SA_INVALID;
     enter(a);
     dm_sa_stats st = { .capacity = a->config.capacity, .backing_bytes = a->backing,
         .allocated_bytes = a->used, .allocation_count = a->count, .span_count = a->span_count,
-        .metadata_bytes = a->metadata, .closed = a->closed };
+        .metadata_bytes = a->metadata, .closed = a->closed, .committed_bytes = a->backing };
     dm_sa_result r = DM_SA_OK;
-    if (!a->closed) {
-        const dm_sa_provider *p = &a->config.provider;
+    const dm_sa_provider *p = &a->config.provider;
+    if (p->pages.granule) r = committed_stats(a, &st.committed_bytes);
+    if (!a->closed && r == DM_SA_OK) {
         dm_sa_provider_stats ps;
         r = p->query(p->context, p->granule, &ps);
         if (r == DM_SA_OK) {
             size_t cap = a->config.capacity - a->backing;
-            st.total_free = lesser(cap, ps.available_bytes) & ~(p->granule - 1);
-            st.largest_free = lesser(st.total_free, ps.largest_span) & ~(p->granule - 1);
-            for (span *s = a->spans; s; s = s->next) for (block *b = s->blocks; b; b = b->next)
-                if (!b->live && available(a, s, b->offset, b->size)) {
-                    st.total_free += b->size;
-                    if (b->size > st.largest_free) st.largest_free = b->size;
+            size_t extra = lesser(cap, ps.available_bytes) & ~(p->granule - 1);
+            if (p->pages.granule) {
+                size_t budget, backed = 0, holes = 0;
+                r = p->pages.budget(p->context, &budget);
+                if (r == DM_SA_OK) {
+                    budget &= ~(p->pages.granule - 1);
+                    extra = lesser(extra, budget) & ~(p->granule - 1);
+                    st.largest_free = lesser(extra, ps.largest_span) & ~(p->granule - 1);
+                    for (span *s = a->spans; s && r == DM_SA_OK; s = s->next)
+                        for (block *b = s->blocks; b && r == DM_SA_OK; b = b->next)
+                            if (!b->live) r = sparse_free_stats(a, s, b, budget, &backed, &holes, &st.largest_free);
+                    st.total_free = backed + lesser(budget, holes + extra);
                 }
+            } else {
+                st.total_free = extra;
+                st.largest_free = lesser(extra, ps.largest_span) & ~(p->granule - 1);
+                for (span *s = a->spans; s; s = s->next) for (block *b = s->blocks; b; b = b->next)
+                    if (!b->live && available(a, s, b->offset, b->size)) {
+                        st.total_free += b->size;
+                        if (b->size > st.largest_free) st.largest_free = b->size;
+                    }
+            }
         }
     }
     if (r == DM_SA_OK) *out = st;
@@ -340,8 +447,9 @@ dm_sa_result dm_sa_finalize(dm_sa_allocator *a) {
     if (!a) return DM_SA_INVALID;
     enter(a);
     if (!a->closed) {
-        for (span *s = a->spans; s; s = s->next) if (!available(a, s, 0, s->lease.size)) {
-            leave(a); return DM_SA_BUSY;
+        for (span *s = a->spans; s; s = s->next) {
+            dm_sa_result ready = releasable(a, s);
+            if (ready != DM_SA_OK) { leave(a); return ready; }
         }
         a->closed = 1; a->used = 0; a->count = 0;
         for (span *s = a->spans; s; s = s->next) s->live_count = 0;
