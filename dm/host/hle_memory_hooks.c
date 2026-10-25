@@ -29,6 +29,15 @@ static int index_of(const char *name) {
     for (unsigned i = 0; i < TOTAL; ++i) if (!strcmp(name, name_at(i))) return (int)i;
     return -1;
 }
+static int owned_member(const char *name, const char *owner_name) {
+    // Itanium nested names encode the owning class before the member, whereas
+    // unrelated functions may mention this class only in a parameter type.
+    // Do not reject those service exports as new allocator/manager methods.
+    if (strncmp(name, "_ZN", 3)) return 0;
+    name += 3;
+    while (*name && strchr("rVKRO", *name)) ++name; // cv/ref qualifiers
+    return !strncmp(name, owner_name, strlen(owner_name));
+}
 static int inside(const module_t *m, uint64_t offset, size_t size) {
     return offset <= m->size && size <= m->size - offset;
 }
@@ -127,7 +136,8 @@ int dm_memory_hooks_install(module_t *modules, size_t count,
             if (!name) goto done;
             int index = index_of(name);
             if (index < 0) {
-                if (strstr(name, "17StandardAllocator") || strstr(name, "11VammManager")) goto done;
+                if (owned_member(name, "2nn3mem17StandardAllocator") ||
+                    owned_member(name, "2nn2os6detail11VammManager")) goto done;
                 continue;
             }
             if (!s->st_shndx) continue;

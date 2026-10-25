@@ -254,6 +254,10 @@ int main(void) {
     setup(); images[1].symbols[N + 1] = images[1].symbols[1]; modules[1].nsym++; rejected();
     setup(); strcpy(images[1].strings + 7000, "_ZN2nn3mem17StandardAllocatorD1Ev");
     images[1].symbols[N + 1] = images[1].symbols[1]; images[1].symbols[N + 1].st_name = 7000; modules[1].nsym++; rejected();
+    setup(); strcpy(images[1].strings + 7000, "_ZNKR2nn3mem17StandardAllocator10UnexpectedEv");
+    images[1].symbols[N + 1] = images[1].symbols[1]; images[1].symbols[N + 1].st_name = 7000; modules[1].nsym++; rejected();
+    setup(); strcpy(images[1].strings + 7000, "_ZNK2nn2os6detail11VammManager10UnexpectedEv");
+    images[1].symbols[N + 1] = images[1].symbols[1]; images[1].symbols[N + 1].st_name = 7000; modules[1].nsym++; rejected();
     setup(); images[0].rela[2].r_addend = 1; rejected();
     setup(); images[0].rela[2].r_offset = 8; rejected();
     setup(); images[0].rela[2].r_offset = sizeof(image); rejected();
@@ -270,6 +274,21 @@ int main(void) {
     setup(); pid_t pid = fork(); assert(pid >= 0);
     if (!pid) { assert(dm_memory_hooks_enter_guest()); rejected(); _exit(0); }
     int status; assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    // Synthetic service exports using the classes as parameter types are not
+    // class members. The actual SDK has such exports; substring matching
+    // incorrectly made even a complete, reviewed method census impossible.
+    const char *parameter_exports[] = {
+        "_ZN2nn4test6AcceptEPNS_3mem17StandardAllocatorE",
+        "_ZN2nn4test6AcceptEPNS_2os6detail11VammManagerE"
+    };
+    for (unsigned i = 0; i < sizeof parameter_exports / sizeof *parameter_exports; ++i) {
+        setup(); strcpy(images[1].strings + 7000, parameter_exports[i]);
+        images[1].symbols[N + 1] = images[1].symbols[1];
+        images[1].symbols[N + 1].st_name = 7000; modules[1].nsym++;
+        pid = fork(); assert(pid >= 0);
+        if (!pid) { assert(install() == DM_MEMORY_HOOKS_OK); _exit(0); }
+        assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    }
     // A defined constructor alias with no relocation callers is not an
     // installation gap. Exact observed slots are covered, the table is complete.
     for (unsigned unused = 0; unused < N; ++unused) {

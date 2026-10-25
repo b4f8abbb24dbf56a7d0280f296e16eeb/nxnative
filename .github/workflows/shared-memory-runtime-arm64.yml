@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 9191c9ff9802d6240b50897fdda502f786f91bed
+          ref: 7ed2278f0004d14f6c7ec5de388163217c777598
           persist-credentials: false
       - name: Host unit tests (dm/host/tests)
         run: |
@@ -68,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 9191c9ff9802d6240b50897fdda502f786f91bed
+          ref: 7ed2278f0004d14f6c7ec5de388163217c777598
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 9191c9ff9802d6240b50897fdda502f786f91bed
+          ref: 7ed2278f0004d14f6c7ec5de388163217c777598
           persist-credentials: false
       - name: Mac host for three profiles (Vulkan, NVN, OpenGL)
         run: |
@@ -152,13 +152,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 9191c9ff9802d6240b50897fdda502f786f91bed
+          ref: 7ed2278f0004d14f6c7ec5de388163217c777598
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 9191c9ff9802d6240b50897fdda502f786f91bed
-          test "$(git rev-parse HEAD^{tree})" = 2d6e9c4a4108cb4b4b7d9455f162deed1538d12e
+          test "$(git rev-parse HEAD)" = 7ed2278f0004d14f6c7ec5de388163217c777598
+          test "$(git rev-parse HEAD^{tree})" = 4d82f38495e70def5962c34b53dd4230b4c683de
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
