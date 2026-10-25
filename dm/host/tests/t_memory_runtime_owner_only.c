@@ -21,7 +21,9 @@ static uint32_t pages(void *context, uintptr_t base, size_t size, int commit) {
 static dm_vamm_resource_usage resources(void *context) {
     assert(!context); return (dm_vamm_resource_usage){0x100000, 0};
 }
-uint32_t dm_vamm_native_configure(dm_vamm_config *out, size_t max_regions) {
+uint32_t dm_vamm_native_configure_domain(dm_vamm_config *out, size_t max_regions,
+                                         dm_vamm_native_domain_policy policy) {
+    assert(policy == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA);
     if (fail_configure) return DM_VAMM_INVALID;
     *out = (dm_vamm_config){.base = 0x100000, .size = 0x1000000,
         .max_regions = max_regions, .change_pages = pages, .resources = resources};
