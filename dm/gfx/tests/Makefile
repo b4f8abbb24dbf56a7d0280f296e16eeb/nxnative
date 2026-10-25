@@ -164,3 +164,15 @@ run: t_nvn t_dirty_slots t_dirty_race t_builtin t_vin t_tbuf2d t_deswz_gpu t_pac
 	MTL_DEBUG_LAYER=1 ./t_stencil_view
 	DM_GAME=$(GAME) python3 test_tbdr_budget.py
 .PHONY: run
+
+# Opt-in synthetic cube compatibility copy; no game/SDK inputs. Metal 4 runtime required.
+t_cube_copy_policy: t_cube_copy_policy.c ../nvn/nvn_cube_copy.h
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -o $@ t_cube_copy_policy.c
+t_cube_copy: t_cube_copy.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_cube_copy.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_cube_copy
+check_t_cube_copy: t_cube_copy_policy t_cube_copy
+	./t_cube_copy_policy
+	MTL_DEBUG_LAYER=1 DM_RES_CHECK=1 ./t_cube_copy --disabled
+	MTL_DEBUG_LAYER=1 DM_RES_CHECK=1 DM_NVN_ENC_THREAD=0 ./t_cube_copy
+	MTL_DEBUG_LAYER=1 DM_RES_CHECK=1 DM_NVN_ENC_THREAD=1 ./t_cube_copy

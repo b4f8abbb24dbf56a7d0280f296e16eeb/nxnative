@@ -24,6 +24,7 @@
 #include "nvn_refl.h"
 #include "nvn_cover.h"
 #include "nvn_primitive.h"
+#include "nvn_cube_copy.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
 #include "game_profile.h"   // game profile constants (profile id, the profile's switches)
 // Texture slot table per stage: 0-127 the combined handles (nvnCommandBufferBindTexture), 128-255 the separate texture binds (NVN_SEPTEX_SLOT0, nvn_obj.h)
@@ -3573,6 +3574,92 @@ static inline __attribute__((always_inline)) void *tex_fast(int tid) {
 // The texture type the shader declares differs from the one the descriptor gives: use a compatible view. Maxwell sample instructions carry their own dimension, and a non-array instruction reading a 2D array texture reads layer 0;
 // on Metal a 2D array bound to a texture2d argument is a type mismatch with undefined reads (measured: one fixed value). Super Mario 3D World + Bowser's Fury creates its pre-lighting buffer as a one-layer 2D array
 // and the deferred lighting shader samples it as 2D: the ambient light of the whole picture became one colour, washed out white. Supports 2D array <-> 2D and 2D array -> cube / cube array; any other mismatch is reported once. Caller holds g_rmu
+// Opt-in compatibility experiment, not a reconstruction of a real environment map. Cache allocations,
+// not content: every consuming draw/dispatch refreshes all six faces, after resolving dirty uploads.
+// There is no complete per-texture GPU-write generation here, so an unchanged object is NOT proof
+// of unchanged pixels. Refresh-before-use also covers clears, image writes and in-place GPU copies.
+@interface NvCubeCopy : NSObject { @public
+    __weak id<MTLTexture> source; id<MTLTexture> storage, view;
+    uint64_t prepared, fence, bytes; MTLTextureType type;
+} @end
+@implementation NvCubeCopy @end
+static NvCubeCopy *g_cube_copy[NVN_CUBE_COPY_SLOTS];
+static uint64_t g_cube_copy_use, g_cube_copy_bytes, g_cube_copy_made, g_cube_copy_refresh, g_cube_copy_refused;
+static int g_cube_copy_binding, g_cube_copy_last_bound;   // explicit consumer scope; geometry/helper encoders keep zero
+static int cube_copy_on(void) {
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_CUBE_COPY"); v = e && !strcmp(e, "1");
+        if (v) MLOG("CUBE_COPY: opt-in six-face compatibility fallback; allocation cache only, refreshed before each use (not a proven environment map)"); }
+    return v;
+}
+static int mtl_pf_dpf(MTLPixelFormat pf);
+static int cube_copy_shape(id<MTLTexture> t, MTLTextureType want) {
+    if (!t || (want != MTLTextureTypeCube && want != MTLTextureTypeCubeArray) ||
+        (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) ||
+        t.storageMode != MTLStorageModePrivate || t.framebufferOnly || t.buffer || t.isSparse || mtl_pf_dpf(t.pixelFormat) != NVN_DPF_FLOAT) return 0;
+    switch (t.pixelFormat) { case MTLPixelFormatInvalid: case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float:
+        case MTLPixelFormatStencil8: case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatX32_Stencil8: return 0; default: break; }
+    return nvn_cube_copy_shape(t.width, t.height, t.arrayLength, t.mipmapLevelCount, t.sampleCount);
+}
+static void cube_copy_drop(int i) {   // Never retire an in-flight allocation: the budget includes every cached allocation.
+    NvCubeCopy *c = g_cube_copy[i]; if (!c) return;
+    if (c->fence > g_done) return; res_remove(c->storage); g_cube_copy_bytes -= c->bytes; g_cube_copy[i] = nil;
+}
+static NvCubeCopy *cube_copy_find(id<MTLTexture> t, MTLTextureType want) {
+    for (int i = 0; i < NVN_CUBE_COPY_SLOTS; i++) { NvCubeCopy *c = g_cube_copy[i]; if (c && c->source == t && c->type == want) return c; }
+    return nil;
+}
+static id<MTLTexture> cube_copy_bound(id<MTLTexture> t, MTLTextureType want, uint64_t *rid) {
+    if (!cube_copy_on() || !g_cube_copy_binding) return nil;
+    NvCubeCopy *c = cube_copy_find(t, want);
+    if (!c || !g_cube_copy_use || c->prepared != g_cube_copy_use) return nil;   // no previous draw's snapshot, even if the source pointer is unchanged
+    c->fence = g_fence + 1; g_cube_copy_last_bound = 1;
+    *rid = c->view.gpuResourceID._impl; return c->view;
+}
+static int cube_copy_prepare_texture(int tid, id<MTLTexture> t, MTLTextureType want) {
+    if (!cube_copy_on() || !g_cb || !cube_copy_shape(t, want)) return 0;
+    NvCubeCopy *c = cube_copy_find(t, want);
+    if (!c) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor new]; d.textureType = MTLTextureType2DArray;
+        d.pixelFormat = t.pixelFormat; d.width = t.width; d.height = t.height; d.depth = 1; d.arrayLength = 6;
+        d.mipmapLevelCount = t.mipmapLevelCount; d.sampleCount = 1; d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+        uint64_t need = [g_dev heapTextureSizeAndAlignWithDescriptor:d].size;
+        if (!nvn_cube_copy_budget(0, need)) return 0;
+        int slot = -1;
+        for (int i = 0; i < NVN_CUBE_COPY_SLOTS; i++) if (!g_cube_copy[i]) { slot = i; break; }
+        // Only completed, not-this-consumer entries can be evicted. A busy GPU causes a zero fallback, never unbounded deferred allocations or a CPU wait.
+        for (int i = 0; i < NVN_CUBE_COPY_SLOTS && (slot < 0 || !nvn_cube_copy_budget(g_cube_copy_bytes, need)); i++) {
+            NvCubeCopy *old = g_cube_copy[i]; if (old && nvn_cube_copy_evictable(old->fence, g_done, old->prepared, g_cube_copy_use)) { cube_copy_drop(i); if (slot < 0) slot = i; }
+        }
+        if (slot < 0 || !nvn_cube_copy_budget(g_cube_copy_bytes, need)) return 0;
+        id<MTLTexture> storage = [g_dev newTextureWithDescriptor:d]; if (!storage) return 0;
+        uint64_t charge = MAX(need, (uint64_t)storage.allocatedSize);
+        if (!nvn_cube_copy_budget(g_cube_copy_bytes, charge)) return 0;
+        id<MTLTexture> view = [storage newTextureViewWithPixelFormat:t.pixelFormat textureType:want levels:NSMakeRange(0, t.mipmapLevelCount) slices:NSMakeRange(0, 6) swizzle:t.swizzle];
+        if (!view) return 0;
+        c = [NvCubeCopy new]; c->source = t; c->storage = storage; c->view = view; c->bytes = charge; c->type = want;
+        g_cube_copy[slot] = c; g_cube_copy_bytes += charge; g_cube_copy_made++; res_add(storage);
+    }
+    if (c->prepared == g_cube_copy_use) return 1;   // same scalar source in two slots/stages of this one draw
+    int layered = g_rp_layered; g_rp_layered = 0; lc_land(); g_rp_layered = layered;
+    rp_flush();   // lazy and load-action clears must execute before the copy, not when its consumer pass opens
+    up_flush();   // pending uploads must reach the same Metal 4 queue before the replay copy reads them
+    id<MTL4ComputeCommandEncoder> b = blit();   // ends prior render work; existing full/intra-encoder barriers order prior writes and later consumers
+    // Coordinates are relative to the resolved view. Do not add parentRelativeLevel/Slice again.
+    // Full mip extents are valid for BC blocks too: the 2x2 and 1x1 tail mips clamp to the image edge.
+    for (NSUInteger l = 0; l < t.mipmapLevelCount; l++) for (NSUInteger f = 0; f < 6; f++) {
+        enc_b_copy_texture(b, t, 0, l, MTLOriginMake(0, 0, 0), MTLSizeMake(MAX(t.width >> l, 1u), MAX(t.height >> l, 1u), 1),
+                           c->storage, f, l, MTLOriginMake(0, 0, 0)); g_gp_copies++;
+    }
+    defer_obj_unref(t);   // Metal 4 command buffers do not retain resources; keep the source view through this submission
+    c->prepared = g_cube_copy_use; c->fence = g_fence + 1; g_cube_copy_refresh++;
+    if (g_cube_copy_refresh <= 16 || !(g_cube_copy_refresh % 600))
+        MLOG("CUBE_COPY id=%d %lux%lu fmt=%lu mips=%lu view=%lu/%lu faces=6 refresh=%llu allocations=%llu bytes=%llu",
+             tid, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.mipmapLevelCount,
+             (unsigned long)t.parentRelativeLevel, (unsigned long)t.parentRelativeSlice, (unsigned long long)g_cube_copy_refresh,
+             (unsigned long long)g_cube_copy_made, (unsigned long long)g_cube_copy_bytes);
+    return 1;
+}
+
 static id<MTLTexture> dummy_tex(int dtt, int dpf); static uint64_t g_dummy_tex_rid[8][4];
 static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, uint64_t *rid) {
     MTLTextureType have = t.textureType; NSUInteger ns = 0;
@@ -3585,6 +3672,8 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, ui
     // a defined read, instead of a type mismatch whose reads are undefined. The same for a 2D array of fewer than 6 layers, which is how the host holds some 2D textures (Mario Kart 8 Deluxe binds
     // an NVN 2D texture, format 0x44, at slot 10 of two pixel shaders that declare a cube there, as a race loads)
     if (!ns && (want == MTLTextureTypeCube || want == MTLTextureTypeCubeArray) && (have == MTLTextureType2D || (have == MTLTextureType2DArray && t.arrayLength < 6))) {
+        id<MTLTexture> copy = cube_copy_bound(t, want, rid); if (copy) return copy;
+        if (cube_copy_on() && g_cube_copy_refused++ < 16) MLOG("CUBE_COPY id=%d not prepared/eligible or cache busy; zero cube retained", tid);
         RED_ONCE(103, "texture type mismatch: shader declares a cube, texture is 2D (texture ID %d); the zero cube is bound", tid);
         id<MTLTexture> z = dummy_tex((int)want, NVN_DPF_FLOAT); *rid = g_dummy_tex_rid[want & 7][NVN_DPF_FLOAT]; return z; }
     if (!ns || tid <= 0 || tid >= g_ntreg) return nil;   // no view bridges it: the caller reports it (tex_mis_note)
@@ -4921,6 +5010,23 @@ static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts 
 static uint32_t g_draw_binst;   // the current draw's base instance (draw), for c0 + 0x644
 static __unsafe_unretained id<MTLBuffer> g_c0_dim_buf; static size_t g_c0_dim_off;   // where encode_args put them for this dispatch (nil: the shader reads no c0); an indirect dispatch copies its GPU-written counts there
 static uint64_t g_geo_bind[5];
+// Only scalar bindings: mixed dynamic handle arrays contain unselected 2D entries and keep their existing zero fallback.
+// Run before opening the consumer encoder, never from encode_args/tex_fit while an encoder is already in use.
+static void cube_copy_prepare_shader(NvShader *sh, int stage) {
+    if (!cube_copy_on() || !sh) return;
+    for (int i = 0; i < sh->rf.nb; i++) {
+        const nvn_rbind *b = &sh->rf.b[i];
+        if ((b->kind != NVN_RB_TEX && b->kind != NVN_RB_TEXU) || b->n || b->dpf != NVN_DPF_FLOAT ||
+            (b->dtt != MTLTextureTypeCube && b->dtt != MTLTextureTypeCubeArray)) continue;
+        int tid = b->kind == NVN_RB_TEXU ? ubo_tex_id(ubo_handle(stage, b->reg, b->off)) : (int)(tex_slot_h(S.tex[stage], S.img[stage], b->reg) & 0xfffff);
+        if (!tid) continue;
+        // tex_by_id runs the existing dirty-page/upload invalidation. Keep a strong local source while not holding the registration lock: blit/rp_end may need it.
+        pthread_mutex_lock(&g_rmu); id<MTLTexture> t = tex_by_id(tid); pthread_mutex_unlock(&g_rmu);
+        if (cube_copy_prepare_texture(tid, t, (MTLTextureType)b->dtt)) args_dirty_all();
+    }
+}
+static void cube_copy_begin(void) { g_cube_copy_binding = g_cube_copy_last_bound = 0; if (cube_copy_on()) { g_cube_copy_use++; args_dirty_all(); } }
+
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex);
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) { AP_B; int r = encode_args_(en, sh, nvn_stage, metal_vertex); AP_E(3); return r; }
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
@@ -7027,6 +7133,7 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained id<MTLRenderPipelineState> ps = tf_pso(vs);
     if (!ps) return;
     rp_end(); ubd_land();   // the deferred inline updates first: this draw comes before draw's conflict check (ubd_conflict) and writes its capture buffers
+    cube_copy_begin(); cube_copy_prepare_shader(vs, 0);
     // ubd_land copies them in the copy encoder and leaves it open, as does a copy or dispatch just before: a render encoder opened beside it is invalid (Metal validation: "Command buffer already
     // has an open command encoder"). Pokémon Legends: Z-A crashed in the driver when that copy encoder ended, two minutes into a new game on the Mac (GitHub issue #101)
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
@@ -7035,7 +7142,7 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     enc_r_pso(en, ps);
     bind_vbufs(en);
     vconv_bind(en, vs, 1, dw, NULL);
-    args_dirty_all(); encode_args(en, vs, 0, 1);
+    args_dirty_all(); g_cube_copy_binding = 1; encode_args(en, vs, 0, 1); g_cube_copy_binding = 0;
     for (int b = 0; b < 4; b++) if (vs->tf_stride[b]) {   // vertex v of the draw (first + i) stores at v × stride: the pointer starts first × stride before the write offset
         enc_r_vbuf(en, TF_SLOT + b, gpu[b] - (uint64_t)dw->first * vs->tf_stride[b]);
         uint64_t n = (uint64_t)dw->count * vs->tf_stride[b]; pend_add(S.tf[b].addr + S.tf_off[b], n, 4); S.tf_off[b] += n;
@@ -7146,7 +7253,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     }
     int mdx_on = (dw && dw->mdi_cnt) || (di && di->mdi_cnt) ? mdx_wanted(dw, di) : 0;   // an indirect-count multi-draw's record masked on the GPU (mdx_run), else read after a wait
     if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) return;   // past the multi-draw's count
-    if (mdx_on && mdx_next(dw, di)) return;   // the next draw of a masked multi-draw: only the draw is encoded
+    if (mdx_on && !g_cube_copy_last_bound && mdx_next(dw, di)) return;   // the next draw of a masked multi-draw: only the draw is encoded
     g_mdxc.next = NULL;
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
@@ -7211,6 +7318,11 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
     if (g_enc && g_pass.layered != g_rp_layered) rp_end();   // a layered pass only for layer-writing vertex shaders (see rp_begin_ex)
+    cube_copy_begin();
+    // A fused/deferred replay may inject draws after this point. Do not snapshot across that reordering; those cases retain zero.
+    if (!defer_q_draw && !g_defer_nact && !g_defer_replaying && !g_fz.active && !g_fz_checking) {
+        cube_copy_prepare_shader(pr->sh[0], 0); cube_copy_prepare_shader(pr->sh[1], 1);
+    }
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     g_rp_layered = 0;
     g_fd_dw = NULL; g_fd_di = NULL;
@@ -7268,8 +7380,10 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     bind_vbufs(en);
     if (pr->sh[0]) vconv_bind(en, pr->sh[0], 0, dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
     g_kd_force = kd_draw(pr, dw, di);
+    g_cube_copy_binding = 1;
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
+    g_cube_copy_binding = 0;
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
     int prim = dw ? dw->prim : di->prim;
@@ -7501,13 +7615,14 @@ static void dispatch(const p_dispatch *dp) {
     if (!tg[0]) { RED_ONCE(29, "compute shader lacks threadgroup size reflection"); return; }
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_end();
+    cube_copy_begin(); cube_copy_prepare_shader(cs, 5);
     int own = dispatch_own();
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc();
     enc_c_pso(ce, ps);
     g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
     g_c0_dim_buf = nil;
-    encode_args(ce, cs, 5, 0);
+    g_cube_copy_binding = 1; encode_args(ce, cs, 5, 0); g_cube_copy_binding = 0;
     if (dp->ind) {   // The shader reads the group counts from c0 + 0x200: copy the GPU-written ones there first (Metal 4 orders nothing inside an encoder without a barrier)
         if (g_c0_dim_buf) { [(id<MTL4ComputeCommandEncoder>)ce copyFromBuffer:(__bridge id<MTLBuffer>)ib sourceOffset:io toBuffer:g_c0_dim_buf destinationOffset:g_c0_dim_off size:12];
             [(id<MTL4ComputeCommandEncoder>)ce barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]; }

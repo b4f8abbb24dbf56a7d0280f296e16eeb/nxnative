@@ -76,3 +76,8 @@ t_stencil_view
 t_stencil_view.dSYM/
 t_pso_archive
 t_pso_archive.dSYM/
+
+t_cube_copy
+t_cube_copy.dSYM/
+t_cube_copy_policy
+t_cube_copy_policy.dSYM/
