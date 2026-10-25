@@ -187,3 +187,23 @@ map-memory-tsan: $(B)/t_map_memory_tsan $(B)/t_map_memory_tsan_unlimited $(B)/t_
 	$(B)/t_map_memory_tsan_16k
 	$(B)/t_map_memory_tsan_16k_unlimited
 run: map-memory
+
+# The production legacy guest-thread helper must supply a valid owned guest
+# MapMemory source and retain both allocations until SDK Wait + Destroy.
+GUEST_STACK_DEPS = t_guestthread_stack.c ../hle_guestthread.c $(MAP_MEMORY_DEPS)
+$(B)/t_guestthread_stack: $(GUEST_STACK_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -o $@ t_guestthread_stack.c ../hle_address_space.c
+$(B)/t_guestthread_stack_16k: $(GUEST_STACK_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_guestthread_stack.c ../hle_address_space.c
+$(B)/t_guestthread_stack_sanitize: $(GUEST_STACK_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_guestthread_stack.c ../hle_address_space.c
+$(B)/t_guestthread_stack_16k_sanitize: $(GUEST_STACK_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_guestthread_stack.c ../hle_address_space.c
+.PHONY: guest-thread-stack guest-thread-stack-sanitize
+guest-thread-stack: $(B)/t_guestthread_stack $(B)/t_guestthread_stack_16k
+	$(B)/t_guestthread_stack
+	$(B)/t_guestthread_stack_16k
+guest-thread-stack-sanitize: $(B)/t_guestthread_stack_sanitize $(B)/t_guestthread_stack_16k_sanitize
+	$(B)/t_guestthread_stack_sanitize
+	$(B)/t_guestthread_stack_16k_sanitize
+run: guest-thread-stack
