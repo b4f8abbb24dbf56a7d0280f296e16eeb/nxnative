@@ -1,0 +1,134 @@
+name: Cached cube fallback native validation
+
+on:
+  push:
+    branches: [ci/cached-2d-cube-fallback-arm64-20261025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cached-cube-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GAME: 010015100B514000
+  CUBE_SOURCE_SHA: c05a8eb885feec86e1587ac3b303d0892d729f2f
+  CUBE_SOURCE_TREE: 9be314c41a1f72c1a1345a6ca2d97f3b4e2f0b34
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-compile:
+    name: Apple native compile and portable contracts
+    runs-on: macos-26
+    timeout-minutes: 30
+    outputs:
+      metal4: ${{ steps.device.outputs.metal4 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.CUBE_SOURCE_SHA }}
+      - name: Verify the exact released source and arm64 runner
+        run: |
+          test "$(git rev-parse HEAD)" = "$CUBE_SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$CUBE_SOURCE_TREE"
+          test "$(uname -m)" = arm64
+      - name: Compile the production-path synthetic fixture
+        run: |
+          mkdir -p logs
+          xcodebuild -version | tee logs/xcode.log
+          uname -m | tee logs/architecture.log
+          make -C dm/gfx/tests GAME="$GAME" -j3 t_cube_copy t_cube_copy_policy 2>&1 | tee logs/native-compile.log
+      - name: Execute portable contracts on the Apple compiler
+        run: |
+          dm/gfx/tests/t_cube_copy_policy 2>&1 | tee logs/policy.log
+          python3 -m unittest -v dm/gfx/tests/test_cube_copy.py 2>&1 | tee logs/portable.log
+      - name: Compile production iOS sources without private assets
+        run: python3 dm/ios/tools/compile_check.py 2>&1 | tee logs/ios-compile.log
+      - name: Establish Metal 4 runtime availability
+        id: device
+        run: |
+          cat > "$RUNNER_TEMP/cube-device.m" <<'OBJC'
+          #import <Foundation/Foundation.h>
+          #import <Metal/Metal.h>
+          #include <stdio.h>
+          int main(void) { @autoreleasepool {
+              id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+              if (!d) { puts("SKIP: no Metal device; GPU fixture was not executed"); return 77; }
+              printf("Metal device: %s\n", d.name.UTF8String);
+              if (!d.hasUnifiedMemory || ![d supportsFamily:MTLGPUFamilyMetal4]) {
+                  puts("SKIP: no unified-memory Metal 4 device; GPU fixture was not executed"); return 77;
+              }
+              puts("Metal 4 device available; synthetic fixture may execute"); return 0;
+          } }
+          OBJC
+          xcrun clang -fobjc-arc "$RUNNER_TEMP/cube-device.m" -framework Foundation -framework Metal -o "$RUNNER_TEMP/cube-device"
+          set +e
+          "$RUNNER_TEMP/cube-device" 2>&1 | tee logs/device.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" = 77 ]; then
+            echo 'metal4=false' >> "$GITHUB_OUTPUT"
+            echo '### GPU fixture: SKIPPED — no suitable Metal 4 device' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Native compilation and portable checks are not a GPU-runtime pass.' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$rc" = 0 ]; then
+            echo 'metal4=true' >> "$GITHUB_OUTPUT"
+          else
+            exit "$rc"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cached-cube-native-compile-logs
+          path: logs
+          retention-days: 7
+
+  synthetic-gpu:
+    name: Synthetic Metal 4 GPU fixture (not game validation)
+    needs: native-compile
+    if: needs.native-compile.outputs.metal4 == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.CUBE_SOURCE_SHA }}
+      - name: Verify the exact released source and arm64 runner
+        run: |
+          test "$(git rev-parse HEAD)" = "$CUBE_SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$CUBE_SOURCE_TREE"
+          test "$(uname -m)" = arm64
+      - name: Build and execute default-off and both encoder modes
+        run: |
+          mkdir -p logs
+          # A newly allocated runner must satisfy the same requirements; any
+          # initialization/runtime failure here fails, never becomes a pass.
+          make -C dm/gfx/tests GAME="$GAME" -j3 t_cube_copy 2>&1 | tee logs/native-compile.log
+          MTL_DEBUG_LAYER=1 DM_RES_CHECK=1 dm/gfx/tests/t_cube_copy --disabled 2>&1 | tee logs/default-off.log
+          MTL_DEBUG_LAYER=1 DM_RES_CHECK=1 DM_NVN_ENC_THREAD=0 dm/gfx/tests/t_cube_copy 2>&1 | tee logs/encoder-0.log
+          MTL_DEBUG_LAYER=1 DM_RES_CHECK=1 DM_NVN_ENC_THREAD=1 dm/gfx/tests/t_cube_copy 2>&1 | tee logs/encoder-1.log
+          # Catch any earlier submission error that a later begin reset in the
+          # production per-submission error flag, including the no-drain pair.
+          # The default-off baseline intentionally emits the existing exact
+          # zero-cube mismatch diagnostic once. Do not suppress any other RED.
+          expected='[RED] texture type mismatch: shader declares a cube, texture is 2D (texture ID 123); the zero cube is bound'
+          test "$(grep -Fc "$expected" logs/default-off.log)" = 1
+          sed '/\[RED\] texture type mismatch: shader declares a cube, texture is 2D (texture ID 123); the zero cube is bound$/d' logs/default-off.log > logs/default-off-unexpected.log
+          if grep -Ei '\[RED\]|FAIL:|validation.*error|failed assertion' logs/default-off-unexpected.log logs/encoder-0.log logs/encoder-1.log; then
+            echo '::error::GPU or residency validation failure in synthetic fixture logs'
+            exit 1
+          fi
+          echo '### Synthetic GPU fixture: executed (no private inputs)' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This does not establish game-rendering correctness.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cached-cube-synthetic-gpu-logs
+          path: logs
+          retention-days: 7
