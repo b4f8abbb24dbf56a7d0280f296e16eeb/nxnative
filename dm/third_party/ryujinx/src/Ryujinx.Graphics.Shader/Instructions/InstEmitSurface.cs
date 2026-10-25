@@ -19,6 +19,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitSuatom(
                 context,
                 op.Dim,
+                op.Clamp,
                 op.Op,
                 op.Size,
                 0,
@@ -38,6 +39,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitSuatom(
                 context,
                 op.Dim,
+                op.Clamp,
                 op.Op,
                 op.Size,
                 op.TidB,
@@ -57,6 +59,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitSuatom(
                 context,
                 op.Dim,
+                op.Clamp,
                 op.Op,
                 op.Size,
                 0,
@@ -66,7 +69,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 op.Dest,
                 op.Ba,
                 isBindless: true,
-                compareAndSwap: false);
+                compareAndSwap: false,
+                hasPredicateResult: op.DestPred != RegisterConsts.PredicateTrueIndex);
         }
 
         public static void SuatomCasB(EmitterContext context)
@@ -76,6 +80,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitSuatom(
                 context,
                 op.Dim,
+                op.Clamp,
                 0,
                 op.Size,
                 0,
@@ -95,6 +100,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitSuatom(
                 context,
                 op.Dim,
+                op.Clamp,
                 0,
                 op.Size,
                 op.TidB,
@@ -139,14 +145,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             InstSuredB op = context.GetOp<InstSuredB>();
 
-            EmitSured(context, op.Dim, op.Op, op.Size, 0, op.SrcA, op.Dest, op.SrcC, op.Ba, isBindless: true);
+            EmitSured(context, op.Dim, op.Clamp, op.Op, op.Size, 0, op.SrcA, op.Dest, op.SrcC, op.Ba, isBindless: true);
         }
 
         public static void Sured(EmitterContext context)
         {
             InstSured op = context.GetOp<InstSured>();
 
-            EmitSured(context, op.Dim, op.Op, op.Size, op.TidB, op.SrcA, op.Dest, 0, op.Ba, isBindless: false);
+            EmitSured(context, op.Dim, op.Clamp, op.Op, op.Size, op.TidB, op.SrcA, op.Dest, 0, op.Ba, isBindless: false);
         }
 
         public static void SustDB(EmitterContext context)
@@ -180,6 +186,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         private static void EmitSuatom(
             EmitterContext context,
             SuDim dimensions,
+            Clamp clamp,
             SuatomOp atomicOp,
             SuatomSize size,
             int imm,
@@ -189,7 +196,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int dest,
             bool byteAddress,
             bool isBindless,
-            bool compareAndSwap)
+            bool compareAndSwap,
+            bool hasPredicateResult = false)
         {
             SamplerType type = ConvertSamplerType(dimensions);
 
@@ -271,7 +279,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             Operand[] sources = sourcesList.ToArray();
 
-            TextureFlags flags = compareAndSwap ? TextureFlags.CAS : GetAtomicOpFlags(atomicOp);
+            TextureFlags flags = (compareAndSwap ? TextureFlags.CAS : GetAtomicOpFlags(atomicOp)) | (TextureFlags)((int)clamp << 20);
+            if (dest == RegisterConsts.RegisterZeroIndex && !compareAndSwap && !hasPredicateResult)
+            {
+                flags |= TextureFlags.AtomicDiscardResult;
+            }
 
             if (isBindless)
             {
@@ -463,6 +475,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         private static void EmitSured(
             EmitterContext context,
             SuDim dimensions,
+            Clamp clamp,
             RedOp atomicOp,
             SuatomSize size,
             int imm,
@@ -545,7 +558,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             Operand[] sources = sourcesList.ToArray();
 
-            TextureFlags flags = GetAtomicOpFlags((SuatomOp)atomicOp);
+            TextureFlags flags = GetAtomicOpFlags((SuatomOp)atomicOp) |
+                (TextureFlags)((int)clamp << 20) | TextureFlags.AtomicDiscardResult;
 
             if (isBindless)
             {
