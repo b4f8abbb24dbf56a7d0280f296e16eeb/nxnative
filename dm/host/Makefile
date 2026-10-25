@@ -15,6 +15,20 @@ endif
 endif
 GAME_H = gen/$(GAME)/game_profile.h
 CFLAGS=-O1 -g -Wall -Wno-unused-function
+# Deliberate build AND runtime opt-in. This never changes a game profile.
+EXPERIMENTAL_SHARED_MEMORY ?= 0
+ifeq ($(EXPERIMENTAL_SHARED_MEMORY),1)
+override CFLAGS += -DDM_EXPERIMENTAL_SHARED_MEMORY=1
+else ifneq ($(EXPERIMENTAL_SHARED_MEMORY),0)
+$(error EXPERIMENTAL_SHARED_MEMORY must be 0 or 1)
+endif
+EXPERIMENT_STAMP = gen/shared-memory-experiment.stamp
+$(EXPERIMENT_STAMP): FORCE
+	@mkdir -p gen; echo $(EXPERIMENTAL_SHARED_MEMORY) | cmp -s - $@ || echo $(EXPERIMENTAL_SHARED_MEMORY) > $@
+ifneq ($(shell cat $(EXPERIMENT_STAMP) 2>/dev/null),$(EXPERIMENTAL_SHARED_MEMORY))
+dmhost: FORCE
+endif
+
 # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
 SRC=main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m entry.S
 # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
@@ -50,7 +64,7 @@ endif
 endif
 .PHONY: FORCE
 FORCE:
-dmhost: $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB)
+dmhost: guest_mutex_signatures.inc guest_thread_binding.h guest_thread_imports.h guest_thread_imports.generated.inc guest_thread_abi.h guest_thread_signatures.inc $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h hle_memory_experiment.h hle_memory_runtime.h hle_standard_allocator_adapter.h hle_vamm_adapter.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(EXPERIMENT_STAMP) $(VPX_LIB)
 	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
 clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx build; dmhost_* and *.dSYM beside them, as in .gitignore)
 	rm -rf gen dmhost dmhost_* *.dSYM
