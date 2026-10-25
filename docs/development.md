@@ -8,7 +8,7 @@ The upstream bitmap-backed memory transaction and gated native reservation integ
 
 | Part | State |
 |---|---|
-| Rewriter (`dm/tools/patch_nso.py`) | Runs unchanged on every module of every supported game. Per-build cuts are keyed by the module's build ID, in the profile's `patches.py` (a game's own modules) or `dm/tools/sdk_patches.py` (Nintendo's `sdk` modules) |
+| Rewriter (`dm/tools/patch_nso.py`) | Runs unchanged on every module of every supported game. Per-build cuts are keyed by the module's build ID, in the profile's `patches.py` (a game's own modules) or `dm/tools/sdk_patches.py` (Nintendo's `sdk` modules). Profiles can opt verified cuts into [function matching](reference/rewriter.md#function-matched-cuts-for-unregistered-builds) across updates |
 | Host (`dm/host`) | Stands in for the Horizon kernel and the system services the games call: threads and synchronization, memory, file system with transactional saves, HID, audio, movies (VP9 through libvpx, Vorbis sound through stb_vorbis), software keyboard, focus and lifecycle |
 | Graphics (`dm/gfx`) | NVN on Metal. Shaders are extracted by `shader_split.py` from Nintendo's containers and from Unity's `Shader` objects, then translated offline. Mario: 16,266 of 16,268 shaders compile. Engage: 9,268 of 9,269. Games that render with Vulkan (Hades) or OpenGL (Digimon Story Cyber Sleuth) go through layers of their own on Metal (`dm/gfx/vk`, `dm/gfx/gl`) |
 | Audio | Games that carry the SDK's audio renderer (Mario) run it in-process; games that use AudioOut directly (Engage: Wwise) feed it straight. Output goes through Core Audio (default on iOS, `DM_AUDIO=1` on the Mac) |

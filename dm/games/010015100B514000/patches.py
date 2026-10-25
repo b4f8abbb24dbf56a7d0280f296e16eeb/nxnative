@@ -9,8 +9,29 @@ CUTS = {
     # Where this differs from hardware is not known (every allocation size before this block is determined by game code and data); for now every resource heap gets +16 KB.
     (0x1e62fc, 'e00317aa', 'e0124091', 'resource heap size: mov x0,x23 → add x0,x23,#0x4000 (ExpHeap::create size argument +16 KB)'),
   ],
+  # Super Mario Bros. Wonder 1.0.1 (v65536), main f91868b8...: resource heap slack as above.
+  # Ported from v0 by the unique address-masked match of the complete 1,420-byte function
+  # 0x1e603c -> 0x1f65d0; both ExpHeap::create call sites also map to the same callee
+  # (0x4aac38 -> 0x48b134). The original instruction is asserted by the rewriter.
+  'f91868b88f60d3d59009db3389fde314': [
+    (0x1f6890, 'e00317aa', 'e0124091', 'resource heap size: mov x0,x23 -> add x0,x23,#0x4000 (ExpHeap::create size argument +16 KB)'),
+  ],
   # Super Mario Bros. Wonder 1.2.1 (v327680) main: same as above. Location carried over from v0 by dm/tools/nso_fnmap.py (containing function 0x1e603c → 0x1cf6f0 identical after address masking, ExpHeap::create 0x4aac38 → 0x4c4a18)
   'ff773e90972d544eb79406eaa65396d5': [
     (0x1cf9b0, 'e00317aa', 'e0124091', 'resource heap size: mov x0,x23 → add x0,x23,#0x4000 (ExpHeap::create size argument +16 KB)'),
   ],
 }
+
+# Unknown main builds: identify the complete heap setup function and its direct
+# callees/imports, not an address or the short mov/add sequence. Verified against
+# v0 (0x1e603c) and 1.2.1 (0x1cf6f0); a helper changed between them, so each has its
+# own fingerprint. Known builds above keep their exact original-byte assertions.
+MATCH_CUTS = {'main': [{
+  'name': 'resource heap slack',
+  'size': 1420,
+  'fingerprints': [
+    '8062801c559542f56d41eda82685f85f0302933458a57fca074e9b3a3a475102',
+    '09233b021587d058cf645d301d58d07e3dc2bdbac1737b874bb7a0ba914725ed',
+  ],
+  'cuts': [(0x2c0, 'e00317aa', 'e0124091', 'resource heap size: mov x0,x23 -> add x0,x23,#0x4000 (ExpHeap::create size argument +16 KB)')],
+}]}

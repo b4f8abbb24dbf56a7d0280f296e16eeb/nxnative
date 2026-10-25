@@ -1,7 +1,7 @@
 # Tests that need no game files, keys or GPU. GitHub's macOS runners are virtual Macs without Metal 4 (issue #112), so the tests that go through mtl_init
 # (t_nvn, t_mip_extent, t_rt_range and the rest of dm/gfx/tests' run list) stay local: run `make -C dm/gfx/tests GAME=<id> run` on an Apple-silicon Mac.
 # `profile_guess.py --check` stays local too: it compares the guesses with the extractions of the games (it needs their files).
-name: Provider-page capability exact-head ARM64 validation
+name: Sparse core accounting and recommit exact-head ARM64 validation
 
 on:
   push:
@@ -34,13 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
-          test "$(git rev-parse HEAD^{tree})" = 8ce299233914c75642e8998f1d29bf4e129de674
+          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
+          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -83,13 +83,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
-          test "$(git rev-parse HEAD^{tree})" = 8ce299233914c75642e8998f1d29bf4e129de674
+          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
+          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -126,13 +126,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
-          test "$(git rev-parse HEAD^{tree})" = 8ce299233914c75642e8998f1d29bf4e129de674
+          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
+          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -178,13 +178,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
-          test "$(git rev-parse HEAD^{tree})" = 8ce299233914c75642e8998f1d29bf4e129de674
+          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
+          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -202,7 +202,7 @@ jobs:
           retention-days: 7
 
   memory-matrix:
-    name: Provider pages and SDK-memory ARM64 (${{ matrix.mode }})
+    name: Sparse core and SDK-memory ARM64 (${{ matrix.mode }})
     runs-on: macos-26
     timeout-minutes: 25
     strategy:
@@ -214,13 +214,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          ref: 346e7b6f49ddf783b429af0ed22b4f934943d274
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
-          test "$(git rev-parse HEAD^{tree})" = 8ce299233914c75642e8998f1d29bf4e129de674
+          test "$(git rev-parse HEAD)" = 346e7b6f49ddf783b429af0ed22b4f934943d274
+          test "$(git rev-parse HEAD^{tree})" = b6662974f1b985eb0042236a6534996142470402
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -373,7 +373,7 @@ jobs:
         run: |
           make -C dm/host/tests CC=clang B=build/ci-provider-page-thread \
             standard-allocator-provider-tsan 2>&1 | tee logs/provider-page-thread.log
-      - name: Check out reviewed CI-only independent provider harness
+      - name: Check out reviewed CI-only sparse-core harnesses
         if: ${{ !cancelled() }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -381,11 +381,11 @@ jobs:
           path: .ci-provider-fixture
           sparse-checkout: .github/fixtures
           persist-credentials: false
-      - name: Independent direct-lease model and unchanged core behavior
+      - name: Independent sparse statistics, recommit, candidate oracle and lifetime model
         if: ${{ !cancelled() }}
         run: |
-          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_partial_page_independent.c"
-          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 43e39f1e43ede565e987fbf9ab97bd853cb6fba94a6a906e70e390f2af528b81
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_sparse_core_independent.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 415f50c28b47067e1f02f39c28fe0dd0c3b85356e856ecd77889ff53e910166a
           cd dm/host/tests
           mkdir -p "build/ci-independent-$MODE"
           modes=("$MODE")
@@ -404,9 +404,44 @@ jobs:
                 binary="build/ci-independent-$MODE/$name"
                 clang "${flags[@]}" -o "$binary" "$fixture" ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c 2>&1 | tee "../../../logs/$name-build.log"
                 "$binary" 2>&1 | tee "../../../logs/$name.log"
-                grep -Fq 'independent partial-page model: 1200 randomized transactions, identity, stale reuse, threaded and unsorted borrows, no core opt-in passed' "../../../logs/$name.log"
+                grep -Fq 'independent sparse core: missing-cost, live boundaries, metadata, realloc race and sparse finalize passed' "../../../logs/$name.log"
               done
             done
+          done
+      - name: Check out frozen provider-only baseline for disabled differential
+        if: ${{ !cancelled() }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          path: .ci-provider-baseline
+          sparse-checkout: dm/host
+          persist-credentials: false
+      - name: Disabled capability remains byte-identical for 900 operations
+        if: ${{ !cancelled() }}
+        run: |
+          baseline="$GITHUB_WORKSPACE/.ci-provider-baseline"
+          test "$(git -C "$baseline" rev-parse HEAD)" = 4bda16e4a9e5ddfc8fd0a3f08300a76f21c380d8
+          test "$(git -C "$baseline" rev-parse HEAD^{tree})" = 8ce299233914c75642e8998f1d29bf4e129de674
+          fixture="$GITHUB_WORKSPACE/.ci-provider-fixture/.github/fixtures/t_disabled_differential.c"
+          test "$(shasum -a 256 "$fixture" | awk '{print $1}')" = 3bcd825088bac7a1ff5dc749efa6e241953a62cecd0ab30b1ff7931917159583
+          mkdir -p "dm/host/tests/build/ci-disabled-$MODE"
+          modes=("$MODE")
+          if [ "$MODE" = normal ]; then modes+=(combined); fi
+          for sanitizer in "${modes[@]}"; do
+            flags=(-std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread)
+            if [ "$sanitizer" = combined ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer)
+            elif [ "$sanitizer" != normal ]; then flags+=("-fsanitize=$sanitizer" -fno-omit-frame-pointer); fi
+            for version in baseline current; do
+              src="$GITHUB_WORKSPACE"
+              if [ "$version" = baseline ]; then src="$baseline"; fi
+              binary="dm/host/tests/build/ci-disabled-$MODE/$sanitizer-$version"
+              clang "${flags[@]}" -I"$src/dm/host" "-DTEST_FIXTURE=\"$src/dm/host/tests/t_standard_allocator_core.c\"" \
+                -o "$binary" "$fixture" "$src/dm/host/hle_standard_allocator_core.c" 2>&1 | tee "logs/disabled-$sanitizer-$version-build.log"
+              "$binary" > "logs/disabled-$sanitizer-$version.log"
+              test "$(awk 'END {print NR}' "logs/disabled-$sanitizer-$version.log")" = 900
+            done
+            cmp "logs/disabled-$sanitizer-baseline.log" "logs/disabled-$sanitizer-current.log"
+            echo "disabled capability differential: 900 operations byte-identical ($sanitizer)" | tee "logs/disabled-$sanitizer-result.log"
           done
       - name: Upload exact-head ARM64 evidence
         if: always()

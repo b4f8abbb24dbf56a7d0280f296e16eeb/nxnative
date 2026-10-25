@@ -8,6 +8,18 @@ endif
 endif
 GAME_DIR = ../../games/$(GAME)
 GAME_H = ../../host/gen/$(GAME)/game_profile.h
+
+# Portable admission contract only; native Metal binding remains an Apple test.
+.PHONY: imga-layout imga-layout-sanitize
+imga-layout: t_imga_layout
+	./t_imga_layout
+t_imga_layout: t_imga_layout.c ../nvn/nvn_imga_layout.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+imga-layout-sanitize: t_imga_layout_sanitize
+	./t_imga_layout_sanitize
+t_imga_layout_sanitize: t_imga_layout.c ../nvn/nvn_imga_layout.h
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $<
+
 CFLAGS=-O1 -g -Wall -Wno-unused-function -I../nvn/include -I$(dir $(GAME_H))
 GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m)))
 GFX_H=$(wildcard ../nvn/*.h ../nvn/*.inc ../nvn/include/*.h ../tex/*.h) $(GAME_H)

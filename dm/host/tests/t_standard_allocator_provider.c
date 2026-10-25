@@ -92,6 +92,10 @@ typedef struct {
     void *reused_pointer;
     size_t page_calls;
     int fail_pages, borrow_change, borrow_after_commit, check_changing;
+    uintptr_t borrow_after_commit_source;
+    int protect_after_commit;
+    uintptr_t last_page_base;
+    size_t last_page_size;
     dm_sa_provider page_provider;
     dm_sa_span changing_span;
 } owner;
@@ -166,6 +170,7 @@ static uint32_t free_original(void *context, uintptr_t base) {
 static dm_sa_result change_original(void *context, uintptr_t address, size_t size, int commit) {
     owner *o = context; assert(guest_active);
     pthread_mutex_lock(&o->mutex); ++o->page_calls;
+    o->last_page_base = address; o->last_page_size = size;
     assert(address >= o->base);
     size_t i = (address - o->base) / SLOT_SIZE, offset = (address - o->base) % SLOT_SIZE;
     assert(i < SLOT_COUNT && offset <= o->sizes[i] && size <= o->sizes[i] - offset);
@@ -192,7 +197,14 @@ static dm_sa_result change_original(void *context, uintptr_t address, size_t siz
     }
     uint64_t rc = pages(commit, address, size);
     if (!rc && commit && o->borrow_after_commit) {
-        o->borrow_after_commit = 0; borrow(o, address);
+        o->borrow_after_commit = 0;
+        uintptr_t source = o->borrow_after_commit_source ? o->borrow_after_commit_source : address;
+        o->borrow_after_commit_source = 0;
+        borrow(o, source);
+        if (o->protect_after_commit) {
+            o->protect_after_commit = 0;
+            assert(!mprotect((void *)(source & ~(uintptr_t)(host_page() - 1)), host_page(), PROT_NONE));
+        }
     }
     pthread_mutex_unlock(&o->mutex);
     return !rc ? DM_SA_OK : rc == 0x10801 ? DM_SA_NO_MEMORY :
@@ -240,6 +252,282 @@ static dm_sa_page_run get_run(dm_sa_provider *p, const dm_sa_span *span,
     assert(p->pages.query_run(p->context, span, offset, maximum, &run) == DM_SA_OK);
     assert(run.size && run.size <= maximum);
     return run;
+}
+// Single-threaded sparse-core fixture interception. Capture exact provider
+// handles; never infer a reservation from bitmap holes or touch live granules.
+static dm_sa_result (*captured_acquire)(void *, size_t, size_t, dm_sa_span *);
+static dm_sa_result (*captured_run)(void *, const dm_sa_span *, size_t, size_t, dm_sa_page_run *);
+static dm_sa_result (*captured_budget)(void *, size_t *);
+static dm_sa_span captured_lease;
+static int fail_run_query, fail_budget_query, short_run_queries;
+static dm_sa_result capture_acquire(void *context, size_t size, size_t alignment, dm_sa_span *out) {
+    dm_sa_result r = captured_acquire(context, size, alignment, out);
+    if (r == DM_SA_OK) captured_lease = *out;
+    return r;
+}
+static dm_sa_result capture_run(void *context, const dm_sa_span *span,
+                                 size_t offset, size_t maximum, dm_sa_page_run *out) {
+    if (fail_run_query) { fail_run_query = 0; return DM_SA_PROVIDER_FAILED; }
+    if (short_run_queries && maximum > 17) maximum = 17;
+    return captured_run(context, span, offset, maximum, out);
+}
+static dm_sa_result capture_budget(void *context, size_t *out) {
+    if (fail_budget_query) { fail_budget_query = 0; return DM_SA_PROVIDER_FAILED; }
+    return captured_budget(context, out);
+}
+static void test_sparse_core_stats(owner *o, dm_sa_sdk_owner callbacks) {
+    callbacks.change_pages = change_original;
+    dm_sa_sdk_provider *provider = NULL;
+    assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
+    dm_sa_provider p = dm_sa_sdk_provider_interface(provider);
+    captured_acquire = p.acquire; captured_run = p.pages.query_run; captured_budget = p.pages.budget;
+    dm_sa_config config = {.provider = p, .capacity = POOL, .pool_size = POOL};
+    config.provider.acquire = capture_acquire;
+    config.provider.pages.query_run = capture_run;
+    config.provider.pages.budget = capture_budget;
+    dm_sa_allocator *a = NULL;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    void *anchor = NULL;
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x57, 32);
+    dm_sa_span lease = captured_lease;
+    p.begin(p.context);
+    assert(p.pages.change(p.context, &lease, PAGE, 8 * PAGE, 0) == DM_SA_OK);
+    p.end(p.context);
+    assert(!call(1, 0, 0x1e00000 - 12 * PAGE, 0)); // 8 backed + 4 headroom pages
+    dm_sa_stats st = stats(a);
+    assert(st.backing_bytes == POOL && st.committed_bytes == 8 * PAGE && st.allocated_bytes == 32);
+    assert(st.total_free == 12 * PAGE - 32 && st.largest_free == 11 * PAGE);
+    short_run_queries = 1;
+    dm_sa_stats short_stats = stats(a);
+    short_run_queries = 0;
+    assert(short_stats.committed_bytes == st.committed_bytes && short_stats.total_free == st.total_free &&
+           short_stats.largest_free == st.largest_free);
+    // Query failures publish none of a partially accumulated statistics result.
+    for (int i = 0; i < 3; ++i) {
+        dm_sa_stats actual, sentinel;
+        memset(&sentinel, 0xa5, sizeof sentinel); actual = sentinel;
+        if (i == 0) fail_run_query = 1;
+        else if (i == 1) fail_budget_query = 1;
+        else o->fail_query = 1;
+        assert(dm_sa_get_stats(a, &actual) == DM_SA_PROVIDER_FAILED);
+        assert(!memcmp(&actual, &sentinel, sizeof actual));
+    }
+    assert(!call(1, 0, 0x1e00000 - 8 * PAGE, 0));
+    st = stats(a);
+    assert(st.total_free == 8 * PAGE - 32 && st.largest_free == 7 * PAGE);
+    borrow(o, (uintptr_t)anchor + 9 * PAGE);
+    st = stats(a);
+    assert(st.total_free == 7 * PAGE - 32 && st.largest_free == 6 * PAGE);
+    assert(dm_sa_finalize(a) == DM_SA_BUSY && !stats(a).closed);
+    size_t usable = 0; assert(dm_sa_get_size(a, anchor, &usable) == DM_SA_OK && usable == 32);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x57);
+    return_borrow(o);
+    // Finalize can drain sparse leases, and a returning owner failure keeps the
+    // closed lease's sparse commitment visible until an exact retry succeeds.
+    o->fail_release = 1;
+    assert(dm_sa_finalize(a) == DM_SA_PROVIDER_FAILED);
+    st = stats(a);
+    assert(st.closed && st.backing_bytes == POOL && st.committed_bytes == 8 * PAGE &&
+           !st.allocated_bytes && !st.allocation_count && !st.total_free && !st.largest_free);
+    assert(dm_sa_destroy(a) == DM_SA_OK && !owned_count(o));
+    assert(!call(1, 0, 0, 0));
+
+    // Shared headroom is counted once even when both new reservations and
+    // recommittable holes exist; the capacity bound still charges full leases.
+    config.capacity = 2 * POOL;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK);
+    lease = captured_lease;
+    p.begin(p.context);
+    assert(p.pages.change(p.context, &lease, PAGE, 8 * PAGE, 0) == DM_SA_OK);
+    p.end(p.context);
+    assert(!call(1, 0, 0x1e00000 - 12 * PAGE, 0));
+    st = stats(a);
+    assert(st.total_free == 12 * PAGE - 32 && st.largest_free == 11 * PAGE);
+    o->fail_release = 1;
+    assert(dm_sa_free(a, anchor) == DM_SA_OK);
+    st = stats(a);
+    assert(!st.allocation_count && st.backing_bytes == POOL && st.committed_bytes == 8 * PAGE);
+    assert(dm_sa_trim(a) == DM_SA_OK && !stats(a).backing_bytes && !stats(a).committed_bytes);
+    assert(dm_sa_destroy(a) == DM_SA_OK);
+    assert(!call(1, 0, 0, 0));
+    assert(!owned_count(o) && !alias_mapped());
+    assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
+}
+static size_t sparse_metadata_calls, sparse_metadata_failure;
+static void *sparse_metadata_alloc(void *context, size_t size) {
+    (void)context;
+    if (++sparse_metadata_calls == sparse_metadata_failure) return NULL;
+    return malloc(size);
+}
+static void sparse_metadata_free(void *context, void *pointer) { (void)context; free(pointer); }
+static void decommit_free_tail(dm_sa_provider *p, const dm_sa_span *lease, size_t offset) {
+    p->begin(p->context);
+    assert(p->pages.change(p->context, lease, offset, lease->size - offset, 0) == DM_SA_OK);
+    p->end(p->context);
+}
+static void test_sparse_core_recommit(owner *o, dm_sa_sdk_owner callbacks) {
+    callbacks.change_pages = change_original;
+    dm_sa_sdk_provider *provider = NULL;
+    assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
+    dm_sa_provider p = dm_sa_sdk_provider_interface(provider);
+    captured_acquire = p.acquire;
+    dm_sa_config config = {.provider = p, .capacity = POOL, .pool_size = POOL,
+        .metadata_alloc = sparse_metadata_alloc, .metadata_free = sparse_metadata_free};
+    config.provider.acquire = capture_acquire;
+    dm_sa_allocator *a; void *anchor, *out;
+
+    // Both split nodes must exist before a page callback can change backing.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x37, 32);
+    dm_sa_span lease = captured_lease;
+    decommit_free_tail(&p, &lease, PAGE);
+    dm_sa_stats before = stats(a);
+    size_t page_calls = o->page_calls;
+    for (unsigned fail = 1; fail <= 2; ++fail) {
+        sparse_metadata_failure = sparse_metadata_calls + fail; out = (void *)1;
+        assert(dm_sa_allocate(a, PAGE, PAGE, &out) == DM_SA_NO_MEMORY && out == (void *)1);
+        dm_sa_stats after = stats(a);
+        assert(after.metadata_bytes == before.metadata_bytes && after.committed_bytes == PAGE &&
+               after.allocation_count == 1 && after.allocated_bytes == 32 && o->page_calls == page_calls);
+    }
+    sparse_metadata_failure = 0;
+    out = (void *)1; o->fail_pages = 1;
+    assert(dm_sa_allocate(a, PAGE, PAGE, &out) == DM_SA_PROVIDER_FAILED && out == (void *)1);
+    assert(stats(a).committed_bytes == PAGE && stats(a).metadata_bytes == before.metadata_bytes);
+    assert(dm_sa_allocate(a, PAGE, PAGE, &out) == DM_SA_OK && out == (unsigned char *)anchor + PAGE);
+    for (size_t i = 0; i < PAGE; ++i) assert(!((unsigned char *)out)[i]);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x37);
+    assert(stats(a).committed_bytes == 2 * PAGE);
+    assert(dm_sa_free(a, out) == DM_SA_OK && dm_sa_free(a, anchor) == DM_SA_OK);
+    assert(dm_sa_destroy(a) == DM_SA_OK);
+
+    // A partial committed boundary is preserved and costs nothing to recommit.
+    // The request spans three pages but only two missing pages fit the budget.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x69, 32); lease = captured_lease;
+    decommit_free_tail(&p, &lease, PAGE);
+    // Keep the heap host-page aligned; consume the remaining logical page via
+    // alias backing so this exact two-page budget also works on 16 KiB hosts.
+    assert(!call(1, 0, 0x1e00000 - 4 * PAGE, 0));
+    uintptr_t budget_page = o->base + 0x1400000;
+    assert(!pages(1, budget_page, PAGE));
+    assert(dm_sa_allocate(a, 2 * PAGE + 16, 16, &out) == DM_SA_OK && out == (unsigned char *)anchor + 32);
+    assert(stats(a).committed_bytes == 3 * PAGE);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x69);
+    for (size_t i = 0; i < 2 * PAGE + 16; ++i) assert(!((unsigned char *)out)[i]);
+    page_calls = o->page_calls;
+    size_t usable;
+    assert(dm_sa_shrink(a, out, 32, &usable) == DM_SA_OK && usable == 32);
+    assert(o->page_calls == page_calls && stats(a).committed_bytes == 3 * PAGE);
+    assert(dm_sa_free(a, out) == DM_SA_OK && dm_sa_free(a, anchor) == DM_SA_OK);
+    assert(dm_sa_destroy(a) == DM_SA_OK && !pages(0, budget_page, PAGE) && !call(1, 0, 0, 0));
+
+    // Zero budget must still find a later committed aligned subrun behind an
+    // unaffordable hole, rather than rejecting the entire coalesced free block.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK); lease = captured_lease;
+    p.begin(p.context);
+    assert(p.pages.change(p.context, &lease, PAGE, 8 * PAGE, 0) == DM_SA_OK);
+    p.end(p.context);
+    assert(!call(1, 0, 0x1e00000 - 8 * PAGE, 0));
+    page_calls = o->page_calls;
+    assert(dm_sa_allocate(a, 2 * PAGE, PAGE, &out) == DM_SA_OK && out == (unsigned char *)anchor + 9 * PAGE);
+    assert(o->page_calls == page_calls && stats(a).committed_bytes == 8 * PAGE);
+    assert(dm_sa_free(a, out) == DM_SA_OK && dm_sa_free(a, anchor) == DM_SA_OK);
+    assert(dm_sa_destroy(a) == DM_SA_OK && !call(1, 0, 0, 0));
+
+    // In-place growth commits only the free tail, then validates BOTH that tail
+    // and the old live prefix after an owner callback can suspend the guard.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, PAGE, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x4d, PAGE); lease = captured_lease;
+    decommit_free_tail(&p, &lease, PAGE);
+    o->borrow_after_commit = 1; o->borrow_after_commit_source = (uintptr_t)anchor;
+    o->protect_after_commit = 1; out = (void *)1;
+    assert(dm_sa_reallocate(a, anchor, 3 * PAGE, &out) == DM_SA_BUSY && out == (void *)1);
+    assert(dm_sa_get_size(a, anchor, &usable) == DM_SA_OK && usable == PAGE);
+    assert(stats(a).allocated_bytes == PAGE && stats(a).committed_bytes == 3 * PAGE);
+    assert(!mprotect((void *)((uintptr_t)anchor & ~(uintptr_t)(host_page() - 1)), host_page(), PROT_READ | PROT_WRITE));
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)anchor)[i] == 0x4d);
+    return_borrow(o);
+    assert(dm_sa_reallocate(a, anchor, 3 * PAGE, &out) == DM_SA_OK && out == anchor);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)out)[i] == 0x4d);
+    for (size_t i = PAGE; i < 3 * PAGE; ++i) assert(!((unsigned char *)out)[i]);
+    assert(dm_sa_free(a, out) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+
+    // Borrow after successful recommit cannot publish an allocation. Its pages
+    // stay owned and charged, with no compensating decommit of rounded bytes.
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, PAGE, 16, &anchor) == DM_SA_OK); lease = captured_lease;
+    decommit_free_tail(&p, &lease, PAGE);
+    o->borrow_after_commit = 1; out = (void *)1;
+    assert(dm_sa_allocate(a, PAGE, PAGE, &out) == DM_SA_BUSY && out == (void *)1);
+    assert(stats(a).allocation_count == 1 && stats(a).allocated_bytes == PAGE && stats(a).committed_bytes == 2 * PAGE);
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && stats(a).backing_bytes == POOL);
+    return_borrow(o);
+    assert(dm_sa_trim(a) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+    assert(!owned_count(o) && !alias_mapped());
+    assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
+}
+static void test_capability_granularity(owner *o, dm_sa_sdk_owner callbacks) {
+    enum { GRANULE = 4 * PAGE };
+    callbacks.change_pages = change_original;
+    dm_sa_sdk_provider *provider = NULL;
+    assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
+    dm_sa_provider p = dm_sa_sdk_provider_interface(provider);
+    captured_acquire = p.acquire;
+    dm_sa_config config = {.provider = p, .capacity = POOL, .pool_size = POOL};
+    config.provider.granule = config.provider.pages.granule = GRANULE;
+    config.provider.acquire = capture_acquire;
+    dm_sa_allocator *a; void *anchor, *out = (void *)1;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, PAGE, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x68, PAGE);
+    dm_sa_span lease = captured_lease;
+    dm_sa_stats before = stats(a), sentinel, actual;
+    p.begin(p.context);
+    // Deliberately violate the advertised 16 KiB COMMITTED unit using the
+    // lower-level 4 KiB fixture interface, but never touch a live payload page.
+    assert(p.pages.change(p.context, &lease, PAGE, PAGE, 0) == DM_SA_OK);
+    p.end(p.context);
+    size_t calls = o->page_calls, mapped = alias_mapped(), usable;
+    memset(&sentinel, 0xa5, sizeof sentinel); actual = sentinel;
+    assert(dm_sa_get_stats(a, &actual) == DM_SA_PROVIDER_FAILED);
+    assert(!memcmp(&actual, &sentinel, sizeof actual));
+    assert(dm_sa_allocate(a, 2 * PAGE, 16, &out) == DM_SA_PROVIDER_FAILED && out == (void *)1);
+    assert(dm_sa_reallocate(a, anchor, 2 * PAGE, &out) == DM_SA_PROVIDER_FAILED && out == (void *)1);
+    assert(dm_sa_get_size(a, anchor, &usable) == DM_SA_OK && usable == PAGE);
+    assert(o->page_calls == calls && alias_mapped() == mapped && o->sizes[0] == POOL);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)anchor)[i] == 0x68);
+    p.begin(p.context);
+    assert(p.pages.change(p.context, &lease, PAGE, PAGE, 1) == DM_SA_OK);
+    p.end(p.context);
+    actual = stats(a);
+    assert(actual.committed_bytes == before.committed_bytes && actual.backing_bytes == before.backing_bytes &&
+           actual.allocated_bytes == before.allocated_bytes && actual.metadata_bytes == before.metadata_bytes);
+
+    // BORROWED can be finer: the first committed granule has a borrowed 4 KiB
+    // neighbor outside the candidate. Rounded recommit must preserve it while
+    // mapping one whole missing granule, using only that granule's budget.
+    decommit_free_tail(&p, &lease, GRANULE);
+    assert(!call(1, 0, 0x1e00000 - 2 * GRANULE, 0));
+    borrow(o, (uintptr_t)anchor); calls = o->page_calls;
+    assert(dm_sa_allocate(a, GRANULE + 16, 16, &out) == DM_SA_OK && out == (unsigned char *)anchor + PAGE);
+    assert(o->page_calls == calls + 1 && o->last_page_base == (uintptr_t)anchor && o->last_page_size == 2 * GRANULE);
+    assert(stats(a).committed_bytes == 2 * GRANULE);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)o->stack)[i] == 0x68);
+    for (size_t i = 0; i < GRANULE + 16; ++i) assert(!((unsigned char *)out)[i]);
+    assert(dm_sa_free(a, anchor) == DM_SA_BUSY);
+    assert(dm_sa_free(a, out) == DM_SA_OK);
+    return_borrow(o);
+    for (size_t i = 0; i < PAGE; ++i) assert(((unsigned char *)anchor)[i] == 0x68);
+    assert(dm_sa_free(a, anchor) == DM_SA_OK && dm_sa_destroy(a) == DM_SA_OK);
+    assert(!call(1, 0, 0, 0) && !owned_count(o) && !alias_mapped());
+    assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
 }
 static void test_partial_pages(owner *o, dm_sa_sdk_owner callbacks) {
     // Direct lease operations only. Production runtime and allocator Shrink,
@@ -571,6 +859,9 @@ int main(void) {
     assert(!owned_count(&o) && !alias_mapped());
     assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
     test_partial_pages(&o, callbacks);
+    test_sparse_core_stats(&o, callbacks);
+    test_sparse_core_recommit(&o, callbacks);
+    test_capability_granularity(&o, callbacks);
     assert(!pthread_mutex_destroy(&o.mutex));
     alarm(0);
     puts("standard allocator SDK provider: real-SVC ownership, rollback, races, budget and shared-core tests passed");
