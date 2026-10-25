@@ -26,6 +26,24 @@ experimental binary. The separately reviewed `za-base-sdk-v1` value selects
 SDK-only mode; any other requested value fails explicitly rather than
 silently falling back. iOS packaging does not opt in automatically.
 
+Partial-page reclamation is a separate, **default-off runtime flag**:
+
+```sh
+DM_EXPERIMENTAL_SHARED_MEMORY=za-base-v1 DM_MEMORY_RECLAIM=1 \
+  dm/host/dmhost /path/to/rewritten-base main sdk
+```
+
+An absent `DM_MEMORY_RECLAIM` or exact `0` preserves whole-lease backing; exact
+`1` selects the page-capable native factory only after the full-mode contract
+passes. Any other value, including an empty string, is invalid. `1` with an
+inactive experiment or SDK-only mode fails clearly rather than becoming a
+silent no-op. The flag is read once at startup, not a live ownership switch.
+It is reusable for future **separately reviewed** full-mode contracts, but it
+does not admit another title, version, module set or SDK: only the Z-A base
+identities below are currently eligible. All existing cuts and metadata bounds
+remain unchanged. Both the experimental build and exact runtime request are
+still required; a failed check stops before guest entry.
+
 Only these **full 32-byte NSO build IDs** are eligible:
 
 | Module | Reviewed identity |
@@ -100,7 +118,13 @@ high-alignment request fits.
 
 Managed Dump still reports nominal capacity, actual leased backing, live
 bytes/blocks, span count, real free/largest budgets, native metadata and closed
-state. Fatal
+state. Existing Dump/event snapshots append `reserved` (the outstanding lease
+extent, also reported as `backing`) and authoritative `committed` bytes. The
+one-time activation policy line names the contract, full/SDK-only mode and
+reclaim on/off. A successful flag request is not evidence that a game has
+actually shrunk or trimmed any allocation; compare the commitment snapshots
+with the exercised operations. Returning pages preserves the virtual reservation
+and does not promise an immediate physical RSS drop. Fatal
 contracts identify the operation/result and explicitly retain ownership. Ordinary
 allocation exhaustion still returns null without SDK fallback.
 

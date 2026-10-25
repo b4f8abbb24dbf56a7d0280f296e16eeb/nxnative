@@ -123,9 +123,10 @@ int dm_memory_experiment_authorized_sdk_only(const struct dm_memory_experiment_a
 #endif
 static void allocator_dump(void *context, const void *self, const dm_sa_stats *s) {
     (void)context;
-    LOG("experimental shared memory Dump self=%p capacity=%zu backing=%zu live=%zu blocks=%zu spans=%zu free=%zu largest=%zu metadata=%zu closed=%d",
+    LOG("experimental shared memory Dump self=%p capacity=%zu backing=%zu live=%zu blocks=%zu spans=%zu free=%zu largest=%zu metadata=%zu closed=%d reserved=%zu committed=%zu",
         self, s->capacity, s->backing_bytes, s->allocated_bytes, s->allocation_count,
-        s->span_count, s->total_free, s->largest_free, s->metadata_bytes, s->closed);
+        s->span_count, s->total_free, s->largest_free, s->metadata_bytes, s->closed,
+        s->backing_bytes, s->committed_bytes);
 }
 static void allocator_event(void *context, const dm_sa_adapter_event *e) {
     (void)context;
@@ -137,11 +138,12 @@ static void allocator_event(void *context, const dm_sa_adapter_event *e) {
         operation, e->self, (unsigned long long)e->generation, e->requested_size,
         e->alignment, e->result, (unsigned long long)e->failure_count);
     if (e->stats_result == DM_SA_OK)
-        LOG("experimental shared memory snapshot self=%p generation=%llu capacity=%zu backing=%zu live=%zu blocks=%zu spans=%zu free=%zu largest=%zu metadata=%zu closed=%d",
+        LOG("experimental shared memory snapshot self=%p generation=%llu capacity=%zu backing=%zu live=%zu blocks=%zu spans=%zu free=%zu largest=%zu metadata=%zu closed=%d reserved=%zu committed=%zu",
             e->self, (unsigned long long)e->generation, e->stats.capacity,
             e->stats.backing_bytes, e->stats.allocated_bytes, e->stats.allocation_count,
             e->stats.span_count, e->stats.total_free, e->stats.largest_free,
-            e->stats.metadata_bytes, e->stats.closed);
+            e->stats.metadata_bytes, e->stats.closed, e->stats.backing_bytes,
+            e->stats.committed_bytes);
     else if (e->kind != DM_SA_EVENT_FINALIZED || e->result != DM_SA_OK)
         LOG("experimental shared memory snapshot unavailable self=%p generation=%llu result=%d",
             e->self, (unsigned long long)e->generation, e->stats_result);
@@ -164,22 +166,39 @@ static void sdk_vamm_fatal(void *context, const char *operation) {
 // private: production reaches it only through exact registry selection/preflight.
 // Default-off builds have no caller; Clang diagnoses even unused static inline functions.
 __attribute__((unused))
-static inline dm_sa_result create_contract_runtime(const startup_contract *c, dm_memory_runtime **out) {
-    if (validate_contract(c)) return DM_SA_INVALID;
+static inline dm_sa_result create_contract_runtime(const startup_contract *c, int reclaim,
+                                                    dm_memory_runtime **out) {
+    if ((reclaim != 0 && reclaim != 1) || validate_contract(c) ||
+        (reclaim && c->mode != FULL_MEMORY)) return DM_SA_INVALID;
+    if (reclaim)
+        return dm_memory_runtime_create_page_capable_with_contract(out, c->max_regions, &c->runtime);
     return c->mode == SDK_MEMORY ?
         dm_memory_runtime_create_vamm_only_with_contract(out, c->max_regions, &c->runtime) :
         dm_memory_runtime_create_with_contract(out, c->max_regions, &c->runtime);
+}
+static int reclaim_request(const char *value) {
+    if (!value || !strcmp(value, "0")) return 0;
+    return !strcmp(value, "1") ? 1 : -1;
 }
 
 int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
     if (diagnostic) *diagnostic = NULL;
     const char *why = NULL;
     const startup_contract *selected = select_contract(request);
+    // Capture once for this startup only; changing the environment later cannot
+    // mutate an active owner's policy or authorize another module closure.
+    int reclaim = reclaim_request(getenv(DM_MEMORY_RECLAIM_ENV));
     int repeated = startup_seen; startup_seen = 1;
     if (repeated) why = "startup/restart is unsupported; start a new host process";
-    else if (!request || !*request || !strcmp(request, "0")) return DM_MEMORY_EXPERIMENT_OFF;
+    else if (reclaim < 0) why = "expected DM_MEMORY_RECLAIM=0 or 1 (absent means off)";
+    else if (!request || !*request || !strcmp(request, "0")) {
+        if (!reclaim) return DM_MEMORY_EXPERIMENT_OFF;
+        why = "DM_MEMORY_RECLAIM=1 requires an admitted full shared-memory experiment";
+    }
     else if (!selected)
         why = "expected DM_EXPERIMENTAL_SHARED_MEMORY=" DM_MEMORY_EXPERIMENT_NAME " or " DM_SDK_MEMORY_EXPERIMENT_NAME;
+    else if (reclaim && selected->mode != FULL_MEMORY)
+        why = "DM_MEMORY_RECLAIM=1 is unsupported in SDK-only memory mode";
 #if !defined(DM_EXPERIMENTAL_SHARED_MEMORY) || !DM_EXPERIMENTAL_SHARED_MEMORY
     else why = "host was built without EXPERIMENTAL_SHARED_MEMORY=1";
 #elif !defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
@@ -193,7 +212,7 @@ int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
         dm_memory_runtime *runtime = NULL;
         dm_sa_adapter_config allocator = {0};
         dm_vamm_adapter_config vamm = {0};
-        if (create_contract_runtime(selected, &runtime) != DM_SA_OK)
+        if (create_contract_runtime(selected, reclaim, &runtime) != DM_SA_OK)
             why = "cannot create native memory owner";
         else if ((sdk_only ? dm_memory_runtime_vamm_config(runtime, &vamm) :
                              dm_memory_runtime_configs(runtime, &vamm, &allocator)) != DM_SA_OK)
@@ -221,6 +240,8 @@ int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
                     LOG("experimental SDK-only memory %s active: exact main+sdk, process lifetime, original StandardAllocator and profile alignment retained; original 12 GiB startup arena remains unchanged and may exceed native alias domain", DM_SDK_MEMORY_EXPERIMENT_NAME);
                 else
                     LOG("experimental shared memory %s active: exact main+sdk, process lifetime, managed Walk rejected", DM_MEMORY_EXPERIMENT_NAME);
+                LOG("experimental memory policy contract=%s mode=%s reclaim=%s",
+                    selected->request, sdk_only ? "sdk-only" : "full", reclaim ? "on" : "off");
                 return DM_MEMORY_EXPERIMENT_ACTIVE;
             }
             LOG("[RED] experimental %s memory relocation transaction rejected (%d)", sdk_only ? "SDK-only" : "shared", result);

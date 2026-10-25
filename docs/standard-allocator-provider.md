@@ -44,12 +44,12 @@ finer and query prefixes may be clipped. It is not merely a minimum callback
 alignment or the host protection-page size. The native capability remains
 4 KiB on both 4 KiB and 16 KiB hosts. Finer existing commitment states are not
 supported by an advertised coarser capability.
-Existing runtime constructors and admitted startup descriptors do **not** supply
-this callback. The [explicit page-capable constructor](shared-memory-runtime.md#explicit-page-capable-construction-not-startup-admission)
-is currently exercised only by synthetic runtime integration fixtures; activation
-gates remain unchanged. Sparse commitment statistics, whole-lease draining,
+Existing runtime constructors do **not** supply this callback. The bounded
+startup policy selects the [explicit page-capable constructor](shared-memory-runtime.md#explicit-page-capable-construction-not-startup-admission)
+only after full-mode preflight and the separate default-off reclaim flag;
+all admission gates remain unchanged. Sparse commitment statistics, whole-lease draining,
 recommit-on-reuse/growth and optional native reclamation are implemented as
-staged core layers below. These policies are not active in production.
+staged core layers below. These policies are not enabled by default.
 
 Queries run without dropping the source guard and never read payload bytes.
 Page changes mark the lease in-flight, drop the guard before the owner callback,
@@ -94,7 +94,7 @@ cost; borrowed runs are barriers. No persistent residency ledger is introduced.
 Query failures leave the entire caller output unchanged.
 
 Page-capable free-space statistics describe budgeted recommit potential, not a
-promise against a competing physical commit after a snapshot. Admitted startup
+promise against a competing physical commit after a snapshot. Flag-off startup
 callbacks stay absent. Synthetic tests create holes through exact captured leases
 in proven wholly free granules, or through the core reclamation policy below.
 

@@ -25,7 +25,7 @@ static void rejected(startup_contract *c, const module_t *modules) {
     dm_memory_runtime *out = (void *)1;
     reset(0);
     assert(preflight_contract(c, modules, 2));
-    assert(create_contract_runtime(c, &out) == DM_SA_INVALID && out == (void *)1);
+    assert(create_contract_runtime(c, 0, &out) == DM_SA_INVALID && out == (void *)1);
     untouched();
 }
 static void malformed(void) {
@@ -99,7 +99,7 @@ static void construction(void) {
         reset(domain == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA);
         assert(!preflight_contract(&c, modules, 2)); untouched();
         dm_memory_runtime *r = NULL;
-        assert(create_contract_runtime(&c, &r) == DM_SA_OK && r);
+        assert(create_contract_runtime(&c, 0, &r) == DM_SA_OK && r);
         assert(queries[2] == 1 && queries[3] == 1 && queries[28] == !domain);
         assert(provider_creates == (mode == FULL_MEMORY) && !changes);
         // Construction is not activation: no permit or guest initializer ran.
@@ -123,14 +123,35 @@ static void construction(void) {
     startup_contract c; startup_module_contract expected[2]; module_t modules[2];
     synthetic(&c, expected, modules); reset(1); fail_provider = 1;
     dm_memory_runtime *out = (void *)1;
-    assert(create_contract_runtime(&c, &out) == DM_SA_NO_MEMORY && out == (void *)1);
+    assert(create_contract_runtime(&c, 0, &out) == DM_SA_NO_MEMORY && out == (void *)1);
     assert(provider_creates == 1 && !provider_destroys && !changes);
     reset(1); ++base;
-    assert(create_contract_runtime(&c, &out) == DM_SA_INVALID && out == (void *)1);
+    assert(create_contract_runtime(&c, 0, &out) == DM_SA_INVALID && out == (void *)1);
     --base; assert(!provider_creates && !changes);
 }
+static void reclaim_selection(void) {
+    assert(reclaim_request(NULL) == 0 && reclaim_request("0") == 0 && reclaim_request("1") == 1);
+    const char *invalid[] = {"", "01", "true", " 1", "1 ", "-1", "2"};
+    for (size_t i = 0; i < sizeof invalid / sizeof *invalid; ++i) assert(reclaim_request(invalid[i]) == -1);
+    for (int mode = FULL_MEMORY; mode <= SDK_MEMORY; ++mode)
+    for (int reclaim = -1; reclaim <= 2; ++reclaim) {
+        startup_contract c; startup_module_contract expected[2]; module_t modules[2];
+        synthetic(&c, expected, modules); c.mode = mode; reset(1);
+        dm_memory_runtime *out = (void *)1;
+        if (reclaim < 0 || reclaim > 1 || (reclaim && mode == SDK_MEMORY)) {
+            assert(create_contract_runtime(&c, reclaim, &out) == DM_SA_INVALID && out == (void *)1);
+            untouched();
+        } else {
+            assert(create_contract_runtime(&c, reclaim, &out) == DM_SA_OK);
+            if (mode == FULL_MEMORY) assert(!!captured_owner.change_pages == reclaim);
+            else assert(!provider_creates);
+            assert(!dm_memory_experiment_authorized(NULL, out));
+            assert(dm_memory_runtime_destroy(out) == DM_SA_OK);
+        }
+    }
+}
 int main(void) {
-    registry(); malformed(); complete_module_set(); construction();
+    registry(); malformed(); complete_module_set(); construction(); reclaim_selection();
     puts("startup contracts: exact registry, malformed/order/identity rejection, raw/legacy construction, mode separation, cleanup: PASS");
     return 0;
 }

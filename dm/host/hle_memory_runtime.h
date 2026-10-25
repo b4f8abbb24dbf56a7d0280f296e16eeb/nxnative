@@ -25,9 +25,9 @@ dm_sa_result dm_memory_runtime_create_with_contract(dm_memory_runtime **out,
     size_t max_regions, const dm_memory_runtime_contract *contract);
 dm_sa_result dm_memory_runtime_create_vamm_only_with_contract(dm_memory_runtime **out,
     size_t max_regions, const dm_memory_runtime_contract *contract);
-// Explicit full-mode construction with native partial-page backing. Currently
-// used only by synthetic integration fixtures: NO admitted startup descriptor
-// selects it. This grants no hook/game authorization. Existing constructors
+// Explicit full-mode construction with native partial-page backing. The bounded
+// startup policy selects it only after its independent full-mode preflight and
+// explicit reclaim flag. This grants no hook/game authorization. Existing constructors
 // remain whole-lease-backed; there is deliberately no SDK-only counterpart.
 dm_sa_result dm_memory_runtime_create_page_capable_with_contract(dm_memory_runtime **out,
     size_t max_regions, const dm_memory_runtime_contract *contract);
