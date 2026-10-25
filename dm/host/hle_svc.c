@@ -249,6 +249,20 @@ static int map_source_backed(uint64_t src, uint64_t size) {
     module_data_query(m, off, &data, &end, &perm);
     return perm == 3 && memory_contains(data, end - data, off, size);
 }
+// Host-created guest threads use the same source eligibility as MapMemory.
+// This is only a preflight: the caller must retain exclusive allocation
+// ownership, and the later SVC still validates and borrows under these locks.
+int dm_guest_map_source_available(const void *source, size_t size) {
+    uintptr_t src = (uintptr_t)source;
+    if (!size || ((src | size) & 0xfff) || size > UINTPTR_MAX - src) return 0;
+    mem_init();
+    pthread_mutex_lock(&g_map_lock);
+    pthread_mutex_lock(&g_phys_mu);
+    int available = !map_source_busy(src, size) && map_source_backed(src, size);
+    pthread_mutex_unlock(&g_phys_mu);
+    pthread_mutex_unlock(&g_map_lock);
+    return available;
+}
 // Overlay borrowed source ownership on the existing state run. Individual
 // ownership boundaries stay distinct; deleting an owner naturally rejoins the
 // surrounding unlocked run. No per-4-KiB hardware protection is implied.
