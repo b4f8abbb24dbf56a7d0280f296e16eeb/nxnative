@@ -1,5 +1,6 @@
 // Exercise the production dispatcher with real backing, including protection
 // failures and concurrent operations. No alternate allocator implementation.
+#define _GNU_SOURCE
 #include "../dm.h"
 #include <assert.h>
 #include <errno.h>
@@ -8,6 +9,11 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef __APPLE__
+static void *pthread_get_stackaddr_np(pthread_t thread) { (void)thread; return NULL; }
+static size_t pthread_get_stacksize_np(pthread_t thread) { (void)thread; return 0; }
+#endif
 
 static int memory_mprotect(void *addr, size_t size, int prot);
 static _Noreturn void memory_abort(void);
@@ -196,7 +202,8 @@ static void ownership(void) {
     assert(!pages(0, alias, P) && !pages(1, alias, P));
     assert(*(uint8_t *)(alias + P) == 0x34);
     memset((void *)(stack + P), 0x76, 2 * P);
-    readonly_base = alias; readonly_size = memory_getpagesize();
+    readonly_size = memory_getpagesize();
+    readonly_base = (alias + P) & ~(uintptr_t)(readonly_size - 1);
     assert(!mprotect((void *)readonly_base, readonly_size, PROT_READ));
     assert(!unmap(stack + P, alias + P, 2 * P) && !readonly_size);
     for (size_t i = P; i < 3 * P; ++i) assert(((uint8_t *)alias)[i] == 0x76);
@@ -323,11 +330,18 @@ static void fragmented_queries(void) {
 }
 static void lazy_commit(void) {
     size_t n = DM_GAME_APP_POOL - DM_GAME_MEM_USED, pg = memory_getpagesize();
-    char *resident = malloc(n / pg); assert(resident);
+    // mincore reports real host pages, even in the simulated 16 KiB fixture.
+    size_t native_page = (size_t)getpagesize();
+#ifdef __APPLE__
+    char *resident = malloc(n / native_page);
+#else
+    unsigned char *resident = malloc(n / native_page);
+#endif
+    assert(resident);
     assert(!pages(1, alias, n));
     assert(!mincore((void *)alias, n, resident));
     size_t count = 0;
-    for (size_t i = 0; i < n / pg; ++i) count += !!(resident[i] & MINCORE_INCORE);
+    for (size_t i = 0; i < n / native_page; ++i) count += !!(resident[i] & 1);
     assert(count < 32); // metadata scans must not fault the anonymous backing in
     ((uint8_t *)alias)[0] = 0x98;
     assert(!pages(0, alias, pg) && !pages(1, alias, pg));
@@ -403,7 +417,11 @@ static void failures(void) {
 }
 // Exercise the real host helper through SDK-shaped test entry points. Its stack
 // allocation must reach MapMemory as guest backing and outlive SDK copyback.
+static module_t helper_sdk_module = { .loaded = 1 };
+static module_t *helper_module_of(const void *p) { (void)p; return &helper_sdk_module; }
+#define module_of helper_module_of
 #include "../hle_guestthread.c"
+#undef module_of
 static void (*helper_entry)(void *);
 static void *helper_arg, *helper_stack;
 static size_t helper_size;
@@ -419,22 +437,22 @@ static void helper_free(void *p) {
     assert(*(uint8_t *)helper_stack == 0x87); // DestroyThread already copied back
     helper_freed = 1; assert(!resize(0));
 }
-static int helper_create(void *tt, void (*fn)(void *), void *arg, void *source, size_t n, int prio) {
+static int helper_create(dm_guest_thread_type *tt, void (*fn)(void *), void *arg, void *source, size_t n, int prio) {
     (void)tt; (void)prio; helper_entry = fn; helper_arg = arg; helper_stack = source; helper_size = n;
     return (int)map(stack, (uintptr_t)source, n);
 }
-static void helper_start(void *tt) { (void)tt; helper_entry(helper_arg); helper_started = 1; }
-static void helper_wait(void *tt) { (void)tt; assert(helper_started); }
-static void helper_destroy(void *tt) {
+static void helper_start(dm_guest_thread_type *tt) { (void)tt; helper_entry(helper_arg); helper_started = 1; }
+static void helper_wait(dm_guest_thread_type *tt) { (void)tt; assert(helper_started); }
+static void helper_destroy(dm_guest_thread_type *tt) {
     (void)tt; assert(!unmap(stack, (uintptr_t)helper_stack, helper_size)); helper_destroyed = 1;
 }
 void *guest_sym(const char *name) {
     if (!strcmp(name, "malloc")) return helper_malloc;
     if (!strcmp(name, "free")) return helper_free;
-    if (!strcmp(name, "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi")) return helper_create;
-    if (!strcmp(name, "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE")) return helper_start;
-    if (!strcmp(name, "_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE")) return helper_wait;
-    if (!strcmp(name, "_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE")) return helper_destroy;
+    if (!strcmp(name, dm_guest_symbol_CreateThread)) return helper_create;
+    if (!strcmp(name, dm_guest_symbol_StartThread)) return helper_start;
+    if (!strcmp(name, dm_guest_symbol_WaitThread)) return helper_wait;
+    if (!strcmp(name, dm_guest_symbol_DestroyThread)) return helper_destroy;
     assert(0); return NULL;
 }
 static void helper_body(void *arg) { assert(arg == &helper_started); *(uint8_t *)stack = 0x87; }
