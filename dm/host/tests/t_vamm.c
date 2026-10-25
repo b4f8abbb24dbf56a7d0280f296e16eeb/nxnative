@@ -218,7 +218,7 @@ static void core_tests(void) {
     empty(&f);
 
     // Complete StandardAllocator -> current host owner -> production SVC path.
-    dm_sa_sdk_owner callbacks = {&f, acquire, relinquish, reservation_stats, context_active, SMALL};
+    dm_sa_sdk_owner callbacks = {&f, acquire, relinquish, reservation_stats, context_active, SMALL, NULL};
     dm_sa_sdk_provider *provider;
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
     dm_sa_config sc = {.provider = dm_sa_sdk_provider_interface(provider), .capacity = (size_t)62 << 30};
@@ -247,6 +247,168 @@ static void core_tests(void) {
     assert(!dm_vamm_free(f.v, base)); other = 13;
     assert(dm_vamm_allocate(f.v, &other, LARGE, 0) == DM_VAMM_NO_SPACE && other == 13);
     assert(!dm_vamm_destroy(f.v));
+}
+
+
+static dm_vamm_stats aligned_stats(fixture *f, size_t alignment) {
+    dm_vamm_stats s; assert(!dm_vamm_get_aligned_stats(f->v, alignment, &s)); return s;
+}
+static void aligned_tests(void) {
+    fixture f = {0}; dm_vamm_config c = config(&f, 128);
+    assert(!dm_vamm_create(&f.v, &c));
+    uintptr_t base = 7;
+    assert(dm_vamm_allocate_aligned(f.v, &base, PAGE, 2 * SMALL, 0) == DM_VAMM_INVALID && base == 7);
+    assert(!aligned_stats(&f, 2 * SMALL).largest_region);
+    dm_vamm_initialize(f.v);
+
+    // Invalid inputs preserve outputs and never call the physical backend.
+    const size_t invalid_alignments[] = {0, 16, PAGE / 2, PAGE + 1, 3 * PAGE, SIZE_MAX};
+    for (size_t i = 0; i < sizeof invalid_alignments / sizeof *invalid_alignments; ++i) {
+        dm_vamm_stats s, old; memset(&s, 0xa5, sizeof s); old = s;
+        assert(dm_vamm_get_aligned_stats(f.v, invalid_alignments[i], &s) == DM_VAMM_INVALID);
+        assert(!memcmp(&s, &old, sizeof s));
+        assert(dm_vamm_allocate_aligned(f.v, &base, PAGE, invalid_alignments[i], 1) == DM_VAMM_INVALID);
+        assert(base == 7 && !f.page_calls);
+    }
+    assert(dm_vamm_allocate_aligned(f.v, &base, 0, LARGE, 1) == DM_VAMM_INVALID);
+    assert(dm_vamm_allocate_aligned(f.v, &base, PAGE + 1, LARGE, 1) == DM_VAMM_INVALID);
+    assert(dm_vamm_allocate_aligned(f.v, &base, SIZE_MAX, LARGE, 1) == DM_VAMM_INVALID);
+    assert(dm_vamm_allocate_aligned(f.v, &base, PAGE, LARGE, 2) == DM_VAMM_INVALID);
+    assert(dm_vamm_allocate_aligned(f.v, NULL, PAGE, LARGE, 1) == DM_VAMM_INVALID);
+    assert(dm_vamm_allocate_aligned(NULL, &base, PAGE, LARGE, 1) == DM_VAMM_INVALID);
+    assert(dm_vamm_get_aligned_stats(f.v, PAGE, NULL) == DM_VAMM_INVALID);
+    assert(base == 7 && !f.page_calls);
+
+    const size_t alignments[] = {PAGE, 2 * SMALL, LARGE, 2 * LARGE, 4 * LARGE, 8 * LARGE};
+    const size_t sizes[] = {PAGE, SMALL, LARGE, LARGE + PAGE};
+    for (size_t i = 0; i < sizeof alignments / sizeof *alignments; ++i) {
+        size_t alignment = alignments[i];
+        dm_vamm_stats before = aligned_stats(&f, alignment);
+        assert(before.available_bytes == before.largest_region && before.largest_region >= LARGE + PAGE);
+        for (size_t j = 0; j < sizeof sizes / sizeof *sizes; ++j) {
+            size_t size = sizes[j];
+            assert(!dm_vamm_allocate_aligned(f.v, &base, size, alignment, 1));
+            assert(!(base & (alignment - 1)));
+            assert(base >= c.base + PAGE && size + PAGE <= c.base + c.size - base);
+            dm_vamm_stats live = aligned_stats(&f, alignment);
+            assert(live.regions == 1 && live.reserved_bytes == size && alias_mapped() == size);
+            assert(live.metadata_bytes == before.metadata_bytes);
+            // Alignment slack and guards are never padded mapped payload.
+            query_state(base - PAGE, 0, 0, 0); query_state(base + size, 0, 0, 0);
+            query_state(base, 5, 0, 3); query_state(base + size - PAGE, 5, 0, 3);
+            memset((void *)base, 0x5a, size);
+            assert(dm_vamm_pages(f.v, base - PAGE, PAGE, 1) == DM_VAMM_INVALID);
+            assert(dm_vamm_pages(f.v, base, size + PAGE, 1) == DM_VAMM_INVALID);
+            assert(!dm_vamm_free(f.v, base)); empty(&f);
+            assert(aligned_stats(&f, alignment).available_bytes == before.available_bytes);
+        }
+        // The exact reported maximum really fits, with the same placement
+        // rule. A larger contiguous request must not become smaller success.
+        unsigned calls = f.page_calls;
+        assert(!dm_vamm_allocate_aligned(f.v, &base, before.largest_region, alignment, 0));
+        assert(!(base & (alignment - 1)) && f.page_calls == calls && !alias_mapped());
+        assert(aligned_stats(&f, alignment).reserved_bytes == before.largest_region);
+        assert(!dm_vamm_free(f.v, base)); base = 9; calls = f.page_calls;
+        assert(dm_vamm_allocate_aligned(f.v, &base, before.largest_region + PAGE, alignment, 1) == DM_VAMM_NO_SPACE);
+        assert(base == 9 && f.page_calls == calls); empty(&f);
+    }
+    size_t impossible = SIZE_MAX / 2 + 1;
+    unsigned calls = f.page_calls;
+    assert(!aligned_stats(&f, impossible).available_bytes && !aligned_stats(&f, impossible).largest_region);
+    assert(dm_vamm_allocate_aligned(f.v, &base, PAGE, impossible, 1) == DM_VAMM_NO_SPACE && base == 9);
+    assert(dm_vamm_allocate_aligned(f.v, &base, SIZE_MAX & ~(size_t)(PAGE - 1), LARGE, 1) == DM_VAMM_NO_SPACE);
+    assert(base == 9 && f.page_calls == calls); empty(&f);
+
+    // Large alignment consumes no extra physical budget: a single page still
+    // fits with only one host page left under either legacy mapping policy.
+    assert(!call(1, 0, APP_POOL - DM_GAME_MEM_USED - host_page(), 0));
+    dm_sa_svc_owner_allocation_begin();
+    assert(!dm_vamm_allocate_aligned(f.v, &base, PAGE, 8 * LARGE, 1));
+    dm_sa_svc_owner_allocation_end();
+    assert(!(base & (8 * LARGE - 1)) && alias_mapped() == PAGE);
+    assert(!dm_vamm_free(f.v, base)); base = 11;
+    dm_vamm_stats before = aligned_stats(&f, LARGE);
+    dm_sa_svc_owner_allocation_begin();
+    assert(dm_vamm_allocate_aligned(f.v, &base, host_page() + PAGE, LARGE, 1) == DM_VAMM_NO_MEMORY && base == 11);
+    dm_sa_svc_owner_allocation_end();
+    assert(aligned_stats(&f, LARGE).available_bytes == before.available_bytes); empty(&f);
+    assert(!call(1, 0, 0, 0));
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_vamm_allocate_aligned(f.v, &base, SMALL, LARGE, 1), NULL, 0);
+    assert(base == 11 && aligned_stats(&f, LARGE).available_bytes == before.available_bytes); empty(&f);
+
+    // Failed exact release retains the same high-alignment reservation and
+    // every mapped byte until its borrowed source has been copied back.
+    assert(!dm_vamm_allocate_aligned(f.v, &base, SMALL, LARGE, 1));
+    memset((void *)base, 0xa5, SMALL);
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_vamm_free(f.v, base), (void *)base, SMALL);
+    uintptr_t stack = info(I_StackAddr);
+    assert(!call(4, stack, base, PAGE)); *(unsigned char *)stack = 0x4c;
+    assert(dm_vamm_free(f.v, base) == 0x803);
+    assert(dm_vamm_pages(f.v, base, SMALL, 0) == 0x803);
+    assert(aligned_stats(&f, LARGE).regions == 1 && aligned_stats(&f, LARGE).reserved_bytes == SMALL);
+    assert(alias_mapped() == SMALL && *(unsigned char *)(base + PAGE) == 0xa5);
+    query_state(base, 5, 1, 0);
+    assert(!call(5, stack, base, PAGE) && *(unsigned char *)base == 0x4c);
+    assert(!dm_vamm_free(f.v, base)); empty(&f); assert(!dm_vamm_destroy(f.v));
+
+    // Fragmentation is not one contiguous lease. Two aligned holes together
+    // have enough bytes for largest+PAGE, but neither can satisfy that request.
+    c = config(&f, 8);
+    c.base = (c.base + LARGE - 1) & ~(uintptr_t)(LARGE - 1);
+    c.size = 4 * LARGE + PAGE;
+    assert(!dm_vamm_create(&f.v, &c)); dm_vamm_initialize(f.v);
+    uintptr_t fragments[4];
+    for (unsigned i = 0; i < 4; ++i)
+        assert(!dm_vamm_allocate_aligned(f.v, &fragments[i], LARGE - PAGE, PAGE, 0));
+    assert(!dm_vamm_free(f.v, fragments[0]) && !dm_vamm_free(f.v, fragments[2]));
+    before = aligned_stats(&f, 2 * SMALL);
+    assert(before.available_bytes == 2 * (LARGE - 2 * SMALL));
+    assert(before.largest_region == LARGE - 2 * SMALL);
+    base = 13; calls = f.page_calls;
+    assert(dm_vamm_allocate_aligned(f.v, &base, before.largest_region + PAGE, 2 * SMALL, 0) == DM_VAMM_NO_SPACE);
+    assert(base == 13 && f.page_calls == calls && aligned_stats(&f, 2 * SMALL).regions == 2);
+    assert(!dm_vamm_allocate_aligned(f.v, &base, before.largest_region, 2 * SMALL, 0));
+    assert(base == c.base + 2 * LARGE + 2 * SMALL);
+    uintptr_t other;
+    assert(!dm_vamm_allocate_aligned(f.v, &other, before.largest_region, 2 * SMALL, 0));
+    assert(other == c.base + 2 * SMALL && !aligned_stats(&f, 2 * SMALL).largest_region);
+    assert(!dm_vamm_free(f.v, base) && !dm_vamm_free(f.v, other));
+    assert(!dm_vamm_free(f.v, fragments[1]) && !dm_vamm_free(f.v, fragments[3]));
+    empty(&f); assert(!dm_vamm_destroy(f.v));
+
+    // Explicit native alignment is not secretly promoted at the SDK's 2 MiB
+    // payload threshold. The unchanged public operation still uses its default.
+    c = config(&f, 8);
+    c.base = ((c.base + LARGE - 1) & ~(uintptr_t)(LARGE - 1)) + PAGE;
+    c.size = 3 * LARGE / 2;
+    assert(!dm_vamm_create(&f.v, &c)); dm_vamm_initialize(f.v);
+    assert(vstats(&f).largest_region == LARGE - PAGE);
+    before = aligned_stats(&f, PAGE); assert(before.largest_region == c.size - 2 * PAGE);
+    assert(dm_vamm_allocate(f.v, &base, LARGE, 0) == DM_VAMM_NO_SPACE);
+    assert(!dm_vamm_allocate_aligned(f.v, &base, before.largest_region, PAGE, 0));
+    assert(base == c.base + PAGE && base % LARGE);
+    assert(!dm_vamm_free(f.v, base) && !dm_vamm_destroy(f.v));
+
+    // Near-address-limit rounding must fail rather than wrap into a fabricated
+    // reservation. No physical callback ever sees this synthetic boundary.
+    c = config(&f, 8);
+    c.base = (UINTPTR_MAX & ~(uintptr_t)(PAGE - 1)) - 4 * PAGE;
+    c.size = 4 * PAGE;
+    assert(!dm_vamm_create(&f.v, &c)); dm_vamm_initialize(f.v);
+    base = 17; calls = f.page_calls;
+    assert(!aligned_stats(&f, impossible).largest_region);
+    assert(dm_vamm_allocate_aligned(f.v, &base, PAGE, impossible, 0) == DM_VAMM_NO_SPACE);
+    assert(base == 17 && f.page_calls == calls && !aligned_stats(&f, PAGE).regions);
+    assert(!dm_vamm_destroy(f.v));
+
+    c = config(&f, 1);
+    assert(!dm_vamm_create(&f.v, &c)); dm_vamm_initialize(f.v);
+    assert(!dm_vamm_allocate_aligned(f.v, &base, PAGE, LARGE, 0));
+    before = aligned_stats(&f, LARGE);
+    assert(!before.available_bytes && !before.largest_region && before.reserved_bytes == PAGE);
+    other = 19;
+    assert(dm_vamm_allocate_aligned(f.v, &other, PAGE, LARGE, 0) == DM_VAMM_NO_MEMORY && other == 19);
+    assert(!dm_vamm_free(f.v, base)); empty(&f); assert(!dm_vamm_destroy(f.v));
 }
 
 static unsigned original_calls;
@@ -316,6 +478,7 @@ static void adapter_tests(int disabled, int c2) {
 int main(int argc, char **argv) {
     alarm(60);
     core_tests();
+    aligned_tests();
     adapter_tests(argc > 1 && !strcmp(argv[1], "disabled"), argc > 1 && !strcmp(argv[1], "c2"));
     puts("vamm: reservation/dispatch/provider/SVC checks passed"); return 0;
 }

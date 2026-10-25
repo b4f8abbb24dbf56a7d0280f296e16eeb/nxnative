@@ -258,7 +258,7 @@ static void native_tests(void) {
     assert(!alias_mapped() && !stats(v).regions);
 
     // Complete StandardAllocator -> current owner -> native callbacks -> SVC.
-    dm_sa_sdk_owner callbacks = {v, acquire, release, reservation_stats, context_active, SMALL};
+    dm_sa_sdk_owner callbacks = {v, acquire, release, reservation_stats, context_active, SMALL, NULL};
     dm_sa_sdk_provider *provider;
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
     dm_sa_config sc = {.provider = dm_sa_sdk_provider_interface(provider), .capacity = (size_t)62 << 30};

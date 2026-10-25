@@ -34,6 +34,10 @@ static uint32_t owner_allocate(void *context, uintptr_t *out, size_t size) {
     dm_memory_runtime *r = context;
     return dm_vamm_allocate(r->owner, out, size, 1);
 }
+static uint32_t owner_allocate_aligned(void *context, uintptr_t *out, size_t size, size_t alignment) {
+    dm_memory_runtime *r = context;
+    return dm_vamm_allocate_aligned(r->owner, out, size, alignment, 1);
+}
 static uint32_t owner_free(void *context, uintptr_t base) {
     dm_memory_runtime *r = context;
     return dm_vamm_free(r->owner, base);
@@ -41,8 +45,8 @@ static uint32_t owner_free(void *context, uintptr_t base) {
 static dm_sa_result owner_stats(void *context, size_t alignment, dm_sa_provider_stats *out) {
     dm_memory_runtime *r = context;
     dm_vamm_stats s;
-    if (dm_vamm_get_stats(r->owner, alignment, &s)) return DM_SA_PROVIDER_FAILED;
-    // Real reservation gaps, guards, size alignment and metadata capacity. The
+    if (dm_vamm_get_aligned_stats(r->owner, alignment, &s)) return DM_SA_PROVIDER_FAILED;
+    // Real reservation gaps, guards, explicit alignment and metadata capacity. The
     // shared provider independently clamps these against guarded physical RAM.
     *out = (dm_sa_provider_stats){s.available_bytes, s.largest_region};
     return DM_SA_OK;
@@ -132,7 +136,8 @@ dm_sa_result dm_memory_runtime_create(dm_memory_runtime **out, size_t max_region
     if (result) goto fail;
     dm_sa_sdk_owner owner = {.context = r, .allocate_memory = owner_allocate,
         .free_address_region = owner_free, .query_reservations = owner_stats,
-        .guest_context_active = native_owner_active, .guaranteed_alignment = 0x10000};
+        .guest_context_active = native_owner_active, .guaranteed_alignment = 0x10000,
+        .allocate_memory_aligned = owner_allocate_aligned};
     status = dm_sa_sdk_provider_create(&r->provider, &owner);
     if (status != DM_SA_OK) { if (dm_vamm_destroy(r->owner)) abort(); goto fail; }
     *out = r; return DM_SA_OK;

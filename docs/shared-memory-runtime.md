@@ -69,9 +69,16 @@ comes from the native raw GetInfo values with Vamm's existing headroom rule.
 between managed and original size-only Allocate dispatch. This native policy
 has no SDK symbol lookup or TLS dependency. `hle_os.c` exports an original-only
 forwarder for SDK-owned objects; managed allocation failure cannot fall through
-to it. The provider currently guarantees 64 KiB lease alignment and rejects
-larger requested lease alignments rather than claiming unavailable backing;
-full guest alignment/behavior compatibility remains an activation prerequisite.
+to it. The native provider supplies an explicit-alignment owner operation:
+`dm_vamm_allocate_aligned` leases exactly the requested page-granular payload
+at any legal power-of-two alignment that fits a real guarded interval. It does
+not pad a mapping, return an interior pointer, shrink a request, or combine
+fragmented holes. `dm_vamm_get_aligned_stats` uses the same placement rule before
+physical-budget clamping. The SDK-facing `dm_vamm_allocate` retains its original
+size-dependent alignment (64 KiB below 2 MiB, 2 MiB otherwise); native leases
+use their explicit requested alignment instead. Original-SDK providers without
+that verified callback remain limited to their truthful fixed guarantee.
+Full guest behavior/call-coverage compatibility remains an activation prerequisite.
 
 ## Verification
 
@@ -88,7 +95,12 @@ It tests native and simulated 16 KiB host pages, both map-limit policies, disabl
 system resources, the unconditional production gate, pending cancellation,
 pre-initialization rejection, core-create rollback, lazy 62 GiB capacity,
 reservation sharing, physical exhaustion, borrowed-source retention, failed
-Finalize/retry, concurrent cores, and table/config lifetime ordering.
+Finalize/retry, concurrent cores, and table/config lifetime ordering. Cold
+128 KiB, 2 MiB, 8 MiB and 16 MiB alignments cover small/large payloads, exact
+backing and guards, impossible requests, moving reallocation with preserved
+alignment/data, borrowed-source rejection, and realizable largest-span statistics.
+Direct Vamm tests additionally cover fragmented intervals, address-limit overflow,
+metadata exhaustion and unchanged SDK-default alignment.
 
 The normal suite is included in the existing host `run` target. Sanitizer
 variants retain the same page and budget matrix. On ptrace-restricted Linux,

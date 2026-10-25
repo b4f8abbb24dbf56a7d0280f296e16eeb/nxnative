@@ -1,5 +1,5 @@
 // No parallel allocator over SDK-owned free alias space. All real leases go
-// through the original owner's operations; metadata lives only on the host.
+// through the current owner's operations; metadata lives only on the host.
 #include "hle_standard_allocator_provider.h"
 #include <stdlib.h>
 
@@ -41,21 +41,23 @@ static dm_sa_result acquire(void *context, size_t size, size_t alignment, dm_sa_
     dm_sa_sdk_provider *p = context;
     if (!out || !size || (size & 0xfff) || !power2(alignment) || alignment < 0x1000)
         return DM_SA_INVALID;
-    if (alignment > p->owner.guaranteed_alignment) return DM_SA_NO_MEMORY;
+    if (!p->owner.allocate_memory_aligned && alignment > p->owner.guaranteed_alignment) return DM_SA_NO_MEMORY;
     if (p->next_token == UINTPTR_MAX) return DM_SA_NO_MEMORY;
     sdk_lease *l = calloc(1, sizeof *l);
     if (!l) return DM_SA_NO_MEMORY;
     l->span.size = size; l->span.token = ++p->next_token;
     l->in_flight = LEASE_ACQUIRING; l->next = p->leases; p->leases = l;
-    // The SDK holds its Vamm lock and calls back through MapPhysicalMemory.
-    // Keeping the source guard here would recursively deadlock at that SVC.
+    // Both original SDK and native owners hold their Vamm lock and enter SVC
+    // page transactions. Keeping the source guard would recursively deadlock.
     dm_sa_svc_scope_end();
     uintptr_t address = 0;
     int guest = p->owner.guest_context_active(p->owner.context);
     uint32_t result = 1;
     if (guest) {
         dm_sa_svc_owner_allocation_begin();
-        result = p->owner.allocate_memory(p->owner.context, &address, size);
+        result = p->owner.allocate_memory_aligned ?
+            p->owner.allocate_memory_aligned(p->owner.context, &address, size, alignment) :
+            p->owner.allocate_memory(p->owner.context, &address, size);
         dm_sa_svc_owner_allocation_end();
     }
     dm_sa_svc_scope_begin();
@@ -100,7 +102,7 @@ static dm_sa_result release(void *context, const dm_sa_span *span) {
 static dm_sa_result query(void *context, size_t alignment, dm_sa_provider_stats *out) {
     dm_sa_sdk_provider *p = context;
     if (!out || !power2(alignment) || alignment < 0x1000) return DM_SA_INVALID;
-    if (alignment > p->owner.guaranteed_alignment) {
+    if (!p->owner.allocate_memory_aligned && alignment > p->owner.guaranteed_alignment) {
         *out = (dm_sa_provider_stats){0, 0}; return DM_SA_OK;
     }
     dm_sa_provider_stats owner;

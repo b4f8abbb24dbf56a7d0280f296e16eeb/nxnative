@@ -147,12 +147,111 @@ static void expect_initialize(void *self, dm_sa_result expected) {
     if (!setjmp(jump)) { INIT(self); abort(); }
     escape = NULL; assert(fatal_result == expected);
 }
+typedef void *(*aligned_allocate_fn)(void *, size_t, size_t);
+typedef void *(*reallocate_fn)(void *, void *, size_t);
+typedef void (*free_fn)(void *, void *);
+typedef size_t (*allocation_size_fn)(const void *, const void *);
+static void aligned_runtime_tests(void *self, dm_vamm *owner, dm_sa_adapter_config *settings,
+                                   aligned_allocate_fn allocate, reallocate_fn reallocate,
+                                   free_fn release, allocation_size_fn allocation_size) {
+    const size_t alignments[] = {0x20000, LARGE, 4 * LARGE, 8 * LARGE};
+    const size_t sizes[] = {32, SMALL, LARGE + PAGE};
+    for (size_t i = 0; i < sizeof alignments / sizeof *alignments; ++i) {
+        size_t alignment = alignments[i];
+        for (size_t j = 0; j < sizeof sizes / sizeof *sizes; ++j) {
+            assert(!alias_mapped()); // every allocation starts with a cold owner
+            size_t size = sizes[j], backing = size < SMALL ? SMALL : size;
+            void *p = allocate(self, size, alignment);
+            assert(p && !((uintptr_t)p & (alignment - 1)));
+            assert(allocation_size(self, p) == size && alias_mapped() == backing);
+            dm_vamm_stats s;
+            assert(!dm_vamm_get_aligned_stats(owner, alignment, &s));
+            assert(s.regions == 1 && s.reserved_bytes == backing);
+            query_state((uintptr_t)p - PAGE, 0, 0, 0);
+            query_state((uintptr_t)p + backing, 0, 0, 0);
+            memset(p, 0x5a, size); assert(((unsigned char *)p)[size - 1] == 0x5a);
+            release(self, p); assert(!alias_mapped());
+        }
+    }
+    // Neither unsupported values nor an impossible but valid power of two can
+    // consume backing, round alignment down or fall through to the original.
+    assert(!allocate(self, 32, 0) && !allocate(self, 32, 3));
+    assert(!allocate(self, 32, (size_t)1 << (sizeof(size_t) * 8 - 1)));
+    assert(!allocate(self, 32, (size_t)1 << (sizeof(size_t) * 8 - 2)));
+    assert(!allocate(self, SIZE_MAX, LARGE) && !alias_mapped());
+
+    // Reallocation must preserve the requested high alignment after moving to
+    // a different exact lease; no hidden padded old/new mappings may remain.
+    void *p = allocate(self, 32, 4 * LARGE); assert(p);
+    memset(p, 0x71, 32);
+    void *q = reallocate(self, p, LARGE + PAGE);
+    assert(q && q != p && !((uintptr_t)q & (4 * LARGE - 1)));
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)q)[i] == 0x71);
+    assert(allocation_size(self, q) == LARGE + PAGE && alias_mapped() == LARGE + PAGE);
+    // Borrowed high-alignment source remains owned and byte-preserving on a
+    // failed growth, just like an ordinary native lease.
+    uintptr_t stack = info(I_StackAddr);
+    assert(!call(4, stack, (uintptr_t)q, PAGE));
+    *(unsigned char *)stack = 0x36;
+    assert(!reallocate(self, q, 2 * LARGE) && alias_mapped() == LARGE + PAGE);
+    assert(allocation_size(self, q) == LARGE + PAGE);
+    assert(!call(5, stack, (uintptr_t)q, PAGE) && *(unsigned char *)q == 0x36);
+    assert(reallocate(self, q, 32) == q && allocation_size(self, q) == 32);
+    release(self, q); assert(!alias_mapped());
+
+    // Query the real runtime provider directly to prove its high-alignment
+    // largest-span snapshot is realizable after strict physical-budget clamping.
+    unsigned char provider_client[DM_SA_ADAPTER_OBJECT_SIZE] = {0};
+    dm_sa_config c;
+    assert(settings->make_config(settings->context, provider_client, (size_t)62 << 30, 0, &c) == DM_SA_OK);
+    dm_sa_provider *provider = &c.provider;
+    for (size_t i = 0; i < sizeof alignments / sizeof *alignments; ++i) {
+        size_t alignment = alignments[i];
+        dm_sa_provider_stats available;
+        provider->begin(provider->context);
+        assert(provider->query(provider->context, alignment, &available) == DM_SA_OK);
+        size_t budget = dm_sa_svc_physical_budget_locked();
+        provider->end(provider->context);
+        dm_vamm_stats s;
+        assert(!dm_vamm_get_aligned_stats(owner, alignment, &s));
+        size_t limit = s.available_bytes < budget ? s.available_bytes : budget;
+        limit &= ~(size_t)(PAGE - 1);
+        assert(available.available_bytes == limit);
+        assert(available.largest_span == (s.largest_region < limit ? s.largest_region : limit));
+        assert(available.largest_span);
+        dm_sa_span lease = {(void *)1, 3, 5}, old = lease;
+        provider->begin(provider->context);
+        assert(provider->acquire(provider->context, available.largest_span + PAGE, alignment, &lease) != DM_SA_OK);
+        assert(lease.base == old.base && lease.size == old.size && lease.token == old.token);
+        assert(provider->acquire(provider->context, available.largest_span, alignment, &lease) == DM_SA_OK);
+        provider->end(provider->context);
+        assert(lease.size == available.largest_span && alias_mapped() == lease.size);
+        assert(!((uintptr_t)lease.base & (alignment - 1)));
+        query_state((uintptr_t)lease.base - PAGE, 0, 0, 0);
+        query_state((uintptr_t)lease.base + lease.size, 0, 0, 0);
+        provider->begin(provider->context);
+        assert(provider->release(provider->context, &lease) == DM_SA_OK);
+        provider->end(provider->context);
+        assert(!alias_mapped());
+    }
+    provider->begin(provider->context);
+    dm_sa_provider_stats impossible = {1, 1};
+    assert(provider->query(provider->context, (size_t)1 << (sizeof(size_t) * 8 - 1), &impossible) == DM_SA_OK);
+    assert(!impossible.available_bytes && !impossible.largest_span);
+    provider->end(provider->context);
+    settings->release_config(settings->context, provider_client, &c);
+}
+#define ALIGNED_RUNTIME_TESTS(self, owner, settings) \
+    aligned_runtime_tests(self, owner, settings, S(10, aligned_allocate_fn), \
+                          S(12, reallocate_fn), S(11, free_fn), S(14, allocation_size_fn))
 static void *worker(void *unused) {
     (void)unused;
     unsigned char self[DM_SA_ADAPTER_OBJECT_SIZE] = {0};
     CONSTRUCT(self); INIT(self);
     for (unsigned i = 0; i < 100; ++i) {
-        void *pointer = ALLOC(self, 64 + i); assert(pointer);
+        size_t alignment = i % 2 ? 0x20000 : LARGE;
+        void *pointer = S(10, aligned_allocate_fn)(self, 64 + i, alignment);
+        assert(pointer && !((uintptr_t)pointer & (alignment - 1)));
         memset(pointer, (int)i, 64 + i); FREE(self, pointer);
     }
     FINISH(self); return NULL;
@@ -249,7 +348,8 @@ int main(void) {
     assert(TOTAL(self) <= APP_POOL - DM_GAME_MEM_USED && TOTAL(self) < ((size_t)62<<30));
     assert(dm_sa_adapter_shutdown() == DM_SA_BUSY); // zero-backing core still owns context
     assert(!ALLOC(self,0));
-    void *pointer = ALLOC(self,SMALL); assert(pointer && !((uintptr_t)pointer % SMALL));
+    ALIGNED_RUNTIME_TESTS(self, v.shared_owner, &a);
+    void *pointer = ALLOC(self,SMALL); assert(pointer && !((uintptr_t)pointer % a.allocation_alignment(self, SMALL)));
     memset(pointer,0x71,SMALL);
     uintptr_t direct;
     assert(!V(1,uint32_t (*)(uintptr_t *,size_t))(&direct,SMALL));
