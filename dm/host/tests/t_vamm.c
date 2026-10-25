@@ -62,6 +62,8 @@ uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 
+#include "memory_failure_test.h"
+
 static uint64_t call(unsigned svc, uint64_t a, uint64_t b, uint64_t c) {
     uint64_t regs[31] = {a, b, c}; svc_dispatch(svc, regs, 0); return regs[0];
 }
@@ -156,11 +158,10 @@ static void core_tests(void) {
     assert(!dm_vamm_pages(f.v, base, PAGE, 1) && *(unsigned char *)base == 0x6b);
     assert(!dm_vamm_free(f.v, base) && !dm_vamm_free(f.v, other)); empty(&f);
 
-    // The raw SVC map failure is atomic. Its nn::os translation is fatal,
-    // covered separately by the native bridge fixture, not a returning 0x803.
+    // Host protection failure is fatal before memory state publication.
     dm_vamm_stats before = vstats(&f); base = 9;
-    atomic_store(&fail_protect, 1);
-    assert(pages(1, c.base + SMALL, SMALL) == 0xd401 && base == 9);
+    EXPECT_MEMORY_PROTECTION_FAILURE(pages(1, c.base + SMALL, SMALL), NULL, 0);
+    assert(base == 9);
     assert(vstats(&f).available_bytes == before.available_bytes); empty(&f);
     assert(dm_vamm_allocate(f.v, &base, (size_t)62 << 30, 0) == DM_VAMM_NO_SPACE && base == 9);
     assert(dm_vamm_allocate(f.v, &base, SIZE_MAX, 0) == DM_VAMM_INVALID);
@@ -178,8 +179,8 @@ static void core_tests(void) {
     assert(!call(1, 0, 0, 0)); empty(&f);
     assert(!dm_vamm_allocate(f.v, &base, SMALL, 1));
     memset((void *)base, 0xa5, SMALL);
-    atomic_store(&fail_protect, 1);
-    assert(dm_vamm_free(f.v, base) == 0x803 && vstats(&f).regions == 1);
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_vamm_free(f.v, base), (void *)base, SMALL);
+    assert(vstats(&f).regions == 1);
     assert(*(unsigned char *)base == 0xa5 && alias_mapped() == SMALL);
     // Source borrowing rejects the whole decommit and preserves the owner.
     uintptr_t stack = info(I_StackAddr);
@@ -194,7 +195,6 @@ static void core_tests(void) {
     assert(!pages(1, raw, PAGE)); query_state(raw, 5, 0, 3);
     assert(dm_vamm_pages(f.v, raw, PAGE, 1) == DM_VAMM_INVALID);
     assert(!pages(0, raw, PAGE));
-    assert(dm_as_reserve(g_alias_space, PAGE, PAGE, &base) == DM_AS_WRONG_MODE);
 
     // Largest-region stats must be a legal exact-size lease, never a raw
     // uncommitted interval or a virtual extent that ignores guard/alignment.
@@ -260,13 +260,11 @@ static void adapter_tests(int disabled, int c2) {
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i)
         symbols[i] = (dm_vamm_symbol){dm_vamm_adapter_symbol_name(i), original_never};
     symbols[8].function = symbols[9].function = (dm_vamm_guest_fn)bootstrap;
-    dm_vamm_adapter_config c = {.proofs = DM_VAMM_PROOF_ALL, .installed_bindings = DM_VAMM_ALL_BINDINGS,
-        .symbols = symbols, .symbol_count = DM_VAMM_SYMBOL_COUNT, .owner = config(&f, 32)};
+    dm_vamm_adapter_config c = {.proofs = DM_VAMM_PROOF_ALL, .symbols = symbols, .symbol_count = DM_VAMM_SYMBOL_COUNT, .owner = config(&f, 32)};
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i) {
-        c.installed_bindings = DM_VAMM_ALL_BINDINGS ^ (UINT64_C(1) << i);
-        assert(dm_vamm_adapter_install(&c) == DM_VAMM_INVALID && !hook(i));
+        dm_vamm_guest_fn old_function = symbols[i].function; symbols[i].function = NULL;
+        assert(dm_vamm_adapter_install(&c) == DM_VAMM_INVALID && !hook(i)); symbols[i].function = old_function;
     }
-    c.installed_bindings = DM_VAMM_ALL_BINDINGS;
     for (unsigned i = 0; i < 6; ++i) {
         c.proofs = DM_VAMM_PROOF_ALL ^ (1u << i);
         assert(dm_vamm_adapter_install(&c) == DM_VAMM_INVALID && !hook(0));

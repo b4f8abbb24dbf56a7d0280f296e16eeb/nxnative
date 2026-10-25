@@ -74,6 +74,12 @@ void dm_vamm_initialize(dm_vamm *v) {
     if (!v->initialized && v->config.resources(v->config.context).total) v->initialized = 1;
     pthread_mutex_unlock(&v->mutex);
 }
+int dm_vamm_is_initialized(dm_vamm *v) {
+    if (!v) return 0;
+    pthread_mutex_lock(&v->mutex);
+    int initialized = v->initialized;
+    pthread_mutex_unlock(&v->mutex); return initialized;
+}
 int dm_vamm_is_enabled(dm_vamm *v) {
     if (!v) return 0;
     pthread_mutex_lock(&v->mutex);

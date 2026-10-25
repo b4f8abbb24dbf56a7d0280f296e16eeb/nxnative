@@ -16,8 +16,8 @@ uint32_t dm_vamm_native_configure(dm_vamm_config *out, size_t max_regions);
 uint32_t dm_vamm_native_svc_result(uint32_t result, int commit);
 
 // Internal SVC boundary shared with the public dispatcher. No guest callbacks.
-// change_pages acquires source -> physical -> address-manager locks itself;
-// never call it while already holding a source/physical lock. Returns SVC Result.
+// change_pages acquires upstream g_map_lock itself; never call it while
+// holding that source/backing/accounting scope. Host protection failure is fatal.
 uint32_t dm_vamm_svc_change_pages(uintptr_t base, size_t size, int commit);
 // Only GetInfo types 2, 3, 28, 16 and 17 are accepted; resource values are raw.
 uint64_t dm_vamm_svc_info(unsigned id);

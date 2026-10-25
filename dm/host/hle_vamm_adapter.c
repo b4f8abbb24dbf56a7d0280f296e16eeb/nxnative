@@ -34,13 +34,25 @@ static dm_vamm_adapter_config settings;
 static dm_vamm_guest_fn originals[DM_VAMM_SYMBOL_COUNT];
 static dm_vamm *owner;
 static void *identity;
-static int constructing, stopped;
-static _Atomic int active;
+static int constructing, preparing;
+static _Atomic int active, stopped;
+struct dm_vamm_adapter_prepared {
+    dm_vamm_adapter_config config;
+    dm_vamm_guest_fn originals[DM_VAMM_SYMBOL_COUNT];
+    dm_vamm *owner;
+};
+static dm_vamm_adapter_prepared *pending;
+static void require_active(void) {
+    if (!atomic_load_explicit(&active, memory_order_acquire) ||
+        atomic_load_explicit(&stopped, memory_order_acquire)) abort();
+}
 static _Noreturn void fail(const char *operation) {
+    require_active(); // stopped shutdown may already have released settings.context
     if (settings.fatal) settings.fatal(settings.context, operation);
     abort();
 }
 static dm_vamm *take(const void *self, const char *operation) {
+    require_active();
     pthread_mutex_lock(&lifecycle);
     int valid = owner && identity && !constructing && !stopped && (!self || self == identity);
     dm_vamm *result = owner;
@@ -49,10 +61,12 @@ static dm_vamm *take(const void *self, const char *operation) {
     return result;
 }
 static dm_vamm *detail(const void *self, const char *operation) {
+    require_active();
     if (!self) fail(operation);
     return take(self, operation);
 }
 static void construct(void *self, unsigned index) {
+    require_active();
     pthread_mutex_lock(&lifecycle);
     if (!self || identity || stopped || constructing) { pthread_mutex_unlock(&lifecycle); fail("constructor"); }
     constructing = 1;
@@ -96,12 +110,15 @@ dm_vamm_guest_fn dm_vamm_adapter_lookup(const char *name) {
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i) if (!strcmp(name, names[i])) return hooks[i];
     return NULL;
 }
-uint32_t dm_vamm_adapter_install(const dm_vamm_adapter_config *c) {
+uint32_t dm_vamm_adapter_prepare(const dm_vamm_adapter_config *c, dm_vamm_adapter_prepared **out) {
+    if (!out) return DM_VAMM_INVALID;
+    *out = NULL;
 #ifndef DM_VAMM_ADAPTER_TESTING
     (void)c; return DM_VAMM_INVALID;
 #else
-    if (!c || c->proofs != DM_VAMM_PROOF_ALL || c->installed_bindings != DM_VAMM_ALL_BINDINGS ||
-        !c->symbols || c->symbol_count != DM_VAMM_SYMBOL_COUNT) return DM_VAMM_INVALID;
+    if (!c || c->proofs != DM_VAMM_PROOF_ALL ||
+        !c->symbols || c->symbol_count != DM_VAMM_SYMBOL_COUNT ||
+        (!!c->shared_owner != !!c->retain_owner) || (!!c->shared_owner != !!c->release_owner)) return DM_VAMM_INVALID;
     dm_vamm_guest_fn captured[DM_VAMM_SYMBOL_COUNT] = {0};
     for (size_t k = 0; k < c->symbol_count; ++k) {
         if (!c->symbols[k].name || !c->symbols[k].function) return DM_VAMM_INVALID;
@@ -113,18 +130,75 @@ uint32_t dm_vamm_adapter_install(const dm_vamm_adapter_config *c) {
         captured[i] = c->symbols[k].function;
     }
     pthread_mutex_lock(&lifecycle);
-    if (atomic_load_explicit(&active, memory_order_relaxed)) { pthread_mutex_unlock(&lifecycle); return DM_VAMM_INVALID; }
-    uint32_t result = dm_vamm_create(&owner, &c->owner);
-    if (!result) {
-        settings = *c; memcpy(originals, captured, sizeof captured);
-        atomic_store_explicit(&active, 1, memory_order_release);
+    if (preparing || pending || atomic_load_explicit(&active, memory_order_relaxed)) { pthread_mutex_unlock(&lifecycle); return DM_VAMM_INVALID; }
+    preparing = 1;
+    pthread_mutex_unlock(&lifecycle);
+    dm_vamm_adapter_prepared *p = calloc(1, sizeof *p);
+    uint32_t result = p ? DM_VAMM_OK : DM_VAMM_NO_MEMORY;
+    if (p) {
+        p->config = *c; p->config.symbols = NULL;
+        memcpy(p->originals, captured, sizeof captured);
+        if (c->shared_owner) {
+            result = c->retain_owner(c->context, c->shared_owner);
+            if (!result) {
+                p->owner = c->shared_owner;
+                dm_vamm_stats stats;
+                result = dm_vamm_get_stats(p->owner, 0x10000, &stats);
+                if (!result && stats.regions) result = DM_VAMM_INVALID;
+                if (result) c->release_owner(c->context, p->owner);
+            }
+        } else result = dm_vamm_create(&p->owner, &c->owner);
     }
+    pthread_mutex_lock(&lifecycle);
+    preparing = 0;
+    if (!result) { pending = p; *out = p; } else free(p);
     pthread_mutex_unlock(&lifecycle); return result;
 #endif
 }
+dm_vamm_guest_fn dm_vamm_adapter_prepared_hook(const dm_vamm_adapter_prepared *p, size_t index) {
+    pthread_mutex_lock(&lifecycle);
+    dm_vamm_guest_fn hook = p && p == pending && index < DM_VAMM_SYMBOL_COUNT ? hooks[index] : NULL;
+    pthread_mutex_unlock(&lifecycle); return hook;
+}
+void dm_vamm_adapter_publish(dm_vamm_adapter_prepared *p) {
+    pthread_mutex_lock(&lifecycle);
+    if (!p || p != pending) abort();
+    settings = p->config; owner = p->owner;
+    memcpy(originals, p->originals, sizeof originals);
+    pending = NULL; free(p);
+    atomic_store_explicit(&active, 1, memory_order_release);
+    pthread_mutex_unlock(&lifecycle);
+}
+void dm_vamm_adapter_cancel(dm_vamm_adapter_prepared *p) {
+    pthread_mutex_lock(&lifecycle);
+    if (!p || p != pending) abort();
+    pending = NULL; preparing = 1;
+    pthread_mutex_unlock(&lifecycle);
+    if (p->config.shared_owner) p->config.release_owner(p->config.context, p->owner);
+    else if (dm_vamm_destroy(p->owner)) abort();
+    free(p);
+    pthread_mutex_lock(&lifecycle); preparing = 0; pthread_mutex_unlock(&lifecycle);
+}
+uint32_t dm_vamm_adapter_install(const dm_vamm_adapter_config *c) {
+    dm_vamm_adapter_prepared *p = NULL;
+    uint32_t r = dm_vamm_adapter_prepare(c, &p);
+    if (!r) dm_vamm_adapter_publish(p);
+    return r;
+}
 uint32_t dm_vamm_adapter_shutdown(void) {
     pthread_mutex_lock(&lifecycle);
-    uint32_t result = owner && !constructing ? dm_vamm_destroy(owner) : DM_VAMM_INVALID;
-    if (!result) { owner = NULL; stopped = 1; }
-    pthread_mutex_unlock(&lifecycle); return result;
+    uint32_t result = DM_VAMM_INVALID;
+    dm_vamm *released = NULL;
+    if (owner && !constructing) {
+        if (settings.shared_owner) {
+            dm_vamm_stats stats;
+            result = dm_vamm_get_stats(owner, 0x10000, &stats);
+            if (!result && stats.regions) result = DM_VAMM_INVALID;
+            if (!result) released = owner;
+        } else result = dm_vamm_destroy(owner);
+    }
+    if (!result) { owner = NULL; atomic_store_explicit(&stopped, 1, memory_order_release); }
+    pthread_mutex_unlock(&lifecycle);
+    if (released) settings.release_owner(settings.context, released);
+    return result;
 }

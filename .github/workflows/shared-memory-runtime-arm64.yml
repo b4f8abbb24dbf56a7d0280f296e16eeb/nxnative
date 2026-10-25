@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4c66fd4d5e5b6276dc3871b1b510a7b957717601
+          ref: 524bec4f51358023f5e52e7d2b42284dd033b972
           persist-credentials: false
       - name: Host unit tests (dm/host/tests)
         run: |
@@ -68,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4c66fd4d5e5b6276dc3871b1b510a7b957717601
+          ref: 524bec4f51358023f5e52e7d2b42284dd033b972
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 4c66fd4d5e5b6276dc3871b1b510a7b957717601
+          ref: 524bec4f51358023f5e52e7d2b42284dd033b972
           persist-credentials: false
       - name: Mac host for three profiles (Vulkan, NVN, OpenGL)
         run: |
@@ -144,19 +144,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4c66fd4d5e5b6276dc3871b1b510a7b957717601
+          ref: 524bec4f51358023f5e52e7d2b42284dd033b972
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 4c66fd4d5e5b6276dc3871b1b510a7b957717601
-          test "$(git rev-parse HEAD^{tree})" = 1cff0be9a727b570e4f551bfbe1c34e0d9fd8754
+          test "$(git rev-parse HEAD)" = 524bec4f51358023f5e52e7d2b42284dd033b972
+          test "$(git rev-parse HEAD^{tree})" = e0c929286d804f7bb87279ea88cf6df808aae8dc
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
           flags="-std=c11 -O1 -g -Wall -Wextra -Werror -pthread -I.."
           if [ "$MODE" != normal ]; then flags="$flags -fsanitize=$MODE -fno-omit-frame-pointer"; fi
           echo "FLAGS=$flags" >> "$GITHUB_ENV"
+          native_flags="-O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations"
+          if [ "$MODE" != normal ]; then native_flags="$native_flags -fsanitize=$MODE -fno-omit-frame-pointer"; fi
+          echo "NATIVE_FLAGS=$native_flags" >> "$GITHUB_ENV"
       - name: Core and complete synthetic adapter surface
         if: ${{ !cancelled() }}
         run: |
@@ -177,6 +180,26 @@ jobs:
         run: |
           make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
             vamm-native 2>&1 | tee logs/vamm-native.log
+      - name: Owned shared-memory runtime and closed production gate (six variants)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" SA_FLAGS="$FLAGS" \
+            memory-runtime 2>&1 | tee logs/memory-runtime.log
+      - name: Combined startup relocation to actual shared runtime (six variants)
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
+            memory-runtime-startup 2>&1 | tee logs/memory-runtime-startup.log
+      - name: Whole-memory ownership transaction and production gate
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" \
+            memory-hooks 2>&1 | tee logs/memory-hooks.log
+      - name: Actual Apple loader relocation, rollback and binding precedence
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang GAME="$GAME" B="build/ci-$MODE" \
+            MEMORY_HOOK_NATIVE_FLAGS="$NATIVE_FLAGS" memory-hooks-loader 2>&1 | tee logs/memory-hooks-loader.log
       - name: Native AArch64 x8 hash and x0/x1 result ABI plus disabled gates
         if: ${{ !cancelled() }}
         run: |
@@ -190,21 +213,31 @@ jobs:
         run: |
           make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
             guest-thread-stack 2>&1 | tee logs/guest-thread-stack.log
-      - name: Combined ASan and UBSan stack and native-Vamm targets
+      - name: Combined ASan and UBSan stack, Vamm, runtime and transaction targets
         if: ${{ !cancelled() && matrix.mode == 'normal' }}
         run: |
           make -C dm/host/tests CC=clang B=build/ci-combined \
-            guest-thread-stack-sanitize vamm-native-sanitize 2>&1 | tee logs/stack-native-vamm-combined.log
-      - name: Exact native-Vamm TSan target
+            guest-thread-stack-sanitize vamm-native-sanitize memory-runtime-sanitize memory-runtime-startup-sanitize memory-hooks-sanitize 2>&1 | tee logs/stack-native-vamm-combined.log
+      - name: Exact native-Vamm, runtime and transaction TSan targets
         if: ${{ !cancelled() && matrix.mode == 'thread' }}
         run: |
           make -C dm/host/tests CC=clang B=build/ci-native-tsan \
-            vamm-native-tsan 2>&1 | tee logs/vamm-native-tsan.log
-      - name: Address manager, SVC and MapMemory full matrix
+            vamm-native-tsan memory-runtime-tsan memory-hooks-tsan 2>&1 | tee logs/native-vamm-transaction-tsan.log
+      - name: Authoritative upstream SVC and extended MapMemory full matrix
         if: ${{ !cancelled() }}
         run: |
           make -C dm/host/tests CC=clang B="build/ci-$MODE" AS_FLAGS="$FLAGS" \
-            address-space address-space-svc map-memory 2>&1 | tee logs/native-memory.log
+            address-space-svc map-memory 2>&1 | tee logs/native-memory.log
+      - name: Original upstream bitmap memory, real dirty tracking, profile and heap fail-fast
+        if: ${{ !cancelled() && matrix.mode == 'normal' }}
+        run: |
+          make -C dm/host/tests CC=clang PYTHON=python3 GAME="$GAME" B=build \
+            memory memory-dirty memory-profile heap_size 2>&1 | tee logs/upstream-memory.log
+      - name: Original upstream memory TSan target
+        if: ${{ !cancelled() && matrix.mode == 'thread' }}
+        run: |
+          make -C dm/host/tests CC=clang B=build/ci-upstream-tsan \
+            memory-tsan 2>&1 | tee logs/upstream-memory-tsan.log
       - name: Upload exact-head ARM64 evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

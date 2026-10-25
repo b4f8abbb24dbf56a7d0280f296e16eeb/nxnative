@@ -71,6 +71,9 @@ static dm_sa_guest_fn fixture[22] = {
 #define WALK(s,c,x) HOOK(W,int(*)(const void*,dm_sa_walk_fn,void*))(s,c,x)
 static size_t leased;
 static unsigned acquisitions,releases;
+static int fail_release;
+static _Atomic unsigned configs_made, configs_released;
+static unsigned context_refs;
 static void begin(void *c) { (void)c; }
 static void end(void *c) { (void)c; }
 static dm_sa_result acquire(void *c,size_t n,size_t a,dm_sa_span *out) {
@@ -80,6 +83,7 @@ static dm_sa_result acquire(void *c,size_t n,size_t a,dm_sa_span *out) {
 }
 static dm_sa_result release(void *c,const dm_sa_span *s) {
     (void)c; assert(s->token==(uintptr_t)s->base); assert(leased>=s->size);
+    if(fail_release) return DM_SA_PROVIDER_FAILED;
     leased-=s->size; releases++; free(s->base); return DM_SA_OK;
 }
 static int available(void *c,const dm_sa_span *s,size_t o,size_t n) {
@@ -88,7 +92,7 @@ static int available(void *c,const dm_sa_span *s,size_t o,size_t n) {
 static dm_sa_result query(void *c,size_t a,dm_sa_provider_stats *out) {
     (void)c;(void)a; *out=(dm_sa_provider_stats){1024*1024-leased,1024*1024-leased}; return DM_SA_OK;
 }
-enum { FACTORY_NORMAL, FACTORY_OTHER, FACTORY_REENTER, FACTORY_BLOCK, FACTORY_FAIL };
+enum { FACTORY_NORMAL, FACTORY_OTHER, FACTORY_REENTER, FACTORY_BLOCK, FACTORY_FAIL, FACTORY_BAD_CAPACITY, FACTORY_BAD_CORE };
 static pthread_mutex_t factory_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t factory_changed=PTHREAD_COND_INITIALIZER;
 static void *factory_target,*factory_other;
@@ -107,7 +111,18 @@ static dm_sa_result make_config(void *c,void *self,size_t capacity,unsigned cach
     if(mode==FACTORY_REENTER) (void)ALLOC(self,16);
     if(mode==FACTORY_FAIL) return DM_SA_PROVIDER_FAILED;
     *out=(dm_sa_config){.provider={NULL,4096,begin,end,acquire,release,available,query},.capacity=capacity,.pool_size=4096};
+    if(mode==FACTORY_BAD_CAPACITY) out->capacity++;
+    if(mode==FACTORY_BAD_CORE) out->provider.granule=3;
+    configs_made++;
     return DM_SA_OK;
+}
+static dm_sa_result retain_context(void *c) { (void)c; context_refs++; return DM_SA_OK; }
+static void release_context(void *c) { (void)c; assert(context_refs==1); assert(configs_made==configs_released); context_refs--; }
+static void release_config(void *c,void *self,const dm_sa_config *config) {
+    (void)c; assert(config && config->provider.acquire==acquire);
+    assert(dm_sa_adapter_is_managed(self)); // callback does not hold registry lock
+    if(factory_other && factory_other!=self) assert(HASH(factory_other).block_count==0);
+    configs_released++;
 }
 static void diagnostic(void *c,const void *s,const dm_sa_stats *st) { (void)c;(void)s; assert(!st->closed); dumped++; }
 static _Thread_local int fatal_in_thread;
@@ -319,6 +334,18 @@ static void initialization_lifecycle(void) {
     expect_thread_failure(initialize_instance,second,DM_SA_PROVIDER_FAILED);
     assert(!dm_sa_adapter_is_managed(second) && !second[0]);
     factory_mode=FACTORY_NORMAL; INIT(second,16384,0); FINISH(second); NEW(second);
+    unsigned released_before=configs_released;
+    factory_mode=FACTORY_BAD_CAPACITY; expect_thread_failure(initialize_instance,second,DM_SA_INVALID);
+    assert(configs_released==released_before+1 && !dm_sa_adapter_is_managed(second));
+    factory_mode=FACTORY_BAD_CORE; expect_thread_failure(initialize_instance,second,DM_SA_INVALID);
+    assert(configs_released==released_before+2 && !dm_sa_adapter_is_managed(second));
+    factory_mode=FACTORY_NORMAL; INIT(second,16384,0); assert(ALLOC(second,64));
+    assert(dm_sa_adapter_shutdown()==DM_SA_BUSY);
+    released_before=configs_released; fail_release=1;
+    expect_thread_failure(finalize_instance,second,DM_SA_PROVIDER_FAILED);
+    assert(configs_released==released_before && second[0] && leased);
+    fail_release=0; FINISH(second); NEW(second);
+    assert(configs_released==released_before+1);
     FINISH(first); NEW(first); factory_target=NULL; factory_other=NULL;
     alarm(0);
 }
@@ -327,14 +354,14 @@ int main(void) {
     for(size_t n=0;n<22;n++) { symbols[n]=(dm_sa_adapter_symbol){dm_sa_adapter_symbol_name(n),fixture[n]}; assert(!dm_sa_adapter_lookup(symbols[n].name)); }
     assert(!dm_sa_adapter_symbol_name(22));
     dm_sa_adapter_config c={.proofs=DM_SA_PROOF_ALL,.symbols=symbols,.symbol_count=22,
-        .installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS,.forward_allocate=profile_allocate,.allocation_alignment=allocation_alignment,.make_config=make_config,.dump=diagnostic,.fatal=fatal};
+        .forward_allocate=profile_allocate,.allocation_alignment=allocation_alignment,.make_config=make_config,
+        .release_config=release_config,.retain_context=retain_context,.release_context=release_context,.dump=diagnostic,.fatal=fatal};
     for(unsigned n=0;n<5;n++) { c.proofs=DM_SA_PROOF_ALL^(1u<<n); assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); }
     c.proofs=DM_SA_PROOF_ALL;
     for(unsigned n=0;n<22;n++) {
-        c.installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS^(UINT64_C(1)<<n);
-        assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); assert(!dm_sa_adapter_lookup(symbols[A].name));
+        dm_sa_guest_fn old_function = symbols[n].function; symbols[n].function = NULL;
+        assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); assert(!dm_sa_adapter_lookup(symbols[A].name)); symbols[n].function = old_function;
     }
-    c.installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS;
     c.allocation_alignment=NULL; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); c.allocation_alignment=allocation_alignment;
     c.symbol_count=21; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); c.symbol_count=22;
     dm_sa_adapter_symbol old=symbols[0]; symbols[0]=symbols[1]; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); symbols[0]=old;
@@ -344,5 +371,9 @@ int main(void) {
     for(size_t n=0;n<22;n++) assert(dm_sa_adapter_lookup(symbols[n].name));
     assert(!dm_sa_adapter_lookup("_ZN2nn3mem17StandardAllocatorD1Ev")); assert(!dm_sa_adapter_lookup(NULL));
     forwarding(); assert(!policy_calls); managed(); initialization_lifecycle();
+    assert(context_refs==1 && configs_made==configs_released);
+    assert(dm_sa_adapter_shutdown()==DM_SA_OK && !context_refs);
+    assert(dm_sa_adapter_shutdown()==DM_SA_INVALID);
+    assert(dm_sa_adapter_lookup(symbols[A].name)); // stopped table never returns to SDK
     puts("StandardAllocator adapter: complete synthetic binding/forwarding/ownership/ABI contracts passed");
 }

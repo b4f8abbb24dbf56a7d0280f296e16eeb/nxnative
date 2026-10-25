@@ -1,11 +1,11 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
-#include "hle_address_space.h"
 #include "hle_standard_allocator_provider.h"
 #include "hle_vamm_native.h"
 #include <sys/mman.h>
 #include <errno.h>
+#include <unistd.h>
 #include <unistd.h>
 #include <sched.h>
 #include <time.h>
@@ -23,13 +23,10 @@ static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_c
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
 int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }
 static uint8_t *g_alias; static size_t g_alias_cap;
-static dm_address_space *g_alias_space;
-// Serializes heap changes with physical maps and their application-pool checks.
-// Lock order: g_map_lock (source ownership), g_phys_mu, address-space lock.
-static pthread_mutex_t g_phys_mu = PTHREAD_MUTEX_INITIALIZER;
-// Only verified current-owner provider allocation callbacks opt in. A stale
-// budget snapshot must not allow their later SVC commit to overdraw the pool,
-// even when the unchanged profile allows ordinary alias maps without a cap.
+static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_pages)
+static uint64_t *g_alias_exposed;   // one bit per host page ever opened; protected by g_map_lock
+// Only provider-owned allocation callbacks opt into the stricter budget. The
+// original SDK callback runs outside g_map_lock and re-enters this same SVC path.
 static _Thread_local unsigned g_sa_owner_allocation_depth;
 void dm_sa_svc_owner_allocation_begin(void) {
     if (g_sa_owner_allocation_depth == UINT32_MAX) abort();
@@ -44,32 +41,11 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
 
 static void *alias_windows_thread(void *arg);
-// The manager supplies host-page aligned ranges. Revoke access before advising
-// discard: a failed mprotect must not discard live data or change accounting.
-static int alias_apply(void *context, uintptr_t base, size_t size, int commit) {
-    (void)context;
-    if (mprotect((void *)base, size, commit ? PROT_READ | PROT_WRITE : PROT_NONE)) return -1;
-    // Opening a host page may also release GPU dirty-tracker protection on a
-    // live neighbor. Notify it only after mprotect succeeds, for the full range
-    // whose protection changed; clearing below still touches only logical holes.
-    if (commit) dm_guest_write_prepare((void *)base, size);
-    else (void)madvise((void *)base, size, MADV_FREE);
-    return 0;
-}
-static void alias_initialize(void *context, uintptr_t base, size_t size) {
-    (void)context;
-    memset((void *)base, 0, size);
-}
-static size_t alias_mapped(void) {
-    dm_as_stats stats;
-    if (dm_as_get_stats(g_alias_space, &stats) != DM_AS_OK) die("alias address-space statistics");
-    return stats.committed_bytes;
-}
 static void mem_init_once(void) {
     size_t pg = (size_t)getpagesize();
     if (RESERVE < 0x10000000 || DM_GAME_MEM_ALIAS > RESERVE - 0x10000000 ||
         DM_GAME_MEM_STACK > RESERVE - 0x10000000 - DM_GAME_MEM_ALIAS ||
-        ((RESERVE | DM_GAME_MEM_ALIAS | DM_GAME_MEM_STACK | 0x10000000) & (pg - 1)))
+        ((RESERVE | DM_GAME_MEM_ALIAS | DM_GAME_MEM_STACK) & (pg - 1)))
         die("guest address-space profile has invalid native boundaries");
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
@@ -82,14 +58,8 @@ static void mem_init_once(void) {
     g_alias = g_as + 0x10000000; g_alias_cap = DM_GAME_MEM_ALIAS;
     g_stack = g_alias + g_alias_cap; g_stack_cap = DM_GAME_MEM_STACK;
     g_heap  = g_stack + g_stack_cap; g_heap_cap  = RESERVE - (size_t)(g_heap - g_as);
-    // The SDK retains EVERY reservation path and its existing patches. Host
-    // reservations are rejected in this mode; only known SVC commit paths share
-    // the manager. Do not enable a second allocator through partial symbol hooks.
-    dm_as_config config = { .base = (uintptr_t)g_alias, .size = g_alias_cap,
-        .guest_page_size = 0x1000, .host_page_size = pg, .max_regions = 0,
-        .mode = DM_AS_EXTERNAL_RESERVATIONS, .apply = alias_apply, .initialize = alias_initialize,
-        .initially_zero = 1 }; // a slice of the fresh anonymous PROT_NONE mmap
-    if (dm_as_create(&g_alias_space, &config) != DM_AS_OK) die("alias address-space manager allocation");
+    if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
+    if (!(g_alias_exposed = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_exposed))) die("alias exposure bitmap calloc");
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack);
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
@@ -121,8 +91,9 @@ enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=
 
 static uint8_t g_seen[256];
 
-// Registry of MapMemory stacks and their exclusively borrowed source intervals.
-// Physical alias pages live in g_alias_space; QueryMemory consults both.
+// Stack destinations and their borrowed sources. Physical alias commits live in
+// g_alias_bits. One lock covers memory validation, protections, copying, budgets
+// and publication; QueryMemory and used-memory queries take the same snapshot.
 // g_map_lock is held over a whole lookup + check + change (and over QueryMemory's reads): map_find's index is only valid under it, since map_del moves the last entry into the freed slot.
 // The lock used to cover only the add and the delete, so two threads unmapping at once (stacks of exiting threads) could delete through a stale index and drop another live mapping
 #define MAX_MAP 4096
@@ -139,31 +110,125 @@ static void map_add(uint64_t b, uint64_t n, uint64_t src, uint32_t st) {   // ca
 }
 static void map_del(int i) { g_map[i] = g_map[--g_nmap]; }   // caller holds g_map_lock
 
-// All mapping intervals are nonempty and nonwrapping before reaching these
-// helpers. Integer subtraction also keeps malformed guest pointers out of C
-// pointer arithmetic. Public MapMemory / UnmapMemory checks share their order.
+// One bit per 4 KB page of the alias region (mapped = 1): Map sets bits, Unmap clears them; returns the number of pages whose state really changed (signed: positive for Map, negative for Unmap)
+static int64_t alias_pages(uint64_t off, uint64_t n, int map) {
+    int64_t ch = 0;
+    for (uint64_t p = off >> 12, e = (off + n + 0xFFF) >> 12; p < e; ) {
+        uint64_t sh = p & 63, k = 64 - sh < e - p ? 64 - sh : e - p, m = (k == 64 ? ~0ull : (1ull << k) - 1) << sh;
+        uint64_t old = map ? atomic_fetch_or(&g_alias_bits[p >> 6], m) : atomic_fetch_and(&g_alias_bits[p >> 6], ~m);
+        ch += __builtin_popcountll((map ? ~old : old) & m);
+        p += k;
+    }
+    return map ? ch : -ch;
+}
+// Pages of the range not mapped yet (the bitmap is left alone)
+static int64_t alias_unmapped(uint64_t off, uint64_t n) {
+    int64_t c = 0;
+    for (uint64_t p = off >> 12, e = (off + n + 0xFFF) >> 12; p < e; ) {
+        uint64_t sh = p & 63, k = 64 - sh < e - p ? 64 - sh : e - p, m = (k == 64 ? ~0ull : (1ull << k) - 1) << sh;
+        c += __builtin_popcountll(~atomic_load(&g_alias_bits[p >> 6]) & m);
+        p += k;
+    }
+    return c;
+}
+static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (page bitmap)
+static size_t alias_mapped(void) { return (size_t)atomic_load(&g_alias_mapped); }
+
+// Word-at-a-time boundaries of the bitmap run containing p (guest page index).
+static uint64_t alias_mask(unsigned n) { return n == 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; }
+static uint64_t alias_run_end(uint64_t p, uint64_t end, int mapped) {
+    for (uint64_t first = p + 1; first < end;) {
+        unsigned shift = first & 63, n = (unsigned)(end - first < 64 - shift ? end - first : 64 - shift);
+        uint64_t bits = atomic_load(&g_alias_bits[first >> 6]);
+        uint64_t different = (mapped ? ~bits : bits) & (alias_mask(n) << shift);
+        if (different) return (first & ~UINT64_C(63)) + __builtin_ctzll(different);
+        first += n;
+    }
+    return end;
+}
+static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapped) {
+    uint64_t p = (addr - (uintptr_t)g_alias) >> 12, lo = p;
+    *mapped = (atomic_load(&g_alias_bits[p >> 6]) >> (p & 63)) & 1;
+    while (lo) {
+        uint64_t first = (lo - 1) & ~UINT64_C(63);
+        uint64_t bits = atomic_load(&g_alias_bits[first >> 6]);
+        uint64_t different = (*mapped ? ~bits : bits) & alias_mask((unsigned)(lo - first));
+        if (different) { lo = first + 64 - __builtin_clzll(different); break; }
+        lo = first;
+    }
+    uint64_t hi = alias_run_end(p, g_alias_cap >> 12, *mapped);
+    *base = (uintptr_t)g_alias + (lo << 12); *size = (hi - lo) << 12;
+}
+// Initialize holes using the OLD commit bitmap. Fresh anonymous host pages stay
+// lazy; after any exposure, even an untouched 4 KiB sibling may hold stale bytes.
+static void alias_initialize(uint64_t off, size_t size) {
+    size_t pg = (size_t)getpagesize(), ratio = pg >> 12;
+    uint64_t end = (off + size) >> 12;
+    for (uint64_t p = off >> 12; p < end;) {
+        int mapped = (atomic_load(&g_alias_bits[p >> 6]) >> (p & 63)) & 1;
+        uint64_t next = alias_run_end(p, end, mapped);
+        if (!mapped) {
+            uint64_t clear = p;
+            for (uint64_t q = p; q < next;) {
+                uint64_t host = q / ratio, stop = (host + 1) * ratio;
+                if (stop > next) stop = next;
+                if (!(g_alias_exposed[host >> 6] & (UINT64_C(1) << (host & 63)))) {
+                    if (clear < q) memset(g_alias + (clear << 12), 0, (q - clear) << 12);
+                    clear = stop;
+                }
+                q = stop;
+            }
+            if (clear < next) memset(g_alias + (clear << 12), 0, (next - clear) << 12);
+        }
+        p = next;
+    }
+    for (uint64_t h = off / pg, last = (off + size - 1) / pg; h <= last; ++h)
+        g_alias_exposed[h >> 6] |= UINT64_C(1) << (h & 63);
+}
+
 static int memory_contains(uint64_t base, uint64_t capacity, uint64_t addr, uint64_t size) {
     return addr >= base && size <= capacity && addr - base <= capacity - size;
 }
 static uint32_t map_arguments(uint64_t dst, uint64_t src, uint64_t size) {
-    if ((dst | src) & 0xfff) return 0xCC01;  // InvalidAddress
-    if (!size || (size & 0xfff)) return 0xCA01;  // InvalidSize
+    if ((dst | src) & 0xfff) return 0xCC01;
+    if (!size || (size & 0xfff)) return 0xCA01;
     if (size > UINT64_MAX - src || size > UINT64_MAX - dst) return 0xD401;
-    // Modules are separate native mappings outside the reserved guest block.
-    if (!memory_contains((uintptr_t)g_as, RESERVE, src, size)) {
-        module_t *m = module_of((void *)(uintptr_t)src);
-        if (!m || !memory_contains((uintptr_t)m->base, m->size, src, size)) return 0xD401;
-    }
     return memory_contains((uintptr_t)g_stack, g_stack_cap, dst, size) ? 0 : 0xDC01;
 }
-static int map_source_busy(uint64_t addr, uint64_t size) { // g_map_lock held
+static int map_source_busy(uint64_t addr, uint64_t size) { // g_map_lock held; nonwrapping ranges
     for (int i = 0; i < g_nmap; ++i)
         if (addr < g_map[i].src + g_map[i].size && g_map[i].src < addr + size) return 1;
     return 0;
 }
-// Narrow bridge for existing-owner StandardAllocator leases. These checks do
-// not reserve addresses or assert SDK ownership: the provider's successful
-// original-operation ledger supplies that. No SDK callback runs in this scope.
+// Loader text/patch seals use 16 KiB boundaries, independently of host page size.
+static void module_readonly_run(uint64_t off, uint64_t start, uint64_t end,
+                                uint64_t *lo, uint64_t *hi, uint64_t *perm) {
+    if (start >= end) return;
+    if (off < start) { if (start < *hi) *hi = start; }
+    else if (off >= end) { if (end > *lo) *lo = end; }
+    else { if (start > *lo) *lo = start; if (end < *hi) *hi = end; *perm &= ~UINT64_C(2); }
+}
+static void module_data_query(const module_t *m, uint64_t off, uint64_t *lo, uint64_t *hi, uint64_t *perm) {
+    module_readonly_run(off, 0, (m->text_end + 0x3fff) & ~UINT64_C(0x3fff), lo, hi, perm);
+    if (m->patch_off > 0) module_readonly_run(off, (uint64_t)m->patch_off & ~UINT64_C(0x3fff), m->size, lo, hi, perm);
+    module_readonly_run(off, m->key_page_off, m->key_page_off + m->key_page_size, lo, hi, perm);
+}
+static int map_source_backed(uint64_t src, uint64_t size) {
+    if (memory_contains((uintptr_t)g_heap, g_heap_cur, src, size)) return 1;
+    if (memory_contains((uintptr_t)g_alias, g_alias_cap, src, size))
+        return !alias_unmapped(src - (uintptr_t)g_alias, size);
+    module_t *m = module_of((void *)(uintptr_t)src);
+    // NRO reload restores backing outside this lock; it cannot be borrowed until
+    // that lifetime is integrated. Static module data is permanent.
+    if (!m || m->nro || !m->loaded || !memory_contains((uintptr_t)m->base, m->size, src, size)) return 0;
+    uint64_t lo = m->data_off ? m->data_off : (m->ro_off ? m->ro_off : m->text_end);
+    uint64_t hi = m->patch_off > 0 ? (uint64_t)m->patch_off : m->size;
+    uint64_t off = src - (uintptr_t)m->base, perm = 3;
+    module_data_query(m, off, &lo, &hi, &perm);
+    return perm == 3 && hi >= lo && memory_contains(lo, hi - lo, off, size);
+}
+// Provider leases inspect the SAME bitmap and borrowed-source registry as
+// upstream SVCs. They do not allocate competing physical or reservation state.
 void dm_sa_svc_scope_begin(void) { mem_init(); pthread_mutex_lock(&g_map_lock); }
 void dm_sa_svc_scope_end(void) { pthread_mutex_unlock(&g_map_lock); }
 int dm_sa_svc_alias_range_locked(uintptr_t base, size_t size) {
@@ -171,131 +236,58 @@ int dm_sa_svc_alias_range_locked(uintptr_t base, size_t size) {
 }
 int dm_sa_svc_backed_locked(uintptr_t base, size_t size) {
     if (!dm_sa_svc_alias_range_locked(base, size)) return 0;
-    // Suballocations can start/end within a logical page. Require every logical
-    // page they touch, never infer access from a shared native protection page.
     uintptr_t lo = base & ~(uintptr_t)0xfff;
     if (size > SIZE_MAX - (base - lo) - 0xfff) return 0;
     size_t n = (size + (base - lo) + 0xfff) & ~(size_t)0xfff;
-    pthread_mutex_lock(&g_phys_mu);
-    size_t committed = 0;
-    int ok = dm_as_committed_in(g_alias_space, lo, n, &committed) == DM_AS_OK && committed == n;
-    pthread_mutex_unlock(&g_phys_mu);
-    return ok;
+    return !alias_unmapped(lo - (uintptr_t)g_alias, n);
 }
 int dm_sa_svc_available_locked(uintptr_t base, size_t size) {
     return dm_sa_svc_alias_range_locked(base, size) && !map_source_busy(base, size) &&
         dm_sa_svc_backed_locked(base, size);
 }
 size_t dm_sa_svc_physical_budget_locked(void) {
-    pthread_mutex_lock(&g_phys_mu);
     size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
     if (image > floor) floor = image;
     size_t heap = atomic_load(&g_heap_cur), mapped = alias_mapped();
     size_t remaining = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
     remaining = heap < remaining ? remaining - heap : 0;
-    remaining = mapped < remaining ? remaining - mapped : 0;
-    pthread_mutex_unlock(&g_phys_mu);
-    // Deliberately conservative even in legacy unlimited-map profiles. Existing
-    // SVC/GetInfo policy is unchanged; this provider never advertises free RAM
-    // merely because a legacy map path does not enforce the application pool.
-    return remaining;
+    return mapped < remaining ? remaining - mapped : 0;
 }
-// Clip a module-data query to one host protection run. Loader metadata is
-// immutable after startup; its text/patch seals use fixed 16 KiB boundaries on
-// both Mac and iOS, even when this portable test process has 4 KiB host pages.
-static void module_readonly_run(uint64_t off, uint64_t start, uint64_t end,
-                                uint64_t *lo, uint64_t *hi, uint64_t *perm) {
-    if (start >= end) return;
-    if (off < start) { if (start < *hi) *hi = start; }
-    else if (off >= end) { if (end > *lo) *lo = end; }
-    else {
-        if (start > *lo) *lo = start;
-        if (end < *hi) *hi = end;
-        *perm &= ~UINT64_C(2); // host RX/R pages cannot be writable CodeData
-    }
-}
-static void module_data_query(const module_t *m, uint64_t off, uint64_t *lo, uint64_t *hi, uint64_t *perm) {
-    uint64_t text = m->text_end <= UINT64_MAX - 0x3fff ? (m->text_end + 0x3fff) & ~UINT64_C(0x3fff) : m->size;
-    module_readonly_run(off, 0, text, lo, hi, perm);
-    if (m->patch_off > 0)
-        module_readonly_run(off, (uint64_t)m->patch_off & ~UINT64_C(0x3fff), m->size, lo, hi, perm);
-    if (m->key_page_size && m->key_page_off <= m->size && m->key_page_size <= m->size - m->key_page_off)
-        module_readonly_run(off, m->key_page_off, m->key_page_off + m->key_page_size, lo, hi, perm);
-}
-// Source permissions are logical, not inferred from host readability: a free
-// 4 KiB alias slice can still share an accessible 16 KiB host page. Only the
-// native states with CanAlias and user RW are accepted (Heap and CodeData).
-// Caller holds g_map_lock -> g_phys_mu, including throughout the subsequent copy.
-static int map_source_backed(uint64_t src, uint64_t size) {
-    module_t *m = module_of((void *)(uintptr_t)src);
-    // NROs are separate permanent native mappings, not the guest image/buffer
-    // passed to LoadModule. This relies on the current loader lifetime/layout.
-    if (m && m->nro) return 0;
-    if (memory_contains((uintptr_t)g_heap, atomic_load(&g_heap_cur), src, size)) return 1;
-    if (memory_contains((uintptr_t)g_alias, g_alias_cap, src, size)) {
-        size_t committed = 0;
-        return dm_as_committed_in(g_alias_space, src, size, &committed) == DM_AS_OK && committed == size;
-    }
-    // No fallback to module metadata for a hole inside the reserved block.
-    if (memory_contains((uintptr_t)g_as, RESERVE, src, size)) return 0;
-    // Static module backing is permanent. NRO reload restores pristine data
-    // outside these locks; reject it until that separate lifetime is integrated.
-    if (!m || m->nro || !m->loaded || !memory_contains((uintptr_t)m->base, m->size, src, size)) return 0;
-    uint64_t ro = m->ro_off ? m->ro_off : m->text_end;
-    uint64_t data = m->data_off ? m->data_off : ro;
-    uint64_t end = m->patch_off > 0 ? (uint64_t)m->patch_off : m->size;
-    uint64_t off = src - (uintptr_t)m->base;
-    if (ro > data || data > end || end > m->size || !memory_contains(data, end - data, off, size)) return 0;
-    uint64_t perm = 3;
-    module_data_query(m, off, &data, &end, &perm);
-    return perm == 3 && memory_contains(data, end - data, off, size);
-}
-// Host-created guest threads use the same source eligibility as MapMemory.
-// This is only a preflight: the caller must retain exclusive allocation
-// ownership, and the later SVC still validates and borrows under these locks.
+// A preflight only: the helper retains allocation ownership and MapMemory later
+// performs its authoritative atomic borrow under this same lock.
 int dm_guest_map_source_available(const void *source, size_t size) {
     uintptr_t src = (uintptr_t)source;
     if (!size || ((src | size) & 0xfff) || size > UINTPTR_MAX - src) return 0;
     mem_init();
     pthread_mutex_lock(&g_map_lock);
-    pthread_mutex_lock(&g_phys_mu);
     int available = !map_source_busy(src, size) && map_source_backed(src, size);
-    pthread_mutex_unlock(&g_phys_mu);
     pthread_mutex_unlock(&g_map_lock);
     return available;
 }
-// Overlay borrowed source ownership on the existing state run. Individual
-// ownership boundaries stay distinct; deleting an owner naturally rejoins the
-// surrounding unlocked run. No per-4-KiB hardware protection is implied.
+
 static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *attr, uint64_t *perm) {
-    uint64_t lo = *base, remaining = *size;
+    uint64_t lo = *base, remaining = *size; // the final free page can end at 2^64
     for (int i = 0; i < g_nmap; ++i) {
         uint64_t src = g_map[i].src, end = src + g_map[i].size;
-        uint64_t lower = lo, upper_distance = remaining;
+        uint64_t lower = lo, upper = remaining;
         if (addr >= src && addr < end) {
             if (src > lower) lower = src;
-            if (end - lo < upper_distance) upper_distance = end - lo;
-            *attr = 1;  // Locked / IsBorrowed, NOT PermissionLocked (bit 4)
-            *perm = 0;
+            if (end - lo < upper) upper = end - lo;
+            *attr = 1; *perm = 0; // Locked / IsBorrowed, not PermissionLocked (bit 4)
         } else if (end <= addr && end > lower) lower = end;
-        else if (src > addr && src - lo < upper_distance) upper_distance = src - lo;
-        remaining = upper_distance - (lower - lo);
-        lo = lower;
+        else if (src > addr && src - lo < upper) upper = src - lo;
+        remaining = upper - (lower - lo); lo = lower;
     }
     *base = lo; *size = remaining;
 }
 
-// Horizon's public MemoryInfo is 0x28 bytes, including the final reserved word.
-// A local object + memcpy supports an unaligned output and initializes every
-// field, without depending on the caller's old padding/refcount values.
+// Horizon MemoryInfo includes its final reserved word. Keep the whole ABI
+// initialized and use memcpy so guest output need not be host-aligned.
 typedef struct {
     uint64_t base, size;
     uint32_t state, attr, perm, ipc_refcount, device_refcount, reserved;
 } svc_memory_info;
-_Static_assert(sizeof(svc_memory_info) == 0x28, "MemoryInfo ABI size");
-_Static_assert(offsetof(svc_memory_info, state) == 0x10 && offsetof(svc_memory_info, attr) == 0x14 &&
-               offsetof(svc_memory_info, perm) == 0x18 && offsetof(svc_memory_info, reserved) == 0x24,
-               "MemoryInfo ABI field offsets");
+_Static_assert(sizeof(svc_memory_info) == 40, "MemoryInfo ABI size");
 
 // Diagnostic DM_ALIAS_WINDOWS=<window MB>: every 30 s, the mapped memory of each window of that size in the alias region (windows aligned to the size in absolute addresses, counted from the page
 // bitmap; windows with nothing mapped are left out). For sizing an allocator that reserves fixed, aligned windows and commits pages from each window's start: Unreal's FMallocBinned3 takes
@@ -305,19 +297,19 @@ static void *alias_windows_thread(void *arg) {
     for (;;) {
         sleep(30);
         char line[8192] = {0}; size_t o = 0; uint64_t tot = 0;
+        pthread_mutex_lock(&g_map_lock);
         for (uint64_t w = a0 & ~(win - 1); w < a1 && o < sizeof line - 64; w += win) {
-            uintptr_t lo = w > a0 ? w : a0, hi = win < a1 - w ? w + win : a1;
-            size_t n = 0;
-            if (dm_as_committed_in(g_alias_space, lo, hi - lo, &n) != DM_AS_OK) continue;
-            if (n) { o += snprintf(line + o, sizeof line - o, " +%#llx:%.1f", (unsigned long long)(w - (a0 & ~(win - 1))), n / 1048576.0); tot += n; }
+            uint64_t n = 0, p0 = (w > a0 ? w - a0 : 0) >> 12, p1 = ((w + win < a1 ? w + win : a1) - a0) >> 12;
+            for (uint64_t p = p0; p < p1; p++) n += atomic_load(&g_alias_bits[p >> 6]) >> (p & 63) & 1;
+            if (n) { o += snprintf(line + o, sizeof line - o, " +%#llx:%.1f", (unsigned long long)(w - (a0 & ~(win - 1))), n * 4096 / 1048576.0); tot += n; }
         }
-        LOG("[mem] alias windows of %llu MB (window offset:MB mapped), %.1f MB in all:%s", (unsigned long long)(win >> 20), tot / 1048576.0, line);
+        pthread_mutex_unlock(&g_map_lock);
+        LOG("[mem] alias windows of %llu MB (window offset:MB mapped), %.1f MB in all:%s", (unsigned long long)(win >> 20), tot * 4096 / 1048576.0, line);
     }
     return NULL;
 }
 
-// The Vamm bridge consumes these same raw values as SVC GetInfo. In
-// particular AliasRegionExtraSize is queried, not assumed zero by the owner.
+// Narrow native bridge; raw values match GetInfo without changing SDK policy.
 uint64_t dm_vamm_svc_info(unsigned id) {
     mem_init();
     switch (id) {
@@ -326,68 +318,72 @@ uint64_t dm_vamm_svc_info(unsigned id) {
     case 28: return 0; // AliasRegionExtraSize: no extra alias reservation today
     case I_SysResTotal: return DM_GAME_SYS_RESOURCE;
     case I_SysResUsed: return DM_GAME_SYS_RESOURCE ? 0x400000 : 0;
-    default: abort(); // internal narrow bridge, not a guest-facing GetInfo API
+    default: abort();
     }
 }
 
-// Shared native page transaction: no guest callbacks or dispatch reentry.
-// Vamm holds its reservation lock before this source -> physical -> manager
-// sequence. Ordinary SVC and strict provider allocations use identical policy.
+// Native Vamm and SDK SVCs share this upstream bitmap transaction. Reservation
+// ownership lives only in the gated Vamm owner, not in a second page manager.
 uint32_t dm_vamm_svc_change_pages(uintptr_t a, size_t size, int commit) {
     if (commit != 0 && commit != 1) return 0xD401;
     mem_init();
     unsigned num = commit ? 0x2C : 0x2D;
-    uintptr_t alias = (uintptr_t)g_alias;
-    // Subtraction after lower-bound/size checks avoids wrapping a+size.
-    if (!size || (a & 0xfff) || (size & 0xfff) || a < alias ||
-        size > g_alias_cap || a - alias > g_alias_cap - size) {
-        LOG("SVC %#x invalid alias range %p+%#zx", num, (void *)a, size); return 0xD401;
+    if (!size || ((a | size) & 0xfff) || !memory_contains((uintptr_t)g_alias, g_alias_cap, a, size)) {
+        LOG("SVC %#x outside the alias region %p+%#zx", num, (void *)a, size); return 0xD401;
     }
-    // Profile mem_map_limit is unchanged: only enabled profiles charge alias
-    // commits to the application pool. Repeated/overlapping maps charge only
-    // newly committed pages. All map/unmap/backend/accounting steps serialize.
     pthread_mutex_lock(&g_map_lock);
-    pthread_mutex_lock(&g_phys_mu);
-    // Neither recommit nor decommit may modify pages borrowed by a stack.
-    // Reject the entire request before the manager/backend sees it.
-    if (map_source_busy(a, size)) {
-        pthread_mutex_unlock(&g_phys_mu); pthread_mutex_unlock(&g_map_lock);
-        return 0xD401;
-    }
-    size_t before = alias_mapped(), limit = SIZE_MAX;
-    if (DM_GAME_MEM_MAP_LIMIT) {
-        uint64_t used = (uint64_t)atomic_load(&g_heap_cur) + DM_GAME_MEM_USED + big_bss_bytes();
-        limit = used < APP_POOL ? (size_t)(APP_POOL - used) : 0;
-    }
-    if (g_sa_owner_allocation_depth) {
-        size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
-        if (image > floor) floor = image;
-        size_t strict = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
-        size_t heap = atomic_load(&g_heap_cur);
-        strict = heap < strict ? strict - heap : 0;
-        if (strict < limit) limit = strict;
-    }
-    dm_as_result result = num == 0x2C ? dm_as_commit(g_alias_space, a, size, limit)
-                                     : dm_as_decommit(g_alias_space, a, size);
-    size_t after = alias_mapped();
-    pthread_mutex_unlock(&g_phys_mu);
-    pthread_mutex_unlock(&g_map_lock);
-    if (result != DM_AS_OK) {
-        if (result == DM_AS_LIMIT) {
+    // The SDK extends committed windows across borrowed stack sources
+    // (Raging Loop, StandardAllocator). Recommit preserves every live byte;
+    // only decommit can invalidate backing required for eventual copyback.
+    if (num == 0x2D && map_source_busy(a, size)) { pthread_mutex_unlock(&g_map_lock); return 0xD401; }
+    uint64_t off = a - (uintptr_t)g_alias;
+    int64_t need = alias_unmapped(off, size) * 4096;
+    // Profile mem_map_limit: a map that would take the process past the application pool fails with ResultLimitReached, as on Horizon (the pool less the used memory GetInfo reports).
+    // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped
+    // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
+    // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
+    // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
+    if ((DM_GAME_MEM_MAP_LIMIT || g_sa_owner_allocation_depth) && commit) {
+        int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
+        if (g_sa_owner_allocation_depth) {
+            // Provider snapshots cannot authorize an overdraw by a later SDK
+            // callback, even when ordinary legacy maps have no profile cap.
+            size_t strict = dm_sa_svc_physical_budget_locked();
+            if (!DM_GAME_MEM_MAP_LIMIT || room > (int64_t)strict) room = (int64_t)strict;
+        }
+        if (need && need > room) {
+            pthread_mutex_unlock(&g_map_lock);
             static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
-                                                                   size, before / 1073741824.0);
+                                                                   size, atomic_load(&g_alias_mapped) / 1073741824.0);
             return 0x10801;
-        } else {
-            LOG("[RED] SVC %#x alias mapping failed %p+%#zx (manager=%d errno=%d)", num, (void *)a, size, result, errno);
-            return 0xD401;
         }
     }
-    if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", (void *)a, size);
-    // High-water address and actual physical use remain separate diagnostics.
-    if (num == 0x2C) { static _Atomic uint64_t hw; uint64_t end = a - alias + size, old = atomic_load(&hw);
+    // Host pages are 16 KB, Horizon pages 4 KB: a map is rounded out to host pages (the extra neighboring 4K pages are inside the alias region and merely become writable early, harmless);
+    // An edge host page is reclaimed only when no live logical neighbor remains.
+    uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
+    uintptr_t mlo = lo & ~(pg - 1), mhi = (hi + pg - 1) & ~(pg - 1);
+    int64_t changed = commit ? need : (int64_t)size - need;
+    if (!commit) {
+        if ((lo - mlo) / 4096 != (uint64_t)alias_unmapped(mlo - (uintptr_t)g_alias, lo - mlo)) mlo += pg;
+        if ((mhi - hi) / 4096 != (uint64_t)alias_unmapped(hi - (uintptr_t)g_alias, mhi - hi)) mhi -= pg;
+    }
+    if (changed && mhi > mlo) {
+        if (mprotect((void *)mlo, mhi - mlo, commit ? PROT_READ | PROT_WRITE : PROT_NONE))
+            die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
+        if (commit) dm_guest_write_prepare((void *)mlo, mhi - mlo);
+        else (void)madvise((void *)mlo, mhi - mlo, MADV_FREE);
+    }
+    if (commit && changed) alias_initialize(off, size);
+    if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", commit ? "Map" : "Unmap", (void *)a, size);
+    // how deep the alias region is used (one line per 256 MB crossed): for sizing the reservation and alias region (iOS caps a single reservation at 6 GB)
+    if (num == 0x2C) { static _Atomic uint64_t hw; uint64_t end = off + size, old = atomic_load(&hw);
         while (end > old && !atomic_compare_exchange_weak(&hw, &old, end)) {}
         if (end > old && end >> 28 != old >> 28) LOG("[mem] alias region mapped up to +%.2f GB (alias region %.2f GB)", end / 1073741824.0, g_alias_cap / 1073741824.0); }
-    if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0);
+    // Total actually mapped in the alias region (one line per 256 MB crossed, up or down): how much physical memory the game uses and whether it keeps growing. Counted with a page bitmap, only pages whose state really changed --
+    // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
+    { int64_t d = alias_pages(off, size, commit) * 4096, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
+      pthread_mutex_unlock(&g_map_lock);
+      if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
     return 0;
 }
 
@@ -400,43 +396,34 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     switch (num) {
     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base
         size_t size = regs[1];
-        if (size > g_heap_cap || (size & 0x1fffff)) { LOG("SetHeapSize invalid: req %#zx, cap %#zx", size, g_heap_cap); regs[0] = 0xD401; return 0; }
+        if (size > g_heap_cap) { LOG("SetHeapSize OOM: req %#zx > cap %#zx", size, g_heap_cap); regs[0] = 0xD401; return 0; }
         pthread_mutex_lock(&g_map_lock);
-        pthread_mutex_lock(&g_phys_mu);
-        size_t previous = atomic_load(&g_heap_cur);
+        size_t previous = g_heap_cur, image = image_bytes();
         if (size < previous && map_source_busy((uintptr_t)g_heap + size, previous - size)) {
-            pthread_mutex_unlock(&g_phys_mu); pthread_mutex_unlock(&g_map_lock);
-            regs[0] = 0xD401; return 0;
+            pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0;
         }
-        size_t image = image_bytes(), bss = big_bss_bytes();
-        // Keep the image-footprint check. With mem_map_limit, later heap growth
-        // must also respect the same total reported by UsedMem and used by maps.
-        uint64_t charged = (uint64_t)DM_GAME_MEM_USED + bss;
-        if (DM_GAME_MEM_MAP_LIMIT) charged += alias_mapped();
-        if (image > APP_POOL || size > APP_POOL - image ||
-            (DM_GAME_MEM_MAP_LIMIT && (charged > APP_POOL || size > APP_POOL - charged))) {
-            static int once; if (!once++) LOG("[mem] SetHeapSize %#zx + modules %#zx exceeds app pool %#llx (used memory reported %#llx + bss %#zx)", size, image - bss,
-                                              (unsigned long long)APP_POOL, (unsigned long long)DM_GAME_MEM_USED, bss);
-            pthread_mutex_unlock(&g_phys_mu);
-            pthread_mutex_unlock(&g_map_lock);
-            regs[0] = 0x10801; return 0;
+        if (image > APP_POOL || size > APP_POOL - image) {   // ResultLimitReached; games retry in 2 MB decrements
+            // Logged once (Mario's retries would repeat it): a game that sizes its heap as pool − used memory and does not retry stops here when its modules are larger than the used memory reported
+            // (profile mem_used; the NSP script's probe boot reads this line, and sets mem_used when no SetHeapSize succeeds afterwards)
+            static int once; if (!once++) LOG("[mem] SetHeapSize %#zx + modules %#zx > app pool %#llx (used memory reported %#llx + bss %#zx)", size, image_bytes() - big_bss_bytes(),
+                                              (unsigned long long)APP_POOL, (unsigned long long)DM_GAME_MEM_USED, big_bss_bytes());
+            pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
+        }
+        uint64_t charged = (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + atomic_load(&g_alias_mapped);
+        if (DM_GAME_MEM_MAP_LIMIT && (charged > APP_POOL || size > APP_POOL - charged)) {
+            pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         int rc = 0;
-        if (size > previous) rc = mprotect(g_heap + previous, size - previous, PROT_READ | PROT_WRITE);
-        else if (size < previous) rc = mprotect(g_heap + size, previous - size, PROT_NONE);
-        // A failed host protection transition is fatal, as on upstream: neither
-        // the heap/accounting state nor the guest result has been published.
+        if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
+        else if (size < g_heap_cur) rc = mprotect(g_heap + size, g_heap_cur - size, PROT_NONE);
         if (rc) die("SetHeapSize mprotect failed: req=%#zx errno=%d", size, errno);
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
-        if (!g_flag.svc && size > previous) LOG("[mem] heap %.2f GB (heap region %.2f GB)", size / 1073741824.0, g_heap_cap / 1073741824.0);
-        atomic_store(&g_heap_cur, size);
-        pthread_mutex_unlock(&g_phys_mu);
+        else if (size > g_heap_cur) LOG("[mem] heap %.2f GB (heap region %.2f GB)", size / 1073741824.0, g_heap_cap / 1073741824.0);
+        g_heap_cur = size;
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; regs[1] = (uint64_t)g_heap; return 0;
     }
-    case 0x02: case 0x03: { // SetMemoryPermission / SetMemoryAttribute
-        // The general SVCs remain legacy no-ops, but cannot claim a successful
-        // mutation of a source borrowed by MapMemory. Do not touch host pages.
+    case 0x02: case 0x03: { // Permission/attribute stubs must not modify a borrowed source.
         uint64_t addr = regs[0], size = regs[1];
         pthread_mutex_lock(&g_map_lock);
         int busy = size > UINT64_MAX - addr || (size && map_source_busy(addr, size));
@@ -448,27 +435,17 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t result = map_arguments(dst, src, size);
         if (result) { regs[0] = result; return 0; }
         pthread_mutex_lock(&g_map_lock);
-        pthread_mutex_lock(&g_phys_mu);
         if (map_find(dst, size) || map_source_busy(src, size) || !map_source_backed(src, size)) result = 0xD401;
-        else if (g_nmap == MAX_MAP) result = 0xCE01;  // OutOfResource; no backend change
-        if (!result) {
-            // Native copy/move architecture, NOT two coherent aliases. Horizon
-            // removes user access to the borrowed source; here it stays host
-            // accessible because a host page can contain live 4 KiB siblings.
-            size_t mask = (size_t)getpagesize() - 1;
-            uint64_t lo = dst & ~(uint64_t)mask, hi = (dst + size + mask) & ~(uint64_t)mask;
-            if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) result = 0xD401;
-            else {
-                // Opening a whole host page also unprotects neighboring GPU
-                // dirty-tracked slices, so notify for that full host-page run.
-                dm_guest_write_prepare((void *)lo, hi - lo);
-                memcpy((void *)dst, (void *)src, size);
-                map_add(dst, size, src, 0x0B /*Stack*/);
-            }
-        }
-        pthread_mutex_unlock(&g_phys_mu);
+        else if (g_nmap == MAX_MAP) result = 0xCE01;
+        if (result) { pthread_mutex_unlock(&g_map_lock); regs[0] = result; return 0; }
+        // Apple pages are 16K, Horizon pages 4K: the accessible region is extended to a 16K boundary (the extra pages opened are unused pages of the same region, semantics unaffected)
+        uint64_t mask = (size_t)getpagesize() - 1;
+        uint64_t lo = dst & ~mask, hi = (dst + size + mask) & ~mask;
+        if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
+        dm_guest_write_prepare((void *)lo, hi - lo);
+        memcpy((void *)dst, (void *)src, size);   // move semantics: the source region is not accessed while mapped (Horizon makes it inaccessible)
+        map_add(dst, size, src, 0x0B /*MappedMemory*/);
         pthread_mutex_unlock(&g_map_lock);
-        if (result) { regs[0] = result; return 0; }
         if (g_flag.svc) LOG("MapMemory %#llx <- %#llx +%#llx", dst, src, size);
         regs[0] = 0; return 0;
     }
@@ -477,24 +454,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t result = map_arguments(dst, src, size);
         if (result) { regs[0] = result; return 0; }
         pthread_mutex_lock(&g_map_lock);
-        pthread_mutex_lock(&g_phys_mu);
         int k = map_find(dst, size);
-        if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size) result = 0xD401;
-        else if (g_map[k - 1].src != src) {
-            result = 0xD401;
-            // Both exact ranges can have valid mapped/borrowed state yet refer
-            // to different backing. Distinguish that from an invalid state.
-            for (int i = 0; i < g_nmap; ++i)
-                if (g_map[i].src == src && g_map[i].size == size) { result = 0xDC01; break; }
-        }
-        if (result) {
-            pthread_mutex_unlock(&g_phys_mu); pthread_mutex_unlock(&g_map_lock); regs[0] = result; return 0; }
-        // Source backing cannot have shrunk/decommitted while this entry lives.
-        // Unlock logically only after copyback, with dirty tracking informed.
+        if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
+            pthread_mutex_unlock(&g_map_lock); LOG("UnmapMemory does not match a mapping %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
         dm_guest_write_prepare((void *)src, size);
         memcpy((void *)src, (void *)dst, size);
         map_del(k - 1);
-        pthread_mutex_unlock(&g_phys_mu);
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; return 0;
     }
@@ -505,34 +470,28 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint64_t base, size, state, perm;
         uint32_t attr = 0;
         int k;
-        pthread_mutex_lock(&g_map_lock);
-        pthread_mutex_lock(&g_phys_mu);
-        size_t heap_size = atomic_load(&g_heap_cur);
-        uintptr_t alias = (uintptr_t)g_alias, alias_end = alias + g_alias_cap;
-        int in_alias = addr >= alias && addr - alias < g_alias_cap;
-        dm_as_range ar = {0};
-        if (in_alias && dm_as_query(g_alias_space, addr, &ar) != DM_AS_OK) die("alias address query");
-        if (a >= g_heap && a < g_heap + heap_size) { base=(uint64_t)g_heap; size=heap_size; state=5/*Heap*/; perm=3; }
+        pthread_mutex_lock(&g_map_lock);   // the registry branches read g_map; the other branches are cheap, so the lock simply spans the whole chain
+        uint64_t ab = (uintptr_t)g_alias, ae = ab + g_alias_cap, rb = 0, rn = 0;
+        int mapped = 0, in_alias = addr >= ab && addr < ae;
+        if (in_alias) alias_query(addr, &rb, &rn, &mapped);
+        if (a >= g_heap && a < g_heap + g_heap_cur) { base=(uint64_t)g_heap; size=g_heap_cur; state=5/*Heap*/; perm=3; }
         else if ((k = map_find(addr, 1))) { base=g_map[k-1].base; size=g_map[k-1].size; state=g_map[k-1].state; perm=3; }
-        else if (in_alias && ar.committed) { base=ar.base; size=ar.size; state=5/*Heap*/; perm=3; }
+        else if (in_alias && mapped) { base=rb; size=rn; state=5; perm=3; }
         else if (a >= g_as && a < g_as + RESERVE) {   // free: up to the adjacent mapping/heap boundary
             uint64_t lo = (uint64_t)g_as, hi = (uint64_t)g_as + RESERVE;
-            if (a >= g_heap) lo = (uint64_t)g_heap + heap_size;
+            if (a >= g_heap) lo = (uint64_t)g_heap + g_heap_cur;
             else if (hi > (uint64_t)g_heap) hi = (uint64_t)g_heap;
-            // A free run may cross an alias partition boundary, but never a
-            // committed alias page. Querying an edge finds the nearest map when
-            // the requested address lies before/after the alias region itself.
             if (in_alias) {
-                if (ar.base > alias && ar.base > lo) lo = ar.base;
-                if (ar.base + ar.size < alias_end && ar.base + ar.size < hi) hi = ar.base + ar.size;
-            } else if (addr < alias) {
-                if (dm_as_query(g_alias_space, alias, &ar) != DM_AS_OK) die("alias lower-edge query");
-                uintptr_t edge = ar.committed ? alias : ar.base + ar.size;
-                if ((ar.committed || edge < alias_end) && edge < hi) hi = edge;
-            } else {
-                if (dm_as_query(g_alias_space, alias_end - 1, &ar) != DM_AS_OK) die("alias upper-edge query");
-                uintptr_t edge = ar.committed ? alias_end : ar.base;
-                if ((ar.committed || edge > alias) && edge > lo) lo = edge;
+                if (rb > ab && rb > lo) lo = rb;
+                if (rb + rn < ae && rb + rn < hi) hi = rb + rn;
+            } else if (g_alias_cap && addr < ab) {
+                alias_query(ab, &rb, &rn, &mapped);
+                uint64_t edge = mapped ? ab : rb + rn;
+                if ((mapped || edge < ae) && edge < hi) hi = edge;
+            } else if (g_alias_cap) {
+                alias_query(ae - 1, &rb, &rn, &mapped);
+                uint64_t edge = mapped ? ae : rb;
+                if ((mapped || edge > ab) && edge > lo) lo = edge;
             }
             for (int i = 0; i < g_nmap; i++) {
                 uint64_t e = g_map[i].base + g_map[i].size;
@@ -554,8 +513,6 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             else if (off < pa) { base = mb + da; size = pa - da;       state = 4/*CodeData*/; perm = 3; }
             else               { base = mb + pa; size = mm->size - pa; state = 4/*CodeData*/; perm = 5; }
             if (state == 4 && perm == 3) {
-                // Key-table pages and rounded text/patch seals are not writable,
-                // even when they lie inside the nominal data/BSS section.
                 uint64_t lo = base - mb, hi = lo + size;
                 module_data_query(mm, off, &lo, &hi, &perm);
                 base = mb + lo; size = hi - lo;
@@ -570,7 +527,6 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             // Other host memory: report "free, no permissions" (the 4 KiB page around it) as Horizon does for unmapped addresses. It used to report Code+RX, and GetExceptionInfo walking back from main merged on through host memory down to 0
             else { base=addr & ~0xFFFull; size=0x1000; state=0/*Free*/; perm=0; } }
         map_source_query(addr, &base, &size, &attr, &perm);
-        pthread_mutex_unlock(&g_phys_mu);
         pthread_mutex_unlock(&g_map_lock);
         if (mi) {
             svc_memory_info out = {base, size, (uint32_t)state, attr, (uint32_t)perm, 0, 0, 0};
@@ -578,7 +534,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         regs[0] = 0; regs[1] = 0; return 0;
     }
-    case 0x2C: case 0x2D: // MapPhysicalMemory / UnmapPhysicalMemory
+    case 0x2C: case 0x2D:
         regs[0] = dm_vamm_svc_change_pages((uintptr_t)regs[0], regs[1], num == 0x2C);
         return 0;
     case 0x26: {  // Break(reason, ptr, size): SDK fatal abort
@@ -600,20 +556,19 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         switch (id) {
         case I_CoreMask: v = 7; break;
         case I_PriorityMask: v = 0; break;
-        case I_AliasAddr: case I_AliasSize: case 28: v = dm_vamm_svc_info((unsigned)id); break;
+        case I_AliasAddr: v = (uint64_t)g_alias; break;   case I_AliasSize: v = g_alias_cap; break;
         case I_HeapAddr:  v = (uint64_t)g_heap;  break;   case I_HeapSize:  v = g_heap_cap;  break;
         case I_AslrAddr:  v = (uint64_t)g_as;    break;   case I_AslrSize:  v = RESERVE;     break;
         case I_StackAddr: v = (uint64_t)g_stack; break;   case I_StackSize: v = g_stack_cap; break;
         case I_TotalMem: case I_TotalNonSys: v = APP_POOL; break;
-        case I_UsedMem: case I_UsedNonSys:
-            pthread_mutex_lock(&g_phys_mu);
-            v = atomic_load(&g_heap_cur) + DM_GAME_MEM_USED + big_bss_bytes();
-            if (DM_GAME_MEM_MAP_LIMIT) v += alias_mapped();
-            pthread_mutex_unlock(&g_phys_mu);
-            break;
+        case I_UsedMem:  case I_UsedNonSys:  pthread_mutex_lock(&g_map_lock);
+                                             v = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
+                                             // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)
+                                             if (DM_GAME_MEM_MAP_LIMIT) v += (uint64_t)atomic_load(&g_alias_mapped);
+                                             pthread_mutex_unlock(&g_map_lock); break;
         // the system resource the NPDM declares (profile sys_resource; 32 MB without the key). The SDK's IsVirtualAddressMemoryEnabled is "total != 0": Big Brain Academy's nninitStartup
         // asks StandardAllocator for 60 GB of virtual address memory when it is, and sets a heap only when it is not (its NPDM declares none)
-        case I_SysResTotal: case I_SysResUsed: v = dm_vamm_svc_info((unsigned)id); break;
+        case I_SysResTotal: v = DM_GAME_SYS_RESOURCE; break; case I_SysResUsed: v = DM_GAME_SYS_RESOURCE ? 0x400000 : 0; break;
         case I_DebuggerAttached: v = 0; break;
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // a deterministic stream when DM_DETCLOCK is on (hle_os.c)
         case I_ProgramId: { static uint64_t pid; if (!pid) { const char *e = getenv("DM_PROGRAM_ID"); pid = e ? strtoull(e, NULL, 16) : DM_GAME_PROGRAM_ID; } v = pid; break; }   // default from the game profile's program_id; DM_PROGRAM_ID=hex overrides

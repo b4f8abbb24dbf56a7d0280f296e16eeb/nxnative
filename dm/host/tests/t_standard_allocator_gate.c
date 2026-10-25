@@ -14,7 +14,7 @@ int main(void) {
     dm_sa_adapter_symbol symbols[DM_SA_ADAPTER_SYMBOL_COUNT];
     for(size_t n=0;n<DM_SA_ADAPTER_SYMBOL_COUNT;n++) symbols[n]=(dm_sa_adapter_symbol){dm_sa_adapter_symbol_name(n),original};
     dm_sa_adapter_config c={.proofs=DM_SA_PROOF_ALL,.symbols=symbols,
-        .symbol_count=DM_SA_ADAPTER_SYMBOL_COUNT,.installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS,.forward_allocate=forward_allocate,.allocation_alignment=allocation_alignment,.make_config=make_config};
+        .symbol_count=DM_SA_ADAPTER_SYMBOL_COUNT,.forward_allocate=forward_allocate,.allocation_alignment=allocation_alignment,.make_config=make_config};
     assert(dm_sa_adapter_install(&c)==DM_SA_INVALID);
     unsigned char self[56]={0}; void *out=self;
     for(size_t n=0;n<DM_SA_ADAPTER_SYMBOL_COUNT;n++) assert(!dm_sa_adapter_lookup(symbols[n].name));

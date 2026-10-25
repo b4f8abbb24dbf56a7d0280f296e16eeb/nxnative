@@ -97,6 +97,8 @@ uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 
+#include "memory_failure_test.h"
+
 #include "heap_failure_test.h"
 
 enum { PAGE = 0x1000, BAD_SIZE = 0xca01, BAD_ADDRESS = 0xcc01,
@@ -227,12 +229,17 @@ static void alias_lifecycle(void) {
     assert(unmap(d + 0x10000, src, 2 * PAGE) == BAD_STATE);
     expect_query(src, src, 2 * PAGE, 5, 1, 0);
     assert(*(volatile uint8_t *)src == 0x39);
-    for (int commit = 0; commit <= 1; ++commit) {
-        assert(pages(commit, src, PAGE) == BAD_STATE);
-        assert(pages(commit, src - PAGE, 2 * PAGE) == BAD_STATE);
-        assert(pages(commit, src + PAGE, 2 * PAGE) == BAD_STATE);
-        assert(pages(commit, a, 16 * PAGE) == BAD_STATE);
-    }
+    assert(pages(0, src, PAGE) == BAD_STATE);
+    assert(pages(0, src - PAGE, 2 * PAGE) == BAD_STATE);
+    assert(pages(0, src + PAGE, 2 * PAGE) == BAD_STATE);
+    assert(pages(0, a, 16 * PAGE) == BAD_STATE);
+    // Upstream game evidence: recommit across a borrowed source is a no-op
+    // for live bytes, including when an SDK extends its committed window.
+    assert(!pages(1, src, PAGE));
+    assert(!pages(1, src - PAGE, 2 * PAGE));
+    assert(!pages(1, src + PAGE, 2 * PAGE));
+    assert(!pages(1, a, 16 * PAGE));
+    assert(*(volatile uint8_t *)src == 0x39 && *(volatile uint8_t *)d == 0x72);
     // Existing permission/attribute stubs must not claim to modify a source
     // while the stack mapping owns it. Unrelated behavior remains unchanged.
     for (unsigned svc = 2; svc <= 3; ++svc) {
@@ -286,9 +293,9 @@ static void wrong_mapping_pair(void) {
     unsigned prepares = atomic_load(&write_prepares), protects = atomic_load(&protect_calls);
     uint64_t used = info(I_UsedMem);
     // Both ranges have valid states and exact live ownership, but they do not
-    // name the same backing. This is InvalidMemoryRegion, not InvalidCurrentMemory.
-    assert(unmap(dst_a, src_b, 2 * PAGE) == BAD_REGION);
-    assert(unmap(dst_b, src_a, 2 * PAGE) == BAD_REGION);
+    // name the same backing. Upstream returns InvalidCurrentMemory for both.
+    assert(unmap(dst_a, src_b, 2 * PAGE) == BAD_STATE);
+    assert(unmap(dst_b, src_a, 2 * PAGE) == BAD_STATE);
     // Interior/partial requests still fail the exact live-mapping state check.
     assert(unmap(dst_a + PAGE, src_b + PAGE, PAGE) == BAD_STATE);
     assert(unmap(dst_a, src_b, PAGE) == BAD_STATE);
@@ -321,9 +328,8 @@ static void heap_lifecycle_and_rollback(void) {
     assert(!unmap(d, src, PAGE));
     memset((void *)d, 0x6a, PAGE); // remains host-accessible, logically free
     unsigned prepares = atomic_load(&write_prepares), protects = atomic_load(&protect_calls);
-    atomic_store(&fail_protect, 1);
-    assert(map(d, src, PAGE) == BAD_STATE);
-    assert(atomic_load(&write_prepares) == prepares && atomic_load(&protect_calls) == protects + 1);
+    EXPECT_MEMORY_PROTECTION_FAILURE(map(d, src, PAGE), (void *)src, PAGE);
+    assert(atomic_load(&write_prepares) == prepares && atomic_load(&protect_calls) == protects);
     assert(*(volatile uint8_t *)d == 0x6a && *(volatile uint8_t *)src == 0x53);
     expect_query(src, h, 0x400000, 5, 0, 3);
     expect_state(d, 0, 0, 0);
@@ -575,7 +581,7 @@ int main(void) {
     metadata_exhaustion();
     assert(!g_nmap && !alias_mapped() && !atomic_load(&g_heap_cur));
     assert(info(I_UsedMem) == DM_GAME_MEM_USED);
-    assert(dm_as_destroy(g_alias_space) == DM_AS_OK);
+    free(g_alias_bits); free(g_alias_exposed);
     assert(!munmap(g_as, RESERVE));
     printf("production MapMemory ownership tests passed (mem_map_limit=%d, host page=%zu)\n", DM_GAME_MEM_MAP_LIMIT, host_page());
     return 0;

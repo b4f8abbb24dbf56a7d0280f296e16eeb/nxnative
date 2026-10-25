@@ -2,7 +2,7 @@
 
 The README covers packing and playing. This page is for working on nxnative itself: how it is built, the script's options, running games on the Mac, adding a game, and per-game notes. Agent-oriented details (bring-up failure catalogue, graphics specifics, debugging recipes) are in [docs/agents](agents/README.md).
 
-Shared native alias-page accounting and the gated host reservation core are documented in [Native address regions](native-address-regions.md), including portable tests and the remaining SDK takeover requirements. Existing patches and profiles are retained.
+The upstream bitmap-backed memory transaction and gated native reservation integration are documented in [Native address regions](native-address-regions.md), including portable tests and the remaining SDK takeover requirements. Existing patches and profiles are retained. The [startup memory-hook transaction](memory-hook-transaction.md) prepares immutable adapters and journals actual loader relocations; production activation remains disabled.
 
 ## How it works
 
@@ -15,6 +15,41 @@ Shared native alias-page accounting and the gated host reservation core are docu
 | Input | iOS: the touch gamepad and physical controllers, all as player 1; shaking the phone shakes the controller (its six-axis sensor, `hle_hid.c`; the accelerometer in `DmGamepad.m`, threshold `DM_SHAKE_G`, 1.5 G by default). Mac: scripted input (`DM_KEYS=<seconds>:<button>,…`, `Shake` for a shake, with `DM_KBD=<text>` answering the system keyboard) or `DM_WINDOW=1` for a window with keyboard input (Space shakes) and physical controllers (buttons by position, as on the iPhone). On the Mac each controller is a player of its own, for local co-op: the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (`pad_slots.h`); a controller that is removed frees its player and gets it back when it reconnects, and the log names each one's player and npad (`controller 'Xbox Wireless Controller' connected: player 2 (npad 1)`). Player 1 is the Handheld npad in handheld mode and No1 docked, player n is No n; the game's supported npad ids decide how many play (`hle_hid.c`): a one-player game gets every controller as player 1, and a controller past a game's last player is not used. `DM_PAD_MERGE=1` makes every controller player 1, as before; `DM_KBD_PLAYER=own` makes the keyboard player 1 on its own, with the controllers from player 2 on. The window goes fullscreen from its green button or ⌃⌘F; `DM_FULLSCREEN=1` starts it that way. In fullscreen, a screen whose refresh rate is not a multiple of the game's (144 or 165 Hz) runs at one that is (120 Hz) until the window leaves fullscreen; `DM_SCREEN_MATCH=0` keeps its rate. The drawable follows the window in pixels (fullscreen at the screen's resolution); `DM_METAL_HUD=1` shows Apple's performance HUD (on the iPhone too, from `Documents/env.txt`). The left mouse button is the touchscreen, on the 16:9 picture. In handheld mode the touches also drive `hid::GetGestureStates` (taps, presses, pans, swipes, pinches and rotations recognized by the host, `hle_touch.c`) |
 | iOS app | One unsigned IPA for iPhone and iPad. The rewritten code is embedded in the executable; the shader libraries, the RomFS and the game icon are inside the app. A settings screen comes before the game (`Launcher.swift`, drawn from `dm/launcher.json`, which `dm/games/settings.py` writes from `dm/games/settings.tsv`); the host's loading starts at app launch meanwhile, and the frame rate and render scale go into the frame step state when the game starts (`loader.c` `dm_fps_state_apply`) |
 | Known gaps | Conditional render is always drawn; `MultiDraw*IndirectCount` waits on the CPU for the GPU-written count; geometry shaders do not translate. TBDR optimizations are off by default (they don't understand bindless textures yet). No amiibo. The bundled prewarm lists are empty. On the Mac, Mario's menu and dialogue text render blank (fine on the iPhone) |
+
+## Guest memory SVCs
+
+`dm/host/hle_svc.c` serializes heap resizing, physical map/unmap, stack
+map/unmap and memory queries with one memory-state lock. The alias bitmap is
+the source of committed/free runs for `QueryMemory` and of committed-byte
+accounting. With `mem_map_limit`, heap growth and physical maps check the same
+application-pool budget; overlapping maps charge only newly committed pages.
+Unexpected host protection failures abort before publishing state, including
+the `SetHeapSize` fail-fast check from PR #127.
+
+`MapMemory` borrows opened heap memory, committed alias memory or writable
+static-module data until an exact unmap copies it back. Another borrow,
+decommit, heap shrink or permission/attribute request cannot invalidate that
+source. Queries report its original state with borrowed attribute bit 0 and
+no user permissions. The implementation still copies bytes: source permissions
+are logical, and native host pages cannot isolate adjacent 4 KiB slices.
+Dynamic NRO backing is rejected because reload can restore it outside this
+ownership lifetime. Host-created guest threads allocate their stack backing
+through SDK malloc and free it after SDK thread destruction/copyback. Physical
+recommit may overlap a borrowed source: SDK allocators extend committed windows
+this way, and existing committed bytes are preserved.
+
+A host-page exposure bitmap preserves lazy zero-fill on first commitment.
+Later commits clear only newly committed logical slices, preserving live
+neighbors on a 16 KiB host page. GPU dirty tracking is notified when a mapping
+opens a host page and before stack copyback. The SDK retains address-region
+reservation ownership and its existing build patches.
+
+`make -C dm/host/tests GAME=<id> run` includes the production-dispatcher memory
+tests, real GPU dirty-tracker integration and heap-probe log compatibility.
+The focused targets are `heap_size`, `memory`, `memory-dirty`, `memory-profile`
+and `memory-tsan`; `memory` includes undefined-behavior and address sanitizers.
+The heap-probe check imports the production profile reader and needs only the
+Python standard library; LZ4 is loaded when decoding NSO files.
 
 ## The packing script in detail
 

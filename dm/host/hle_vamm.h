@@ -36,6 +36,9 @@ uint32_t dm_vamm_create(dm_vamm **out, const dm_vamm_config *config);
 uint32_t dm_vamm_destroy(dm_vamm *owner); // rejects any live reservation
 void dm_vamm_initialize(dm_vamm *owner); // idempotent, no-op if resource total=0
 int dm_vamm_is_enabled(dm_vamm *owner);
+// Monotonic lifecycle observation for an explicitly held owner capability.
+// Unlike is_enabled (raw system-resource availability), false means no init.
+int dm_vamm_is_initialized(dm_vamm *owner);
 dm_vamm_resource_usage dm_vamm_resources(dm_vamm *owner);
 // SDK-style absolute alignment: 64 KiB below 2 MiB, 2 MiB otherwise; one
 // 4 KiB guard on EACH side (neighbors may share their separating guard page).

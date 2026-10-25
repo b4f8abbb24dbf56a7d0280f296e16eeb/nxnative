@@ -40,6 +40,7 @@ static const char *const names[DM_SA_ADAPTER_SYMBOL_COUNT] = {
 typedef struct instance {
     void *self;
     dm_sa_allocator *allocator;
+    dm_sa_config configuration;
     unsigned users;
     uint64_t generation;
     int initializing, finalizing;
@@ -51,7 +52,17 @@ static instance *instances;
 static uint64_t next_generation;
 static dm_sa_adapter_config settings;
 static dm_sa_guest_fn originals[DM_SA_ADAPTER_SYMBOL_COUNT];
-static _Atomic int active;
+static _Atomic int active, stopped;
+static int preparing;
+struct dm_sa_adapter_prepared {
+    dm_sa_adapter_config config;
+    dm_sa_guest_fn originals[DM_SA_ADAPTER_SYMBOL_COUNT];
+};
+static dm_sa_adapter_prepared *pending;
+static void require_active(void) {
+    if (!atomic_load_explicit(&active, memory_order_acquire) ||
+        atomic_load_explicit(&stopped, memory_order_acquire)) abort();
+}
 
 static _Noreturn void fail(const char *operation, dm_sa_result result) {
     if (settings.fatal) settings.fatal(settings.context, operation, result);
@@ -62,6 +73,7 @@ static instance *find(const void *self) {
     return NULL;
 }
 static instance *take(const void *self, const char *operation) {
+    require_active();
     pthread_mutex_lock(&mutex);
     instance *i = find(self);
     if (i && (i->initializing || !i->allocator || i->finalizing)) {
@@ -91,6 +103,7 @@ const char *dm_sa_adapter_symbol_name(size_t index) {
 #define ORIGINAL(n, type) ((type)originals[n])
 
 static void forget_finalized(void *self) {
+    require_active();
     pthread_mutex_lock(&mutex);
     instance **p = &instances;
     while (*p && (*p)->self != self) p = &(*p)->next;
@@ -106,6 +119,7 @@ static void forget_finalized(void *self) {
     pthread_mutex_unlock(&mutex);
 }
 static void initialize(void *self, void *buffer, size_t capacity, unsigned cache, int overload) {
+    require_active();
     if (buffer) {
         forget_finalized(self);
         if (overload == INIT) ORIGINAL(INIT, void (*)(void *, void *, size_t))(self, buffer, capacity);
@@ -138,14 +152,17 @@ static void initialize(void *self, void *buffer, size_t capacity, unsigned cache
     dm_sa_config config = {0};
     dm_sa_allocator *allocator = NULL;
     dm_sa_result r = settings.make_config(settings.context, self, capacity, cache & 1u, &config);
+    int configured = r == DM_SA_OK;
     // Requested capacity is never silently shrunk, nor represented as a fake
     // reservation. It bounds lazily acquired real backing in the core.
     if (r == DM_SA_OK && config.capacity != capacity) r = DM_SA_INVALID;
     if (r == DM_SA_OK) r = dm_sa_create(&allocator, &config);
+    if (r != DM_SA_OK && configured && settings.release_config)
+        settings.release_config(settings.context, self, &config);
     pthread_mutex_lock(&mutex);
     i->initializing = 0;
     if (r == DM_SA_OK) {
-        i->allocator = allocator;
+        i->allocator = allocator; i->configuration = config;
         ((unsigned char *)self)[0] = 1;
         ((unsigned char *)self)[1] = (unsigned char)(cache & 1u);
     } else if (fresh) {
@@ -178,6 +195,7 @@ static void ctor_cache2(void *s, void *b, size_t n, unsigned c) { ctor_cache(s,b
 static void init(void *s, void *b, size_t n) { initialize(s,b,n,0,INIT); }
 static void init_cache(void *s, void *b, size_t n, unsigned c) { initialize(s,b,n,c,INIT_CACHE); }
 static void finalize(void *self) {
+    require_active();
     pthread_mutex_lock(&mutex);
     instance *i = find(self);
     if (!i) { pthread_mutex_unlock(&mutex); ORIGINAL(FINALIZE, void (*)(void *))(self); return; }
@@ -189,8 +207,10 @@ static void finalize(void *self) {
     while (i->users) pthread_cond_wait(&idle, &mutex);
     pthread_mutex_unlock(&mutex);
     dm_sa_result r = dm_sa_destroy(i->allocator);
+    if (r == DM_SA_OK && settings.release_config)
+        settings.release_config(settings.context, self, &i->configuration);
     pthread_mutex_lock(&mutex);
-    if (r == DM_SA_OK) { i->allocator = NULL; ((unsigned char *)self)[0] = 0; }
+    if (r == DM_SA_OK) { i->allocator = NULL; memset(&i->configuration, 0, sizeof i->configuration); ((unsigned char *)self)[0] = 0; }
     i->finalizing = 0;
     pthread_mutex_unlock(&mutex);
     if (r != DM_SA_OK) fail("Finalize", r);
@@ -369,14 +389,16 @@ dm_sa_guest_fn dm_sa_adapter_lookup(const char *name) {
     for (size_t n = 0; n < DM_SA_ADAPTER_SYMBOL_COUNT; n++) if (!strcmp(name, names[n])) return hooks[n];
     return NULL;
 }
-dm_sa_result dm_sa_adapter_install(const dm_sa_adapter_config *config) {
+dm_sa_result dm_sa_adapter_prepare(const dm_sa_adapter_config *config, dm_sa_adapter_prepared **out) {
+    if (!out) return DM_SA_INVALID;
+    *out = NULL;
 #ifndef DM_SA_ADAPTER_TESTING
     (void)config;
     return DM_SA_INVALID; // No global production activation on incomplete evidence.
 #else
     if (!config || config->proofs != DM_SA_PROOF_ALL || !config->make_config || !config->forward_allocate || !config->allocation_alignment ||
         !config->symbols || config->symbol_count != DM_SA_ADAPTER_SYMBOL_COUNT ||
-        config->installed_bindings != DM_SA_ADAPTER_ALL_BINDINGS) return DM_SA_INVALID;
+        (!!config->retain_context != !!config->release_context)) return DM_SA_INVALID;
     for (size_t h = 0; h < DM_SA_ADAPTER_SYMBOL_COUNT; h++)
         if ((dm_sa_guest_fn)config->forward_allocate == hooks[h]) return DM_SA_INVALID;
     dm_sa_guest_fn resolved[DM_SA_ADAPTER_SYMBOL_COUNT] = {0};
@@ -391,14 +413,65 @@ dm_sa_result dm_sa_adapter_install(const dm_sa_adapter_config *config) {
         resolved[index] = s->function;
     }
     pthread_mutex_lock(&mutex);
-    if (atomic_load_explicit(&active, memory_order_relaxed)) {
+    if (preparing || pending || atomic_load_explicit(&active, memory_order_relaxed)) {
         pthread_mutex_unlock(&mutex); return DM_SA_BUSY;
     }
-    settings = *config;
-    settings.symbols = NULL; // caller's census need not outlive installation
-    memcpy(originals, resolved, sizeof originals);
+    preparing = 1;
+    pthread_mutex_unlock(&mutex);
+    dm_sa_adapter_prepared *p = malloc(sizeof *p);
+    dm_sa_result result = p ? DM_SA_OK : DM_SA_NO_MEMORY;
+    if (p) {
+        p->config = *config;
+        p->config.symbols = NULL; // no borrowed caller census after preparation
+        memcpy(p->originals, resolved, sizeof resolved);
+        if (p->config.retain_context) result = p->config.retain_context(p->config.context);
+    }
+    pthread_mutex_lock(&mutex);
+    preparing = 0;
+    if (result == DM_SA_OK) { pending = p; *out = p; } else free(p);
+    pthread_mutex_unlock(&mutex);
+    return result;
+#endif
+}
+dm_sa_guest_fn dm_sa_adapter_prepared_hook(const dm_sa_adapter_prepared *p, size_t index) {
+    pthread_mutex_lock(&mutex);
+    dm_sa_guest_fn hook = p && p == pending && index < DM_SA_ADAPTER_SYMBOL_COUNT ? hooks[index] : NULL;
+    pthread_mutex_unlock(&mutex); return hook;
+}
+void dm_sa_adapter_publish(dm_sa_adapter_prepared *p) {
+    pthread_mutex_lock(&mutex);
+    if (!p || p != pending) abort();
+    settings = p->config; memcpy(originals, p->originals, sizeof originals);
+    pending = NULL; free(p);
     atomic_store_explicit(&active, 1, memory_order_release);
     pthread_mutex_unlock(&mutex);
+}
+void dm_sa_adapter_cancel(dm_sa_adapter_prepared *p) {
+    pthread_mutex_lock(&mutex);
+    if (!p || p != pending) abort();
+    pending = NULL; preparing = 1;
+    pthread_mutex_unlock(&mutex);
+    if (p->config.release_context) p->config.release_context(p->config.context);
+    free(p);
+    pthread_mutex_lock(&mutex); preparing = 0; pthread_mutex_unlock(&mutex);
+}
+dm_sa_result dm_sa_adapter_shutdown(void) {
+    pthread_mutex_lock(&mutex);
+    if (!atomic_load_explicit(&active, memory_order_relaxed) || atomic_load_explicit(&stopped, memory_order_relaxed)) {
+        pthread_mutex_unlock(&mutex); return DM_SA_INVALID;
+    }
+    for (instance *i = instances; i; i = i->next) if (i->allocator || i->users || i->initializing || i->finalizing) {
+        pthread_mutex_unlock(&mutex); return DM_SA_BUSY;
+    }
+    atomic_store_explicit(&stopped, 1, memory_order_release);
+    while (instances) { instance *i = instances; instances = i->next; free(i); }
+    pthread_mutex_unlock(&mutex);
+    if (settings.release_context) settings.release_context(settings.context);
     return DM_SA_OK;
-#endif
+}
+dm_sa_result dm_sa_adapter_install(const dm_sa_adapter_config *config) {
+    dm_sa_adapter_prepared *p = NULL;
+    dm_sa_result r = dm_sa_adapter_prepare(config, &p);
+    if (r == DM_SA_OK) dm_sa_adapter_publish(p);
+    return r;
 }

@@ -38,7 +38,7 @@ uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 void dm_guest_write_prepare(void *p, size_t n) { (void)p; (void)n; }
 
-static const size_t heap_unit = 0x200000; // SetHeapSize is aligned to 2 MiB.
+static const size_t heap_unit = 0x200000; // Exercise ordinary SDK-sized heap steps.
 static size_t old_size, requested;
 static int calls, injected_error, last_prot;
 static volatile sig_atomic_t abort_validated;
@@ -105,7 +105,7 @@ static void used_memory(size_t heap_size) {
     assert(r[0] == 0 && r[1] == heap_size + DM_GAME_MEM_USED);
 }
 int main(void) {
-    // Exercise the real pthread_once initialization and address manager using
+    // Exercise the real pthread_once initialization and bitmap backend using
     // the small synthetic profile; setting g_as no longer bypasses mem_init.
     mem_init();
     assert(g_heap_cap >= 4 * heap_unit && 4 * heap_unit < APP_POOL);
@@ -122,7 +122,7 @@ int main(void) {
     success(0); used_memory(0);
     success(0);                              // unchanged empty heap
     success(heap_unit); success(0);               // regrowth after release
-    assert(dm_as_destroy(g_alias_space) == DM_AS_OK);
+    free(g_alias_bits); free(g_alias_exposed);
     assert(munmap(g_as, RESERVE) == 0);
     puts("SetHeapSize production dispatcher: growth, shrink, unchanged, zero, failure state and fail-fast passed");
     return 0;

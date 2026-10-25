@@ -71,6 +71,8 @@ uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 
+#include "memory_failure_test.h"
+
 static uint64_t call(unsigned svc, uint64_t a, uint64_t b, uint64_t c) {
     uint64_t regs[31] = {a, b, c}; svc_dispatch(svc, regs, 0); return regs[0];
 }
@@ -174,7 +176,6 @@ static void native_tests(void) {
     dm_vamm_config c; assert(!dm_vamm_native_configure(&c, 128));
     assert(c.base == info(2) && c.size == info(3) - info(28) && !c.context);
     assert(c.max_regions == 128 && !alias_mapped() && !g_nmap);
-    assert(dm_as_reserve(g_alias_space, PAGE, PAGE, &(uintptr_t){0}) == DM_AS_WRONG_MODE);
     dm_vamm *v; assert(!dm_vamm_create(&v, &c));
     assert(!dm_vamm_adapter_lookup(dm_vamm_adapter_symbol_name(0)));
     uintptr_t base = 7;
@@ -195,10 +196,9 @@ static void native_tests(void) {
     assert(dm_vamm_pages(v, base, SMALL + PAGE, 1) == DM_VAMM_INVALID);
     assert(dm_vamm_free(v, base + PAGE) == DM_VAMM_INVALID);
 
-    // Map backend failure rolls back the real SVC transaction; nn::os then
-    // aborts for this result rather than returning the synthetic 0x803 fiction.
-    atomic_store(&fail_protect, 1);
-    assert(dm_vamm_svc_change_pages(base, SMALL, 1) == 0xd401 && !alias_mapped());
+    // Host protection failure aborts within SVC before state publication.
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_vamm_svc_change_pages(base, SMALL, 1), NULL, 0);
+    assert(!alias_mapped());
     query_state(base, 0, 0, 0);
     assert(stats(v).regions == 1 && stats(v).reserved_bytes == SMALL);
     expect_native_map_abort(&c, base, 1);
@@ -207,18 +207,19 @@ static void native_tests(void) {
     assert(*(unsigned char *)base == 0xa5); resource_test(v, &c);
 
     // Atomic failed unmap leaves both owner ledger and all native bytes live.
-    atomic_store(&fail_protect, 1);
-    assert(dm_vamm_free(v, base) == 0x803 && stats(v).regions == 1);
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_vamm_free(v, base), (void *)base, SMALL);
+    assert(stats(v).regions == 1);
     assert(alias_mapped() == SMALL && *(unsigned char *)base == 0xa5);
     uintptr_t stack = info(I_StackAddr);
     assert(!call(4, stack, base, PAGE));
     *(unsigned char *)stack = 0x56;
     unsigned before = atomic_load(&protect_calls);
-    assert(dm_vamm_svc_change_pages(base, SMALL, 1) == 0xd401);
+    assert(!dm_vamm_svc_change_pages(base, SMALL, 1));
     assert(dm_vamm_pages(v, base, PAGE, 0) == 0x803);
     assert(dm_vamm_free(v, base) == 0x803 && stats(v).regions == 1);
     assert(alias_mapped() == SMALL && atomic_load(&protect_calls) == before);
-    expect_native_map_abort(&c, base, 0);
+    assert(!c.change_pages(c.context, base, SMALL, 1));
+    assert(*(unsigned char *)base == 0xa5 && *(unsigned char *)stack == 0x56);
     query_state(base, 5, 1, 0);
     assert(!call(5, stack, base, PAGE) && *(unsigned char *)base == 0x56);
     assert(!dm_vamm_free(v, base) && !alias_mapped() && !stats(v).regions);
@@ -283,7 +284,7 @@ int main(void) {
     struct rlimit core = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &core));
     domain_tests(); result_tests(); native_tests();
     assert(!alias_mapped() && !g_nmap && !atomic_load(&g_heap_cur));
-    assert(dm_as_destroy(g_alias_space) == DM_AS_OK);
+    free(g_alias_bits); free(g_alias_exposed);
     assert(!munmap(g_as, RESERVE));
     printf("native Vamm domain/result/resource/SVC tests passed (limit=%d host=%zu resource=%#llx)\n",
            DM_GAME_MEM_MAP_LIMIT, host_page(), (unsigned long long)DM_GAME_SYS_RESOURCE);

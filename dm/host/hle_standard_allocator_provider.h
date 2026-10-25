@@ -29,7 +29,7 @@ typedef struct {
 
 // Callbacks are trusted, verified integration boundaries, not plugin hooks.
 // The per-instance core mutex stays held; their complete call closure must not
-// re-enter that core or take a reverse-ordered lock. g_map_lock/g_phys_mu and
+// re-enter that core or take a reverse-ordered lock. g_map_lock and
 // provider metadata locks are NEVER held while an owner callback runs. Ledger
 // transitions serialize under the SVC source guard, with in-flight records.
 // An owner success violating the exact lease/domain/alignment contract aborts
@@ -44,7 +44,7 @@ dm_sa_result dm_sa_sdk_provider_destroy(dm_sa_sdk_provider *provider);
 // Internal SVC ownership bridge. The scope is the existing MapMemory source
 // lock; it does not establish SDK reservation ownership. Only the provider's
 // exact successful-lease ledger does that. _locked helpers require the scope.
-// Lock order remains source scope -> physical accounting -> address manager.
+// This one scope protects borrowed sources, physical backing and accounting.
 void dm_sa_svc_scope_begin(void);
 void dm_sa_svc_scope_end(void);
 int dm_sa_svc_alias_range_locked(uintptr_t base, size_t size);

@@ -1,4 +1,4 @@
-"""All shipped profiles fit the native address manager's actual host-page bounds."""
+"""All shipped profiles fit the native memory layout's actual host-page bounds."""
 import sys
 import unittest
 from pathlib import Path
@@ -14,8 +14,7 @@ class NativeAddressProfileTests(unittest.TestCase):
         for profile in profiles:
             with self.subTest(profile=profile.id):
                 reserve, alias, stack = (profile.int(key) for key in ('mem_reserve', 'mem_alias', 'mem_stack'))
-                # A zero-size alias is not a supported manager configuration;
-                # no shipped profile uses one, including sys_resource=0 games.
+                # No shipped profile uses a zero-size alias, including sys_resource=0 games.
                 self.assertGreater(alias, 0)
                 self.assertGreaterEqual(stack, 0)
                 self.assertGreaterEqual(reserve, 0x10000000)

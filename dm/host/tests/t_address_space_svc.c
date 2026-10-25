@@ -47,6 +47,8 @@ uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 
+#include "memory_failure_test.h"
+
 #include "heap_failure_test.h"
 
 static uint64_t info(unsigned id) {
@@ -97,8 +99,6 @@ int main(void) {
     assert(info(I_AslrSize) == DM_GAME_MEM_RESERVE);
     assert(info(I_TotalMem) == DM_GAME_APP_POOL);
     assert(info(I_UsedMem) == DM_GAME_MEM_USED);
-    uintptr_t reserved = 7;
-    assert(dm_as_reserve(g_alias_space, 0x1000, 0x1000, &reserved) == DM_AS_WRONG_MODE && reserved == 7);
 
     assert(!pages(1, a + 0x4000, 0x8000));
     assert(write_prepares == 1 && prepared_base == a + 0x4000 && prepared_size == 0x8000);
@@ -118,13 +118,13 @@ int main(void) {
     query(a + 0xc000, a + 0xc000, 0x4000, 5);
     assert(*(volatile uint8_t *)(a + 0x4000) == 0x5a);
 
-    atomic_store(&fail_protect, 1);
     size_t prepares_before = write_prepares;
-    assert(pages(1, a + 0x8000, 0x4000) == 0xd401 && alias_mapped() == 0x8000);
+    EXPECT_MEMORY_PROTECTION_FAILURE(pages(1, a + 0x8000, 0x4000), (void *)(a + 0x4000), 0x4000);
+    assert(alias_mapped() == 0x8000);
     assert(write_prepares == prepares_before);
     query(a + 0x8000, a + 0x8000, 0x4000, 0);
-    atomic_store(&fail_protect, 1);
-    assert(pages(0, a + 0x4000, 0x4000) == 0xd401 && alias_mapped() == 0x8000);
+    EXPECT_MEMORY_PROTECTION_FAILURE(pages(0, a + 0x4000, 0x4000), (void *)(a + 0x4000), 0x4000);
+    assert(alias_mapped() == 0x8000);
     assert(*(volatile uint8_t *)(a + 0x4000) == 0x5a);
     query(a + 0x4000, a + 0x4000, 0x4000, 5);
     assert(!pages(1, a + 0x8000, 0x4000));
@@ -164,7 +164,7 @@ int main(void) {
     for (unsigned i = 0; i < 8; ++i) assert(!pthread_create(&threads[i], NULL, map_worker, (void *)(a + i * 0x10000)));
     for (unsigned i = 0; i < 8; ++i) assert(!pthread_join(threads[i], NULL));
     assert(alias_mapped() == 0 && info(I_UsedMem) == DM_GAME_MEM_USED);
-    assert(dm_as_destroy(g_alias_space) == DM_AS_OK);
+    free(g_alias_bits); free(g_alias_exposed);
     assert(!munmap(g_as, RESERVE));
     printf("production SVC address-space tests passed (mem_map_limit=%d)\n", DM_GAME_MEM_MAP_LIMIT);
     return 0;

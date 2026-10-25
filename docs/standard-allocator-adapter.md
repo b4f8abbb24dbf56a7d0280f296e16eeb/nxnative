@@ -1,8 +1,8 @@
 # StandardAllocator symbol boundary (experimental)
 
-**Shipping activation is hard-disabled.** `dm_sa_adapter_install` rejects even
+**Shipping activation is hard-disabled.** `dm_sa_adapter_prepare` rejects even
 complete proof flags unless this translation unit is built with the synthetic
-fixture-only `DM_SA_ADAPTER_TESTING` macro. There is no production installer or
+fixture-only `DM_SA_ADAPTER_TESTING` macro. There is no enabled production installer or
 new `HLE_FORCE` registration. No game profile, SDK rewrite or game patch changes.
 
 ## Implemented vertical slice
@@ -14,20 +14,30 @@ management cleanup, WalkAllocatedBlocks, Dump and Hash. The supplied SDK exports
 no StandardAllocator destructor; an extra or missing destructor/method rejects
 this census rather than claiming an unknown ABI is covered.
 
-Synthetic activation requires every symbol, every binding bit, nonrecursive
+Synthetic preparation requires every symbol, nonrecursive
 original function addresses, an original Allocate(size) forwarding callback, a native managed-alignment policy callback,
 and explicit ABI/caller/inline/current-owner/behavior proof bits. All validation
-precedes publication. These bits are requirements for future integration, not a
-substitute for evidence. A real loader transaction must finish before any guest
-execution and must cover every relocation, dynamically loaded module and direct
-or inline path; the current code does not install such a transaction.
+precedes publication. Preparation copies its complete table and returns a single
+exclusive, cancelable lease. Prepared hooks can be used as relocation targets,
+but calling them before publication aborts; lookup remains inactive. Publication
+allocates nothing and calls no guest code. The binding-mask assertion is gone. These bits are requirements for future integration, not a
+substitute for evidence. The bounded
+[loader transaction](memory-hook-transaction.md) journals actual relocations and
+publishes both groups before guest entry. It rejects all deferred NROs; direct,
+inline and private paths remain evidence requirements, not covered by a symbol
+census. No production startup path invokes installation.
 
 A side table holds the managed instance and its real provider-backed core.
 Initialization publishes a provisional initializing state, then invokes its
 configuration factory and creates the core without holding the registry lock.
 Other instances remain usable from the factory. Same-instance calls, constructors,
 reinitialization and Finalize reject that in-flight state with BUSY rather than
-reentering the SDK or deadlocking. Failed first initialization removes only its
+reentering the SDK or deadlocking. A successful factory configuration is retained until core destruction and can
+supply `release_config` for exact cleanup, including validation/create failure;
+failed Finalize retains that configuration. Paired context retain/release callbacks
+keep the active table safe even with zero live instances. Host shutdown refuses
+live/in-flight instances, releases context, and permanently stops intercepted
+hooks without restoring SDK ownership. Failed first initialization removes only its
 provisional record; failed reinitialization keeps its finalized tombstone. Only
 null-buffer initialization becomes managed. Provided-buffer and other SDK-owned
 objects call their captured original methods unchanged. Once managed, failures
@@ -127,7 +137,8 @@ remains inactive even with a complete advertised census and all proof flags.
 The ABI fixture is original handwritten assembly and runs only on native
 AArch64, checking x0/self plus x8/24-byte aggregate return. Other architectures
 explicitly print `SKIP`; ordinary x86 aggregate tests are not an AArch64 result.
-On the current x86_64 executor the adapter normal, ASan+UBSan and TSan checks
-pass, but live AArch64/macOS/iOS execution is not available. LeakSanitizer is
-blocked by this executor's ptrace runtime; `ASAN_OPTIONS=detect_leaks=0` permits
-the address/undefined checks and is not a leak-clean claim.
+Report normal and sanitizer results for the exact rebased commit; an earlier
+branch's pass does not validate changed integration. Native AArch64 execution is
+required for an ABI pass, independently of Apple host/iOS and gameplay checks.
+Where ptrace blocks LeakSanitizer, `ASAN_OPTIONS=detect_leaks=0` permits the
+address/undefined checks and is not a leak-clean claim.

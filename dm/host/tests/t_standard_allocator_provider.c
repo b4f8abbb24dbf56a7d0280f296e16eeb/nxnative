@@ -61,6 +61,8 @@ uint64_t guest_ns(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 
+#include "memory_failure_test.h"
+
 static uint64_t call(unsigned svc, uint64_t a, uint64_t b, uint64_t c) {
     uint64_t regs[31] = {a, b, c}; svc_dispatch(svc, regs, 0); return regs[0];
 }
@@ -81,7 +83,7 @@ typedef struct {
     pthread_mutex_t mutex; // synthetic original SDK's Vamm ownership lock
     uintptr_t base, stack, borrowed;
     size_t sizes[SLOT_COUNT], allocation_calls, release_calls, query_calls;
-    int fail_allocate, fail_query, borrow_acquire, borrow_release;
+    int fail_allocate, fail_release, fail_query, borrow_acquire, borrow_release;
     uintptr_t borrow_query;
     uintptr_t race_commit;
     uintptr_t grow_metadata_then_fail;
@@ -141,6 +143,7 @@ static uint32_t free_original(void *context, uintptr_t base) {
     assert(base >= o->base && !((base - o->base) % SLOT_SIZE));
     unsigned i = (unsigned)((base - o->base) / SLOT_SIZE);
     assert(i < SLOT_COUNT && o->sizes[i]);
+    if (o->fail_release) { o->fail_release = 0; pthread_mutex_unlock(&o->mutex); return 0xd401; }
     if (o->borrow_release) { o->borrow_release = 0; borrow(o, base); }
     uint32_t rc = (uint32_t)pages(0, base, o->sizes[i]);
     if (!rc) o->sizes[i] = 0; // failure leaves exact reservation intact
@@ -201,8 +204,6 @@ int main(void) {
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
     dm_sa_allocator *a = make_allocator(provider);
     assert(!o.allocation_calls && stats(a).capacity == (size_t)62 << 30);
-    uintptr_t reserved = 7;
-    assert(dm_as_reserve(g_alias_space, PAGE, PAGE, &reserved) == DM_AS_WRONG_MODE && reserved == 7);
 
     // Actual pool use (heap plus independent alias maps), never arena capacity.
     assert(!call(1, 0, 0x1800000, 0));
@@ -254,8 +255,8 @@ int main(void) {
     void *p = (void *)1;
     o.fail_allocate = 1;
     assert(dm_sa_allocate(a, 32, 16, &p) == DM_SA_PROVIDER_FAILED && p == (void *)1);
-    atomic_store(&fail_protect, 1);
-    assert(dm_sa_allocate(a, 32, 16, &p) == DM_SA_PROVIDER_FAILED && p == (void *)1);
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_sa_allocate(a, 32, 16, &p), NULL, 0);
+    assert(p == (void *)1);
     no_leases(&o, a);
     guest_active = 0;
     size_t calls = o.allocation_calls;
@@ -313,10 +314,11 @@ int main(void) {
     assert(dm_sa_get_size(a, p, &size) == DM_SA_OK && size == POOL);
     return_borrow(&o); assert(dm_sa_free(a, p) == DM_SA_OK); no_leases(&o, a);
 
-    // Backend release failure is transactional; finalized core remains closed
+    // A logical owner release failure is transactional; finalized core remains closed
     // with exact backing until destroy retries (no SDK fallback or lost lease).
     assert(dm_sa_allocate(a, 32, 16, &p) == DM_SA_OK);
-    atomic_store(&fail_protect, 1);
+    EXPECT_MEMORY_PROTECTION_FAILURE(dm_sa_finalize(a), p, 32);
+    o.fail_release = 1;
     assert(dm_sa_finalize(a) == DM_SA_PROVIDER_FAILED);
     assert(stats(a).closed && stats(a).backing_bytes == POOL && owned_count(&o) == 1);
     assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_BUSY);

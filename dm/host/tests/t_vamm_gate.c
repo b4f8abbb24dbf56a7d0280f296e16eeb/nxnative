@@ -12,8 +12,7 @@ int main(void) {
     dm_vamm_symbol symbols[DM_VAMM_SYMBOL_COUNT];
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i)
         symbols[i] = (dm_vamm_symbol){dm_vamm_adapter_symbol_name(i), never};
-    dm_vamm_adapter_config c = {.proofs = DM_VAMM_PROOF_ALL, .installed_bindings = DM_VAMM_ALL_BINDINGS,
-        .symbols = symbols, .symbol_count = DM_VAMM_SYMBOL_COUNT,
+    dm_vamm_adapter_config c = {.proofs = DM_VAMM_PROOF_ALL, .symbols = symbols, .symbol_count = DM_VAMM_SYMBOL_COUNT,
         .owner = {.base = 0x10000, .size = 0x100000, .max_regions = 32, .change_pages = pages, .resources = resources}};
     assert(dm_vamm_adapter_install(&c) == DM_VAMM_INVALID);
     for (unsigned i = 0; i < DM_VAMM_SYMBOL_COUNT; ++i) assert(!dm_vamm_adapter_lookup(symbols[i].name));

@@ -35,12 +35,12 @@ machine code are included in this implementation or its synthetic tests.
 fixed native alias domain. It allocates bounded host metadata, not a guest node
 area. It must never run beside the original SDK reservation owner.
 
-The existing `g_alias_space` remains in `DM_AS_EXTERNAL_RESERVATIONS` mode and
-continues to own kernel-style physical-page accounting. This is intentionally
-not switched to host-reservation mode: raw `MapPhysicalMemory` callers must not
-be forced to hold an SDK reservation. An uncommitted physical interval is not
-proof that it is unreserved. Only the Vamm ledger supplies reservation facts.
-The two managers have different roles, not competing reservation free lists.
+Upstream's `hle_svc.c` bitmap remains the sole physical-page authority. Raw
+`MapPhysicalMemory` callers are not forced to hold a Vamm reservation. An
+uncommitted physical interval is not proof that it is unreserved; only the
+current reservation owner's ledger supplies reservation facts. The superseded
+experimental address-space manager has been removed, not layered underneath
+this owner.
 
 Core contracts:
 
@@ -55,11 +55,13 @@ Core contracts:
 - Combined reserve/map publishes no output or ledger entry if mapping fails;
   successful mapping has no later fallible metadata step.
 - Free decommits the entire recorded payload before removing its record. A
-  borrowed MapMemory source or backend failure retains both ownership and
-  physical contents. Foreign/interior/cross-reservation ranges are rejected.
-- Native page callbacks hold the Vamm lock, then acquire source guard, physical
-  accounting and page-manager locks in that order. They must be atomic on
-  failure, must not run guest callbacks, and must not reenter Vamm. Production
+  borrowed MapMemory source causes a returning rejection that retains ownership
+  and contents. Host protection failures abort before ledger/accounting
+  publication, as upstream requires. Foreign/interior/cross-reservation ranges
+  are rejected.
+- Native page callbacks hold the Vamm lock, then acquire upstream's single
+  `g_map_lock` for source ownership, physical backing and accounting. They must
+  not run guest callbacks or reenter Vamm. Production
   result translation belongs at that verified callback boundary; synthetic
   tests do not claim to establish every SDK's invalid-input/abort policy.
 - `sys_resource=0` keeps initialize disabled with no page changes. Resource
@@ -88,10 +90,12 @@ owner does not hard-code that assumption; nonzero deductions are tested.
 Preparing configuration does not initialize an owner or transfer reservations.
 
 The page callback and the public MapPhysicalMemory/UnmapPhysicalMemory SVCs
-share one native transaction. It acquires source ownership, physical accounting
-and address-manager locks in that order, rejects borrowed source overlap before
-calling the backend, and retains the existing atomic page/accounting failure
-contract. No guest callbacks or dispatcher reentry occur. Limited profiles
+share the upstream bitmap transaction under one `g_map_lock`. Decommit rejects
+borrowed-source overlap before changing backing. Recommit may overlap borrowed
+sources and extend their committed windows while preserving existing bytes,
+retaining upstream's Raging Loop fix. Host protection failures abort before
+publishing new accounting, rather than returning a recoverable result.
+No guest callbacks or dispatcher reentry occur. Limited profiles
 still enforce the application pool; ordinary legacy-unlimited callers remain
 unlimited. Only the existing provider's thread-local allocation scope adds the
 strict current heap/image/alias budget, atomically at commit.
@@ -109,12 +113,13 @@ result policy of the inspected SDK, not the old fixture's generic guess:
 | other nonzero result | fatal | fatal |
 
 Upper result-context bits are masked for error comparisons, not for detecting
-success. In particular, `0xd001` and `0xd401` are different results. A native
-map backend failure currently returns `0xd401`: its SVC transaction rolls back,
-but the nn::os boundary then aborts rather than reporting a recoverable failure.
-Unmap with that same result returns `0x803` and keeps the Vamm reservation live.
-This is an observed contract for the inspected SDK, not activation proof for
-arbitrary SDK versions. There is no guest abort callback under native locks.
+success. In particular, `0xd001` and `0xd401` are different results. A returning
+invalid-current-memory unmap, such as decommit of a borrowed source, translates
+to `0x803` and keeps the Vamm reservation live. Backend mprotect failure is
+separate: upstream aborts inside the SVC transaction before result translation
+for both map and unmap. The table is an observed contract for the inspected
+SDK, not activation proof for arbitrary versions. There is no guest abort
+callback under native locks.
 
 The resource callback returns GetInfo 16/17 **unmodified**. The Vamm owner alone
 adds and bounds the 512 KiB headroom; no alias reservations or committed bytes
@@ -124,22 +129,32 @@ are substituted for system resources. Tests include zero and tiny totals.
 
 `hle_vamm_adapter.[ch]` includes all 18 signatures, including constructor aliases,
 public/detail initialization, the independent combined allocation path and the
-16-byte resource return. It validates a complete symbol census, originals,
-proof requirements and complete binding mask before publishing a table. Failure
-leaves lookup unavailable so a loader can keep the entire SDK group original.
+16-byte resource return. Preparation validates and copies the complete originals
+and preallocates the reservation owner, returning one exclusive cancelable lease.
+Lookup remains inactive until publication. Calling a prepared constructor or
+initializer aborts before invoking any original or resource callback. Cancellation
+destroys only never-published, empty host metadata. Alternatively an explicit
+`shared_owner` and native retain/release pair pin the runtime-owned Vamm through
+preparation/publication; cancellation or drained shutdown releases that handle
+without destroying the runtime owner. Reentrant lifecycle calls from retain or
+release callbacks reject rather than deadlock. Publication is infallible for
+the outstanding lease and performs no allocation or guest callback.
+
 The only original operation invoked after a synthetic handoff is the verified
 non-owning bootstrap constructor. The SDK tree initializer is never invoked.
 A mismatched detail object is fatal, never a fallback to another owner.
 
-The production install function unconditionally rejects activation even if all
-proof flags are supplied. Only `DM_VAMM_ADAPTER_TESTING` enables synthetic
-installation. There are no `HLE`/`HLE_FORCE` registrations, loader edits or SVC
-ownership changes. The binding mask is an integration assertion tested for
-completeness, **not evidence that a live loader has installed those hooks**.
-A future loader still needs a startup transaction that installs the complete
-group before guest execution and retains original bindings on preflight failure.
-Shutdown keeps the group intercepted: it cannot silently restore an SDK owner
-into memory the host previously owned.
+Production preparation unconditionally rejects activation even if all proof flags
+are supplied. Only `DM_VAMM_ADAPTER_TESTING` enables synthetic preparation. There
+are no new `HLE`/`HLE_FORCE` registrations. The old asserted binding mask is removed:
+the [bounded loader transaction](memory-hook-transaction.md) derives its actual
+census and journal from the mapped modules, replaces both complete groups before
+guest execution, and retains original slot values on failure. It rejects NROs,
+late installation, duplicate owners and unsupported relocation shapes. It does
+not prove the absence of private/direct/inline accesses or a prior owner, and no
+production startup path supplies an installation configuration. Shutdown keeps
+the group intercepted: it cannot restore an SDK owner into previously host-owned
+memory.
 
 ### Remaining activation blockers
 
@@ -150,10 +165,10 @@ into memory the host previously owned.
 2. Proven original constructor-only bootstrap and a handoff before **any** SDK
    node owner or conflicting reservation is created. Existing live reservations
    are not imported or migrated by this prototype.
-3. Verify the native callback/result and exact-domain contracts against every
-   supported SDK, then implement the loader's atomic group installation
-   transaction and native AArch64 signature validation. The native bridge above
-   does not establish a safe owner handoff.
+3. Verify native callback/result and exact-domain contracts against each supported
+   SDK, plus the bounded loader transaction and all target-specific call paths.
+   The native bridge and startup transaction do not alone establish complete
+   owner-handoff compatibility.
 4. Real target-device, unpatched initialization and exhaustion/rollback tests,
    concurrency/teardown, GPU pointer registration, rendering and gameplay.
 
@@ -173,20 +188,21 @@ make -C dm/host/tests vamm-native vamm-native-sanitize vamm-native-tsan
 
 The normal, ASan/UBSan and TSan targets each execute 12 combinations: 4/16 KiB
 host pages, limited/unlimited physical profiles, constructor aliases C1/C2 and
-disabled initialization. Tests compile the actual SVC manager, reservation owner,
+disabled initialization. Tests compile the actual upstream SVC backend, reservation owner,
 complete dispatcher, existing span provider and StandardAllocator core together.
 They verify guards/alignment, fragmentation statistics, rollback, borrowed-source
 retention, raw SVC behavior, no node-area commit, metadata exhaustion,
 multithreaded allocation/free, complete dispatch and blocked shipping install.
 
-On the current x86 host the AArch64 fixture explicitly skips rather than claiming
-native ABI validation. ASan/UBSan passed with `ASAN_OPTIONS=detect_leaks=0` because
-LeakSanitizer cannot run under the harness's ptrace; no leak-check pass is claimed.
-The expected failure-injection tests log SVC backend errors deliberately.
+On x86 the AArch64 fixture explicitly skips rather than claiming native ABI
+validation. When ptrace prevents LeakSanitizer, `ASAN_OPTIONS=detect_leaks=0`
+permits ASan/UBSan checks without claiming a leak-check pass. Results must name
+the tested rebased commit. Expected fatal-policy injections run in child
+processes; a process abort is not treated as a recoverable backend result.
 
 The native bridge targets additionally run six configurations: 4/16 KiB host
 pages with limited/unlimited maps, and disabled/tiny system-resource totals.
-They use production native callbacks with the actual SVC manager and provider,
+They use production native callbacks with the actual upstream SVC backend and provider,
 checking exact-domain validation, operation-specific result/abort behavior,
 borrowed sources, strict nested budgets/image floor, exhaustion, rollback,
 raw SVC compatibility, resource totals and concurrent allocation/free. Expected

@@ -156,14 +156,14 @@ static void sa_init(void) {
     g_sa_big_align = DM_GAME_ALLOC_BIG_ALIGN;
     if (g_sa_big_align) LOG("StandardAllocator::Allocate: allocations ≥ 64 KB are 64 KB aligned (game profile alloc_big_align: memory pool storage, see hle_os.c)");
 }
-size_t dm_sa_host_allocation_alignment(void *self, size_t size) {
-    (void)self;
+void *dm_sa_host_forward_allocate(void *self, size_t size) {
     pthread_once(&g_sa_once, sa_init);
-    return g_sa_big_align && size >= 0x10000 ? 0x10000 : 16;
+    size_t alignment = dm_sa_host_allocation_alignment(self, size);
+    return alignment > 16 ? g_sa_alloc_al(self, size, alignment) : g_sa_alloc(self, size);
 }
 HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEm", "passed straight to the SDK; with the profile's alloc_big_align (13 Sentinels, Unicorn Overlord) allocations ≥ 64 KB are 64 KB aligned (memory pool start)", void *, h_mem_SAAllocate, void *self, size_t size) {
     void *managed;
     size_t alignment = dm_sa_host_allocation_alignment(self, size);
     if (dm_sa_adapter_allocate_if_managed(self, size, alignment, &managed)) return managed;
-    return alignment > 16 ? g_sa_alloc_al(self, size, alignment) : g_sa_alloc(self, size);
+    return dm_sa_host_forward_allocate(self, size);
 }
