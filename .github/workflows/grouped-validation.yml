@@ -45,6 +45,12 @@ jobs:
           path: native
           fetch-depth: 2
           persist-credentials: false
+      - name: Check out unchanged upstream for initializer baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 0f99c353d3abc334c39855d691afdfab40f4639f
+          path: baseline
+          persist-credentials: false
       - name: Verify exact heads and upstream parents
         run: |
           mkdir -p logs
@@ -87,6 +93,43 @@ jobs:
             done
             echo "::endgroup::"
           done
+      - name: Reproduce upstream ASan initializer failure without GPU work
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          test "$(git -C baseline rev-parse HEAD)" = 0f99c353d3abc334c39855d691afdfab40f4639f
+          cat > baseline/dm/gfx/tests/t_ci_empty_main.m <<'C'
+          #include "../nvn/nvn_mtl.m"
+          void *front_metal_layer(void) { return NULL; }
+          module_t *module_of(const void *p) { (void)p; return NULL; }
+          module_t g_mod[MAX_MOD]; int g_nmod;
+          void svc_thread_dump(void) {}
+          uint64_t now_ns(void) { return bp_now(); }
+          int main(void) { puts("CI_EMPTY_MAIN_REACHED"); return 0; }
+          C
+          printf 't_ci_empty_main: t_ci_empty_main.m $(MTL_T_DEP)\n\tclang $(CFLAGS) -fobjc-arc -o $@ t_ci_empty_main.m $(MTL_T_SRC) $(FW)\n' > "$RUNNER_TEMP/init.mk"
+          flags="-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/$GAME"
+          make -C baseline/dm/gfx/tests -f Makefile -f "$RUNNER_TEMP/init.mk" GAME="$GAME" CFLAGS="$flags" t_ci_empty_main 2>&1 | tee logs/upstream-initializer-normal-build.log
+          baseline/dm/gfx/tests/t_ci_empty_main 2>&1 | tee logs/upstream-initializer-normal.log
+          grep -q CI_EMPTY_MAIN_REACHED logs/upstream-initializer-normal.log
+          make -C baseline/dm/gfx/tests -f Makefile -f "$RUNNER_TEMP/init.mk" GAME="$GAME" -B CFLAGS="$flags -fsanitize=address -fno-omit-frame-pointer" t_ci_empty_main 2>&1 | tee logs/upstream-initializer-asan-build.log
+          set +e
+          baseline/dm/gfx/tests/t_ci_empty_main 2>&1 | tee logs/upstream-initializer-asan.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -ne 0
+          grep -q 'ERROR: AddressSanitizer: global-buffer-overflow' logs/upstream-initializer-asan.log
+          grep -q 'in nvn_init_slots' logs/upstream-initializer-asan.log
+          grep -q e_nvnDeviceBuilderSetDefaults logs/upstream-initializer-asan.log
+          ! grep -q CI_EMPTY_MAIN_REACHED logs/upstream-initializer-asan.log
+          echo "Unchanged upstream reproduced ASan section-padding failure before empty main (exit $result); no GPU work was called." | tee logs/upstream-initializer-conclusion.txt
+      - name: Independent CPU-only Objective-C pool bounds UBSan
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p logs
+          flags="-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/$GAME -fsanitize=undefined -fno-omit-frame-pointer"
+          make -C pools/dm/gfx/tests GAME="$GAME" -B CFLAGS="$flags" t_pool_bounds 2>&1 | tee logs/pool-bounds-build-undefined.log
+          pools/dm/gfx/tests/t_pool_bounds 2>&1 | tee logs/pool-bounds-undefined.log
       - name: CPU-only Objective-C production pool bounds
         if: ${{ !cancelled() }}
         run: |
