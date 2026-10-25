@@ -320,6 +320,7 @@ static void active_reclaim_calls(void) {
     assert(dm_memory_hooks_enter_guest());
     unsigned char manager[64] = {0}, self[DM_SA_ADAPTER_OBJECT_SIZE] = {0};
     V(8, void (*)(void *))(manager); V(10, void (*)(void *))(manager);
+    assert(startup_allocator.page_events);
     factory_capability(1); CONSTRUCT(self); INIT(self);
     void *p = S(10, void *(*)(void *,size_t,size_t))(self, SMALL, 16); assert(p);
     memset(p, 0x47, SMALL);
@@ -333,6 +334,12 @@ static void active_reclaim_calls(void) {
     S(18, void (*)(const void *))(self); assert(alias_mapped() == PAGE);
     assert(S(12, void *(*)(void *,void *,size_t))(self, p, 4 * PAGE) == p && alias_mapped() == 4 * PAGE);
     assert(S(13, size_t (*)(void *,void *,size_t))(self, p, 0) == 16 && alias_mapped() == PAGE);
+    // Enough real operations to prove exponential sampling without requiring
+    // Dump for evidence. Cumulative ranges include already-backed boundaries.
+    for (unsigned i = 0; i < 64; ++i) {
+        assert(S(12, void *(*)(void *,void *,size_t))(self, p, 4 * PAGE) == p);
+        assert(S(13, size_t (*)(void *,void *,size_t))(self, p, 32) == 32);
+    }
     assert(!setenv(DM_MEMORY_RECLAIM_ENV, "0", 1));
     factory_capability(1); // environment changes cannot reconfigure a live owner
     FREE(self, p); FINISH(self); assert(!alias_mapped());
@@ -401,6 +408,7 @@ int main(void) {
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
         if (i == 14) {
             assert_lifecycle_log(log);
+            assert(!strstr(log, "experimental shared memory pages "));
             assert(strstr(log, "contract=" DM_MEMORY_EXPERIMENT_NAME " mode=full reclaim=off"));
         }
         else
@@ -417,6 +425,15 @@ int main(void) {
         if (!i) {
             assert(strstr(log, "contract=" DM_MEMORY_EXPERIMENT_NAME " mode=full reclaim=on"));
             assert(strstr(log, "reserved=65536 committed=4096"));
+            assert(strstr(log, "route=unexercised reclaim_calls=0 reclaim_ok=0"));
+            assert(strstr(log, "reclaim_calls=67 reclaim_ok=67"));
+            assert(strstr(log, "recommit_calls=66 recommit_ok=66"));
+            assert(strstr(log, "recommit_requested_range_bytes=12288 recommit_successful_range_bytes=12288"));
+            assert(strstr(log, "ranges_not_physical_deltas"));
+            const char *first = strstr(log, "managed page activity ");
+            assert(first && first < strstr(log, "experimental shared memory Dump "));
+            assert(occurrences(log, "managed page activity ") >= 8 &&
+                   occurrences(log, "managed page activity ") <= 14);
         } else
 #endif
             assert(!strstr(log, " active:"));

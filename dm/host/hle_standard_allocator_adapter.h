@@ -20,7 +20,7 @@ typedef enum {
 // Optional native diagnostics: a copied snapshot, never a borrowed core/object.
 typedef enum {
     DM_SA_EVENT_INITIALIZED, DM_SA_EVENT_ALLOCATE_FAILED,
-    DM_SA_EVENT_REALLOCATE_FAILED, DM_SA_EVENT_FINALIZED
+    DM_SA_EVENT_REALLOCATE_FAILED, DM_SA_EVENT_FINALIZED, DM_SA_EVENT_PAGE_ACTIVITY
 } dm_sa_adapter_event_kind;
 typedef struct {
     dm_sa_adapter_event_kind kind;
@@ -29,6 +29,9 @@ typedef struct {
     size_t requested_size, alignment;
     dm_sa_result result, stats_result; // stats valid only when stats_result == OK
     dm_sa_stats stats;
+    int pages_valid;
+    uint64_t page_event_count;
+    dm_sa_page_diagnostics pages;
 } dm_sa_adapter_event;
 
 struct dm_memory_experiment_authorization;
@@ -81,6 +84,12 @@ typedef struct {
     // success or retained ownership. Diagnostic query failure never changes the
     // operation's result or ownership. No post-destruction core is inspected.
     void (*event)(void *context, const dm_sa_adapter_event *event);
+    // Explicit optional page diagnostics only; default zero adds no per-operation
+    // sampling/query. Copies counters without provider work, emits activity only
+    // on changed snapshots (first four, powers of two, first success per route).
+    // Sequence orders snapshots, NOT concurrent console delivery. Observers have
+    // the same no-reentry contract above; all event data is detached by value.
+    int page_events;
     // Called only for managed Dump; does not inspect the SDK's embedded heap.
     void (*dump)(void *context, const void *self, const dm_sa_stats *stats);
     // Fatal guest contracts (Initialize/Free/Finalize/query errors) never fall

@@ -22,7 +22,34 @@ struct dm_sa_allocator {
     span *spans;
     size_t backing, used, count, span_count, metadata;
     int closed;
+    // No extra allocation/metadata charge for whole-lease/default providers.
+    dm_sa_page_diagnostics pages[];
 };
+
+static void add_counter(uint64_t *counter, uint64_t value) {
+    *counter = value > UINT64_MAX - *counter ? UINT64_MAX : *counter + value;
+}
+static void page_observation(dm_sa_allocator *a, uint64_t *counter) {
+    add_counter(counter, 1); add_counter(&a->pages[0].sequence, 1);
+}
+static dm_sa_result page_failure(dm_sa_allocator *a, dm_sa_result result) {
+    page_observation(a, &a->pages[0].page_failures); return result;
+}
+static dm_sa_result change_pages(dm_sa_allocator *a, span *s, size_t offset, size_t size, int commit) {
+    dm_sa_page_diagnostics *d = &a->pages[0];
+    add_counter(commit ? &d->recommit_attempts : &d->reclaim_attempts, 1);
+    add_counter(commit ? &d->recommit_requested_range_bytes : &d->reclaim_requested_range_bytes, size);
+    add_counter(&d->sequence, 1);
+    const dm_sa_provider *p = &a->config.provider;
+    dm_sa_result r = p->pages.change(p->context, &s->lease, offset, size, commit);
+    if (r == DM_SA_OK) {
+        add_counter(commit ? &d->recommit_successes : &d->reclaim_successes, 1);
+        add_counter(commit ? &d->recommit_successful_range_bytes : &d->reclaim_successful_range_bytes, size);
+    } else if (r == DM_SA_NO_MEMORY) add_counter(&d->change_no_memory, 1);
+    else if (r == DM_SA_BUSY) add_counter(&d->change_busy, 1);
+    else add_counter(&d->page_failures, 1);
+    return r;
+}
 
 static int power2(size_t n) { return n && !(n & (n - 1)); }
 static size_t lesser(size_t a, size_t b) { return a < b ? a : b; }
@@ -100,8 +127,10 @@ static dm_sa_result prepare_backing(dm_sa_allocator *a, span *s, size_t offset, 
     for (size_t at = offset; at < end;) {
         dm_sa_page_run run;
         dm_sa_result r = page_run(a, s, at, end - at, &run);
-        if (r != DM_SA_OK) return r;
-        if (run.flags & DM_SA_PAGE_BORROWED) return DM_SA_BUSY;
+        if (r != DM_SA_OK) return page_failure(a, r);
+        if (run.flags & DM_SA_PAGE_BORROWED) {
+            page_observation(a, &a->pages[0].recommit_borrowed); return DM_SA_BUSY;
+        }
         at += run.size;
     }
     size_t granule = p->pages.granule, lo = offset & ~(granule - 1), hi;
@@ -110,12 +139,12 @@ static dm_sa_result prepare_backing(dm_sa_allocator *a, span *s, size_t offset, 
     for (size_t at = lo; at < hi;) {
         dm_sa_page_run run;
         dm_sa_result r = page_run(a, s, at, hi - at, &run);
-        if (r != DM_SA_OK) return r;
+        if (r != DM_SA_OK) return page_failure(a, r);
         if (!(run.flags & DM_SA_PAGE_COMMITTED)) {
             // This scan covers a granule-rounded interval, so a partial hole
             // violates the provider's uniform logical commitment contract.
             // Finer BORROWED boundaries on committed neighbors are valid.
-            if ((at | run.size) & (granule - 1)) return DM_SA_PROVIDER_FAILED;
+            if ((at | run.size) & (granule - 1)) return page_failure(a, DM_SA_PROVIDER_FAILED);
             missing += run.size;
         }
         at += run.size;
@@ -123,12 +152,15 @@ static dm_sa_result prepare_backing(dm_sa_allocator *a, span *s, size_t offset, 
     if (missing) {
         size_t budget;
         dm_sa_result r = p->pages.budget(p->context, &budget);
-        if (r != DM_SA_OK) return r;
-        if (missing > budget) return DM_SA_NO_MEMORY;
-        r = p->pages.change(p->context, &s->lease, lo, hi - lo, 1);
+        if (r != DM_SA_OK) return page_failure(a, r);
+        if (missing > budget) {
+            page_observation(a, &a->pages[0].recommit_budget_denials); return DM_SA_NO_MEMORY;
+        }
+        r = change_pages(a, s, lo, hi - lo, 1);
         if (r != DM_SA_OK) return r;
     }
-    return available(a, s, offset, size) ? DM_SA_OK : DM_SA_BUSY;
+    if (available(a, s, offset, size)) return DM_SA_OK;
+    page_observation(a, &a->pages[0].publication_busy); return DM_SA_BUSY;
 }
 // Native optional policy, not SDK reclamation parity. Logical free/shrink has
 // already committed before this best-effort cleanup. Round INWARD twice: first
@@ -141,12 +173,15 @@ static void reclaim_free(dm_sa_allocator *a, span *s, const block *b) {
     size_t hi = (b->offset + b->size) & ~(granule - 1);
     for (size_t at = lo; at < hi;) {
         dm_sa_page_run run;
-        if (page_run(a, s, at, hi - at, &run) != DM_SA_OK) return;
+        if (page_run(a, s, at, hi - at, &run) != DM_SA_OK) {
+            (void)page_failure(a, DM_SA_PROVIDER_FAILED); return;
+        }
         size_t end = at + run.size;
+        if (run.flags & DM_SA_PAGE_BORROWED) page_observation(a, &a->pages[0].reclaim_borrowed_runs);
         if ((run.flags & (DM_SA_PAGE_COMMITTED | DM_SA_PAGE_BORROWED)) == DM_SA_PAGE_COMMITTED) {
             size_t first, last = end & ~(granule - 1);
             if (rounded(at, granule, &first) && first < last)
-                (void)p->pages.change(p->context, &s->lease, first, last - first, 0);
+                (void)change_pages(a, s, first, last - first, 0);
         }
         // change may suspend the source guard. Inspect subsequent runs afresh;
         // a raced borrow or backend rejection retains backing for a later trim.
@@ -222,9 +257,10 @@ dm_sa_result dm_sa_create(dm_sa_allocator **out, const dm_sa_config *config) {
     dm_sa_config c = *config;
     c.pool_size = pool;
     if (!c.metadata_alloc) { c.metadata_alloc = default_alloc; c.metadata_free = default_free; }
-    dm_sa_allocator *a = c.metadata_alloc(c.metadata_context, sizeof *a);
+    size_t bytes = sizeof(dm_sa_allocator) + (pages->granule ? sizeof(dm_sa_page_diagnostics) : 0);
+    dm_sa_allocator *a = c.metadata_alloc(c.metadata_context, bytes);
     if (!a) return DM_SA_NO_MEMORY;
-    memset(a, 0, sizeof *a); a->config = c; a->metadata = sizeof *a;
+    memset(a, 0, bytes); a->config = c; a->metadata = bytes;
     if (pthread_mutex_init(&a->mutex, NULL)) {
         c.metadata_free(c.metadata_context, a); return DM_SA_NO_MEMORY;
     }
@@ -319,7 +355,7 @@ static dm_sa_result allocate_locked(dm_sa_allocator *a, size_t size, size_t alig
             size_t budget = 0;
             if (pass) {
                 dm_sa_result r = p->pages.budget(p->context, &budget);
-                if (r != DM_SA_OK) return r;
+                if (r != DM_SA_OK) return page_failure(a, r);
                 budget &= ~(p->pages.granule - 1);
                 if (!budget) break;
             }
@@ -330,7 +366,7 @@ static dm_sa_result allocate_locked(dm_sa_allocator *a, size_t size, size_t alig
                     size_t offset = 0;
                     dm_sa_result r = sparse_candidate(a, s, b, n, alignment, budget, &offset);
                     if (r == DM_SA_OK) return take_free(a, s, b, offset, n, alignment, out);
-                    if (r != DM_SA_NOT_FOUND) return r;
+                    if (r != DM_SA_NOT_FOUND) return page_failure(a, r);
                 }
             }
         }
@@ -461,7 +497,10 @@ dm_sa_result dm_sa_reallocate(dm_sa_allocator *a, void *pointer, size_t size, vo
                     // Committing the tail can suspend the source guard. The
                     // already-live prefix can become borrowed independently.
                     if (!available(a, s, b->offset, b->size) ||
-                        (growth == DM_SA_OK && !available(a, s, b->offset, n))) growth = DM_SA_BUSY;
+                        (growth == DM_SA_OK && !available(a, s, b->offset, n))) {
+                        if (growth != DM_SA_BUSY) page_observation(a, &a->pages[0].publication_busy);
+                        growth = DM_SA_BUSY;
+                    }
                     grow = growth == DM_SA_OK;
                 } else grow = available(a, s, tail->offset, extra);
             }
@@ -481,6 +520,7 @@ dm_sa_result dm_sa_reallocate(dm_sa_allocator *a, void *pointer, size_t size, vo
                         span *replacement_owner = NULL;
                         block *replacement_block = find_block(a, replacement, &replacement_owner);
                         free_block(a, replacement_owner, replacement_block);
+                        if (a->config.provider.pages.granule) page_observation(a, &a->pages[0].publication_busy);
                         r = DM_SA_BUSY; // original and caller output unchanged
                     } else {
                         memcpy(replacement, pointer, b->size);
@@ -551,12 +591,20 @@ static dm_sa_result committed_stats(dm_sa_allocator *a, size_t *out) {
         }
     *out = committed; return DM_SA_OK;
 }
+dm_sa_result dm_sa_get_page_diagnostics(dm_sa_allocator *a, dm_sa_page_diagnostics *out) {
+    if (!a || !out) return DM_SA_INVALID;
+    pthread_mutex_lock(&a->mutex);
+    *out = a->config.provider.pages.granule ? a->pages[0] : (dm_sa_page_diagnostics){0};
+    pthread_mutex_unlock(&a->mutex);
+    return DM_SA_OK;
+}
 dm_sa_result dm_sa_get_stats(dm_sa_allocator *a, dm_sa_stats *out) {
     if (!a || !out) return DM_SA_INVALID;
     enter(a);
     dm_sa_stats st = { .capacity = a->config.capacity, .backing_bytes = a->backing,
         .allocated_bytes = a->used, .allocation_count = a->count, .span_count = a->span_count,
-        .metadata_bytes = a->metadata, .closed = a->closed, .committed_bytes = a->backing };
+        .metadata_bytes = a->metadata, .closed = a->closed, .committed_bytes = a->backing, .pages = {0} };
+    if (a->config.provider.pages.granule) st.pages = a->pages[0];
     dm_sa_result r = DM_SA_OK;
     const dm_sa_provider *p = &a->config.provider;
     if (p->pages.granule) r = committed_stats(a, &st.committed_bytes);

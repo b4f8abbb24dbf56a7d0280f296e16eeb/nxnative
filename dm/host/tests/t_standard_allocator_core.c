@@ -230,6 +230,9 @@ static dm_sa_stats stats(dm_sa_allocator *a) {
     dm_sa_stats s;
     memset(&s, 0, sizeof s);
     OK(dm_sa_get_stats(a, &s));
+    dm_sa_page_diagnostics pages, zero = {0};
+    OK(dm_sa_get_page_diagnostics(a, &pages));
+    CHECK(!memcmp(&pages, &zero, sizeof zero) && !memcmp(&s.pages, &zero, sizeof zero));
     CHECK(s.allocated_bytes <= s.backing_bytes && s.backing_bytes <= s.capacity);
     CHECK(s.largest_free <= s.total_free && s.total_free <= s.capacity - s.allocated_bytes);
     return s;

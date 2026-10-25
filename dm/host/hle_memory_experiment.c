@@ -121,18 +121,37 @@ int dm_memory_experiment_authorized_sdk_only(const struct dm_memory_experiment_a
 #if defined(DM_SA_ADAPTER_TESTING) || defined(DM_VAMM_ADAPTER_TESTING) || defined(DM_MEMORY_HOOKS_TESTING)
 #error "Native experimental activation must not use fixture activation flags"
 #endif
+static void allocator_page_log(const void *self, uint64_t generation,
+                                uint64_t samples, const dm_sa_page_diagnostics *p) {
+    const char *route = p->reclaim_successes || p->recommit_successes ? "observed" :
+        p->reclaim_attempts || p->recommit_attempts ? "attempted" :
+        p->sequence ? "skipped" : "unexercised";
+    LOG("experimental shared memory pages self=%p generation=%llu sequence=%llu samples=%llu route=%s reclaim_calls=%llu reclaim_ok=%llu reclaim_requested_range_bytes=%llu reclaim_successful_range_bytes=%llu recommit_calls=%llu recommit_ok=%llu recommit_requested_range_bytes=%llu recommit_successful_range_bytes=%llu borrowed_reclaim_runs=%llu borrowed_recommit=%llu budget_denials=%llu change_no_memory=%llu change_busy=%llu page_failures=%llu publication_busy=%llu; ranges_not_physical_deltas",
+        self, (unsigned long long)generation, (unsigned long long)p->sequence,
+        (unsigned long long)samples, route,
+        (unsigned long long)p->reclaim_attempts, (unsigned long long)p->reclaim_successes,
+        (unsigned long long)p->reclaim_requested_range_bytes, (unsigned long long)p->reclaim_successful_range_bytes,
+        (unsigned long long)p->recommit_attempts, (unsigned long long)p->recommit_successes,
+        (unsigned long long)p->recommit_requested_range_bytes, (unsigned long long)p->recommit_successful_range_bytes,
+        (unsigned long long)p->reclaim_borrowed_runs, (unsigned long long)p->recommit_borrowed,
+        (unsigned long long)p->recommit_budget_denials, (unsigned long long)p->change_no_memory,
+        (unsigned long long)p->change_busy, (unsigned long long)p->page_failures,
+        (unsigned long long)p->publication_busy);
+}
 static void allocator_dump(void *context, const void *self, const dm_sa_stats *s) {
     (void)context;
     LOG("experimental shared memory Dump self=%p capacity=%zu backing=%zu live=%zu blocks=%zu spans=%zu free=%zu largest=%zu metadata=%zu closed=%d reserved=%zu committed=%zu",
         self, s->capacity, s->backing_bytes, s->allocated_bytes, s->allocation_count,
         s->span_count, s->total_free, s->largest_free, s->metadata_bytes, s->closed,
         s->backing_bytes, s->committed_bytes);
+    if (s->pages.sequence) allocator_page_log(self, 0, 0, &s->pages);
 }
 static void allocator_event(void *context, const dm_sa_adapter_event *e) {
     (void)context;
     const char *operation = e->kind == DM_SA_EVENT_INITIALIZED ? "Initialize success" :
         e->kind == DM_SA_EVENT_ALLOCATE_FAILED ? "Allocate failure" :
         e->kind == DM_SA_EVENT_REALLOCATE_FAILED ? "Reallocate failure" :
+        e->kind == DM_SA_EVENT_PAGE_ACTIVITY ? "page activity" :
         e->result == DM_SA_OK ? "Finalize success" : "Finalize retained";
     LOG("experimental shared memory managed %s self=%p generation=%llu requested=%zu alignment=%zu result=%d failure_count=%llu",
         operation, e->self, (unsigned long long)e->generation, e->requested_size,
@@ -147,6 +166,9 @@ static void allocator_event(void *context, const dm_sa_adapter_event *e) {
     else if (e->kind != DM_SA_EVENT_FINALIZED || e->result != DM_SA_OK)
         LOG("experimental shared memory snapshot unavailable self=%p generation=%llu result=%d",
             e->self, (unsigned long long)e->generation, e->stats_result);
+    if (e->pages_valid && (e->kind == DM_SA_EVENT_PAGE_ACTIVITY ||
+        e->kind == DM_SA_EVENT_INITIALIZED || e->kind == DM_SA_EVENT_FINALIZED))
+        allocator_page_log(e->self, e->generation, e->page_event_count, &e->pages);
 }
 static void allocator_fatal(void *context, const char *operation, dm_sa_result result) {
     (void)context;
@@ -226,6 +248,7 @@ int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
             if (!sdk_only) {
                 allocator.experimental_startup = &authorization;
                 allocator.reject_managed_walk = 1;
+                allocator.page_events = reclaim;
                 allocator.dump = allocator_dump; allocator.event = allocator_event; allocator.fatal = allocator_fatal;
             }
             vamm.fatal = sdk_only ? sdk_vamm_fatal : vamm_fatal;
