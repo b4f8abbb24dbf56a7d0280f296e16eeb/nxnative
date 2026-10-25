@@ -123,18 +123,15 @@ jobs:
           grep -q e_nvnDeviceBuilderSetDefaults logs/upstream-initializer-asan.log
           ! grep -q CI_EMPTY_MAIN_REACHED logs/upstream-initializer-asan.log
           echo "Unchanged upstream reproduced ASan section-padding failure before empty main (exit $result); no GPU work was called." | tee logs/upstream-initializer-conclusion.txt
-      - name: Independent CPU-only Objective-C pool bounds UBSan
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p logs
-          flags="-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/$GAME -fsanitize=undefined -fno-omit-frame-pointer"
-          make -C pools/dm/gfx/tests GAME="$GAME" -B CFLAGS="$flags" t_pool_bounds 2>&1 | tee logs/pool-bounds-build-undefined.log
-          pools/dm/gfx/tests/t_pool_bounds 2>&1 | tee logs/pool-bounds-undefined.log
       - name: CPU-only Objective-C production pool bounds
         if: ${{ !cancelled() }}
         run: |
           mkdir -p logs
-          for mode in normal address undefined; do
+          # The unchanged upstream initializer above proves that ASan's padded
+          # custom-section globals cannot be scanned as packed NVN records.
+          # Portable bounds/token/index fixtures still run under ASan; the
+          # actual Objective-C production path runs normally and with UBSan.
+          for mode in normal undefined; do
             echo "::group::Production pool bounds ($mode)"
             flags="-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/$GAME"
             if [ "$mode" != normal ]; then flags="$flags -fsanitize=$mode -fno-omit-frame-pointer"; fi
