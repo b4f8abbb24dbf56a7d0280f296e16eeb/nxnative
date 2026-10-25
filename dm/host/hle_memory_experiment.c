@@ -2,31 +2,97 @@
 #include "hle_memory_hooks.h"
 #include "hle_memory_runtime.h"
 
-// These are full NSO identities, not title-ID guesses or private code offsets.
-// The reviewed closure is exactly Z-A base main + SDK 19.3.11; updates, subsdks,
-// deferred NROs and other SDKs require a new review. Existing cuts stay intact.
-static const char reviewed_main[] = "7222e13ecf6adb3249b5dd5c57fa40b102245fce000000000000000000000000";
-static const char reviewed_sdk[] = "df7a3960c74c3a4803f826c5871532523aa9cf2a000000000000000000000000";
-_Static_assert(sizeof reviewed_main == 65 && sizeof reviewed_sdk == 65, "full NSO identities");
-
-const char *dm_memory_experiment_preflight(const module_t *modules, size_t count) {
-    if (!modules || count != 2) return "requires exactly the reviewed main and sdk (no extra or deferred modules)";
+// Compile-time admission is separate from construction policy. A new descriptor
+// requires review of the COMPLETE ordered module closure; a compatible SDK or a
+// valid raw/legacy construction contract alone never grants startup authority.
+enum { FULL_MEMORY, SDK_MEMORY };
+enum { STARTUP_MAX_REGIONS = 65536 };
+typedef struct {
+    char name[sizeof(((module_t *)0)->name)];
+    char full_build_id[65];
+} startup_module_contract;
+typedef struct {
+    char request[64];
+    const startup_module_contract *modules;
+    size_t module_count, max_regions;
+    unsigned mode;
+    dm_memory_runtime_contract runtime;
+} startup_contract;
+static const startup_module_contract za_modules[] = {
+    {"main", "7222e13ecf6adb3249b5dd5c57fa40b102245fce000000000000000000000000"},
+    {"sdk", "df7a3960c74c3a4803f826c5871532523aa9cf2a000000000000000000000000"}
+};
+// No SDK15 or other new admission. Both existing request names retain exactly
+// their previous ownership mode, domain, placement and metadata bound.
+static const startup_contract admitted_contracts[] = {
+    {DM_MEMORY_EXPERIMENT_NAME, za_modules, 2, 65536, FULL_MEMORY,
+        {DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA, DM_VAMM_PLACEMENT_MODERN}},
+    {DM_SDK_MEMORY_EXPERIMENT_NAME, za_modules, 2, 65536, SDK_MEMORY,
+        {DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA, DM_VAMM_PLACEMENT_MODERN}}
+};
+static const char *validate_contract(const startup_contract *c) {
+    if (!c || !memchr(c->request, 0, sizeof c->request) || !c->request[0] ||
+        !strcmp(c->request, "0") || !c->modules || !c->module_count ||
+        c->module_count > MAX_MOD || !c->max_regions || c->max_regions > STARTUP_MAX_REGIONS ||
+        (c->mode != FULL_MEMORY && c->mode != SDK_MEMORY))
+        return "invalid memory startup descriptor";
+    if ((c->runtime.domain != DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+         c->runtime.domain != DM_VAMM_DOMAIN_RAW_ALIAS) ||
+        (c->runtime.placement != DM_VAMM_PLACEMENT_MODERN &&
+         c->runtime.placement != DM_VAMM_PLACEMENT_LEGACY &&
+         c->runtime.placement != DM_VAMM_PLACEMENT_LEGACY_REDUCED))
+        return "invalid memory startup construction contract";
+    for (size_t k = 0; k < c->module_count; ++k) {
+        const startup_module_contract *m = &c->modules[k];
+        if (!memchr(m->name, 0, sizeof m->name) || !m->name[0] || m->full_build_id[64])
+            return "invalid memory startup module identity";
+        for (unsigned i = 0; i < 64; ++i)
+            if (!((m->full_build_id[i] >= '0' && m->full_build_id[i] <= '9') ||
+                  (m->full_build_id[i] >= 'a' && m->full_build_id[i] <= 'f')))
+                return "invalid memory startup full NSO build ID";
+        for (size_t j = 0; j < k; ++j)
+            if (!strcmp(m->name, c->modules[j].name)) return "duplicate memory startup module name";
+    }
+    return NULL;
+}
+static const startup_contract *select_contract(const char *request) {
+    if (!request) return NULL;
+    const startup_contract *selected = NULL;
+    for (size_t k = 0; k < sizeof admitted_contracts / sizeof *admitted_contracts; ++k) {
+        const startup_contract *c = &admitted_contracts[k];
+        // Malformed or duplicate registry entries fail closed, never first-win.
+        if (validate_contract(c)) return NULL;
+        if (!strcmp(request, c->request)) {
+            if (selected) return NULL;
+            selected = c;
+        }
+    }
+    return selected;
+}
+static const char *preflight_contract(const startup_contract *c,
+                                      const module_t *modules, size_t count) {
+    const char *why = validate_contract(c);
+    if (why) return why;
+    if (!modules || count != c->module_count)
+        return "requires exactly the reviewed complete module set (no extra or deferred modules)";
     for (size_t k = 0; k < count; ++k) {
         const module_t *m = &modules[k];
         if (!memchr(m->name, 0, sizeof m->name)) return "unterminated module name";
         if (m->nro || !m->loaded || m->loads) return "deferred, unloaded or previously loaded modules are unsupported";
         if (!m->base || !m->size) return "module is not mapped";
         // Global ELF lookup is order-sensitive (including main interposition).
-        // This is experiment eligibility, not a generic loader restriction.
-        if (strcmp(m->name, k ? "sdk" : "main")) return "requires reviewed module order: main then sdk";
-        const char *expected = k ? reviewed_sdk : reviewed_main;
+        if (strcmp(m->name, c->modules[k].name)) return "requires reviewed module order (Z-A: main then sdk)";
+        const char *expected = c->modules[k].full_build_id;
         if (memcmp(m->full_build_id, expected, 65)) return "missing or unreviewed full NSO build ID (rewrite old outputs)";
         if (memcmp(m->build_id, expected, 32) || m->build_id[32]) return "inconsistent short/full NSO build ID";
     }
     return NULL;
 }
+const char *dm_memory_experiment_preflight(const module_t *modules, size_t count) {
+    // Preserve the existing public eligibility query for the reviewed Z-A set.
+    return preflight_contract(select_contract(DM_MEMORY_EXPERIMENT_NAME), modules, count);
+}
 
-enum { FULL_MEMORY, SDK_MEMORY };
 struct dm_memory_experiment_authorization { dm_memory_runtime *runtime; int installing, mode; };
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
 static struct dm_memory_experiment_authorization authorization;
@@ -94,29 +160,38 @@ static void sdk_vamm_fatal(void *context, const char *operation) {
 }
 #endif
 
+// Construction grants no permit and publishes no hooks. This helper is kept
+// private: production reaches it only through exact registry selection/preflight.
+static inline dm_sa_result create_contract_runtime(const startup_contract *c, dm_memory_runtime **out) {
+    if (validate_contract(c)) return DM_SA_INVALID;
+    return c->mode == SDK_MEMORY ?
+        dm_memory_runtime_create_vamm_only_with_contract(out, c->max_regions, &c->runtime) :
+        dm_memory_runtime_create_with_contract(out, c->max_regions, &c->runtime);
+}
+
 int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
     if (diagnostic) *diagnostic = NULL;
     const char *why = NULL;
-    int sdk_only = request && !strcmp(request, DM_SDK_MEMORY_EXPERIMENT_NAME);
+    const startup_contract *selected = select_contract(request);
     int repeated = startup_seen; startup_seen = 1;
     if (repeated) why = "startup/restart is unsupported; start a new host process";
     else if (!request || !*request || !strcmp(request, "0")) return DM_MEMORY_EXPERIMENT_OFF;
-    else if (strcmp(request, DM_MEMORY_EXPERIMENT_NAME) && !sdk_only)
+    else if (!selected)
         why = "expected DM_EXPERIMENTAL_SHARED_MEMORY=" DM_MEMORY_EXPERIMENT_NAME " or " DM_SDK_MEMORY_EXPERIMENT_NAME;
 #if !defined(DM_EXPERIMENTAL_SHARED_MEMORY) || !DM_EXPERIMENTAL_SHARED_MEMORY
     else why = "host was built without EXPERIMENTAL_SHARED_MEMORY=1";
 #elif !defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
     else why = "alignment-aware native leases are required; activation remains disabled";
 #else
-    else why = dm_memory_experiment_preflight(g_mod, (size_t)g_nmod);
+    else why = preflight_contract(selected, g_mod, (size_t)g_nmod);
     if (!why) {
+        int sdk_only = selected->mode == SDK_MEMORY;
         // Bounded host metadata, allocated before any guest entry. This limits
         // live reservations, not the allocator's nominal virtual capacity.
         dm_memory_runtime *runtime = NULL;
         dm_sa_adapter_config allocator = {0};
         dm_vamm_adapter_config vamm = {0};
-        if ((sdk_only ? dm_memory_runtime_create_vamm_only(&runtime, 65536) :
-                        dm_memory_runtime_create(&runtime, 65536)) != DM_SA_OK)
+        if (create_contract_runtime(selected, &runtime) != DM_SA_OK)
             why = "cannot create native memory owner";
         else if ((sdk_only ? dm_memory_runtime_vamm_config(runtime, &vamm) :
                              dm_memory_runtime_configs(runtime, &vamm, &allocator)) != DM_SA_OK)

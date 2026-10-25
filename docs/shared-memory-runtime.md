@@ -212,3 +212,32 @@ loader activation by itself. Native SDK-only installation is a separate default-
 bounded path and rejects the existing full-group experiment permit. No SDK/game identity is
 newly authorized and every SDK/game patch remains in place. Real SDK caller,
 bootstrap, ABI, compatibility and Apple-device evidence remain necessary.
+
+
+## Fail-closed startup contract selection
+
+`hle_memory_experiment.c` now selects an immutable compile-time descriptor by
+exact request name. Each descriptor binds the complete ordered module names and
+64-hex-character NSO identities to one ownership mode, a bounded reservation
+ledger, and an explicit domain/placement construction contract. Validation
+rejects malformed identities, duplicate names, unsupported modes/policies,
+missing/extra/reordered/unloaded/deferred modules, and inconsistent short/full
+identities before construction or native GetInfo queries. The descriptor is not
+a profile override or a caller-issued authorization capability.
+
+The only admitted requests remain `za-base-v1` and `za-base-sdk-v1`, with the
+same exact Z-A main plus SDK pair, 65,536-record bound, alias-minus-extra domain,
+and modern placement. Full versus owner-only runtime construction now calls the
+explicit-contract constructors; the existing independent permit and relocation
+transaction gates remain. SDK15 and every other unreviewed whole-process closure
+remain rejected. No SDK/game patch is removed and no new gameplay proof follows.
+
+`make -C dm/host/tests memory-startup-contract` exercises synthetic raw-alias and
+both legacy placement contracts through that same construction helper, including
+mode separation, immutable selection, malformed descriptor rejection, and
+constructor failures. The fixture compiles with native experimental activation
+disabled and never issues a startup permit. The existing `memory-experiment` and
+`sdk-memory-experiment` suites now assert the exact explicit constructor contract
+and continue covering startup failure cleanup, transaction rollback, original SA
+preservation and mode-scoped authority. Add `-sanitize` to each target for the
+ASan/UBSan variants. These tests execute no private SDK and admit no new title.

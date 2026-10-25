@@ -769,3 +769,17 @@ sdk-memory-experiment: $(B)/t_sdk_memory_experiment $(B)/t_sdk_memory_experiment
 sdk-memory-experiment-sanitize: $(B)/t_sdk_memory_experiment_sanitize $(B)/t_sdk_memory_experiment_16k_sanitize
 	@set -e; for test in $^; do $$test; done
 run: sdk-memory-experiment
+
+# Pure synthetic descriptor selection/construction; no activation fixture flags.
+MEMORY_STARTUP_CONTRACT_SRCS = t_memory_startup_contract.c ../hle_memory_runtime.c ../hle_vamm_native.c ../hle_vamm.c
+MEMORY_STARTUP_CONTRACT_DEPS = $(MEMORY_STARTUP_CONTRACT_SRCS) $(MEMORY_CONTRACT_DEPS) ../hle_memory_experiment.c ../hle_memory_experiment.h ../hle_memory_hooks.h ../hle_standard_allocator_adapter.h ../hle_vamm_adapter.h ../standard_allocator_core.h ../dm.h address_space_profile/game_profile.h
+$(B)/t_memory_startup_contract: $(MEMORY_STARTUP_CONTRACT_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -Iaddress_space_profile -Wno-unused-function -o $@ $(MEMORY_STARTUP_CONTRACT_SRCS)
+$(B)/t_memory_startup_contract_sanitize: $(MEMORY_STARTUP_CONTRACT_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -Iaddress_space_profile -Wno-unused-function -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(MEMORY_STARTUP_CONTRACT_SRCS)
+.PHONY: memory-startup-contract memory-startup-contract-sanitize
+memory-startup-contract: $(B)/t_memory_startup_contract
+	$<
+memory-startup-contract-sanitize: $(B)/t_memory_startup_contract_sanitize
+	$<
+run: memory-startup-contract

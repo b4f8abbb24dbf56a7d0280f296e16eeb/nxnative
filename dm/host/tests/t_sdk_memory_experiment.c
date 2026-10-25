@@ -16,16 +16,20 @@
 static unsigned sdk_creates, full_creates, sdk_configs, full_configs, destroys;
 static unsigned sdk_installs, full_installs, allocator_retains, original_allocations, original_frees;
 static int fail_create, fail_config, fail_resolution = -1;
-static dm_sa_result track_sdk_create(dm_memory_runtime **out, size_t count) {
+static dm_sa_result track_sdk_create(dm_memory_runtime **out, size_t count, const dm_memory_runtime_contract *contract) {
+    assert(contract && contract->domain == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+           contract->placement == DM_VAMM_PLACEMENT_MODERN && count == 65536);
     ++sdk_creates;
     if (fail_create) return DM_SA_NO_MEMORY;
-    dm_sa_result r = dm_memory_runtime_create_vamm_only(out, count);
+    dm_sa_result r = dm_memory_runtime_create_vamm_only_with_contract(out, count, contract);
     if (r == DM_SA_OK) startup_runtime = *out;
     return r;
 }
-static dm_sa_result track_full_create(dm_memory_runtime **out, size_t count) {
+static dm_sa_result track_full_create(dm_memory_runtime **out, size_t count, const dm_memory_runtime_contract *contract) {
+    assert(contract && contract->domain == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+           contract->placement == DM_VAMM_PLACEMENT_MODERN && count == 65536);
     ++full_creates;
-    dm_sa_result r = dm_memory_runtime_create(out, count);
+    dm_sa_result r = dm_memory_runtime_create_with_contract(out, count, contract);
     if (r == DM_SA_OK) startup_runtime = *out;
     return r;
 }
@@ -124,15 +128,15 @@ int loader_install_memory_hooks(const dm_sa_adapter_config *a, const dm_vamm_ada
     assert(!resolver_calls && !dm_memory_hooks_active()); preserved_slots();
     return DM_MEMORY_HOOKS_INVALID;
 }
-#define dm_memory_runtime_create_vamm_only track_sdk_create
+#define dm_memory_runtime_create_vamm_only_with_contract track_sdk_create
 #define dm_memory_runtime_vamm_config track_sdk_config
-#define dm_memory_runtime_create track_full_create
+#define dm_memory_runtime_create_with_contract track_full_create
 #define dm_memory_runtime_configs track_full_configs
 #define dm_memory_runtime_destroy track_destroy
 #include "../hle_memory_experiment.c"
-#undef dm_memory_runtime_create_vamm_only
+#undef dm_memory_runtime_create_vamm_only_with_contract
 #undef dm_memory_runtime_vamm_config
-#undef dm_memory_runtime_create
+#undef dm_memory_runtime_create_with_contract
 #undef dm_memory_runtime_configs
 #undef dm_memory_runtime_destroy
 

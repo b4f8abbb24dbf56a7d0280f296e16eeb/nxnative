@@ -189,7 +189,12 @@ class ActivationSourceContract(unittest.TestCase):
     def test_actual_runtime_factory_loader_and_failure_cleanup(self):
         source = (HOST / 'hle_memory_experiment.c').read_text()
         body = source[source.index('int dm_memory_experiment_startup('):]
-        create = body.index('dm_memory_runtime_create(')
+        create = body.index('create_contract_runtime(selected, &runtime)')
+        self.assertLess(body.index('preflight_contract(selected,'), create)
+        constructor = source[source.index('static inline dm_sa_result create_contract_runtime('):source.index('int dm_memory_experiment_startup(')]
+        self.assertIn('validate_contract(c)', constructor)
+        self.assertIn('dm_memory_runtime_create_vamm_only_with_contract(out, c->max_regions, &c->runtime)', constructor)
+        self.assertIn('dm_memory_runtime_create_with_contract(out, c->max_regions, &c->runtime)', constructor)
         configs = body.index('dm_memory_runtime_configs(')
         install = body.index('loader_install_memory_hooks(')
         published = body.index('return DM_MEMORY_EXPERIMENT_ACTIVE;')
