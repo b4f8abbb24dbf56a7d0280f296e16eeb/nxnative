@@ -85,3 +85,92 @@ $(B):
 .PHONY: run tsan
 tsan: $(B)/t_audio_spsc_tsan
 	$(B)/t_audio_spsc_tsan
+
+# Portable production address manager: no game profile, Apple frameworks or SDK
+# binary is needed. 16 KiB host-page behavior is exercised using real mmap.
+AS_FLAGS = -std=c11 -O1 -g -Wall -Wextra -Werror -pthread -I..
+$(B)/t_address_space: t_address_space.c ../hle_address_space.c ../hle_address_space.h | $(B)
+	$(CC) $(AS_FLAGS) -o $@ t_address_space.c ../hle_address_space.c
+$(B)/t_address_space_sanitize: t_address_space.c ../hle_address_space.c ../hle_address_space.h | $(B)
+	$(CC) $(AS_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_address_space.c ../hle_address_space.c
+$(B)/t_address_space_tsan: t_address_space.c ../hle_address_space.c ../hle_address_space.h | $(B)
+	$(CC) $(AS_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ t_address_space.c ../hle_address_space.c
+.PHONY: address-space address-space-sanitize address-space-tsan
+address-space: $(B)/t_address_space
+	$(B)/t_address_space
+address-space-sanitize: $(B)/t_address_space_sanitize
+	$(B)/t_address_space_sanitize
+address-space-tsan: $(B)/t_address_space_tsan
+	$(B)/t_address_space_tsan
+run: address-space
+
+# Compile the production SVC dispatcher with a tiny synthetic profile and stub
+# only unrelated services. Both legacy (unlimited alias maps) and pool-limited
+# profiles must retain their accounting policy. Existing Darwin printf formats
+# use %llx for uint64_t, so suppress that platform-only warning in this harness.
+AS_SVC_FLAGS = $(AS_FLAGS) -std=gnu11 -Wno-format -Iaddress_space_profile
+AS_SVC_DEPS = t_address_space_svc.c address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h
+$(B)/t_address_space_svc: $(AS_SVC_DEPS) | $(B)
+	$(CC) $(AS_SVC_FLAGS) -o $@ t_address_space_svc.c ../hle_address_space.c
+$(B)/t_address_space_svc_unlimited: $(AS_SVC_DEPS) | $(B)
+	$(CC) $(AS_SVC_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_address_space_svc.c ../hle_address_space.c
+$(B)/t_address_space_svc_sanitize: $(AS_SVC_DEPS) | $(B)
+	$(CC) $(AS_SVC_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_address_space_svc.c ../hle_address_space.c
+$(B)/t_address_space_svc_tsan: $(AS_SVC_DEPS) | $(B)
+	$(CC) $(AS_SVC_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ t_address_space_svc.c ../hle_address_space.c
+.PHONY: address-space-svc address-space-svc-sanitize address-space-svc-tsan
+address-space-svc: $(B)/t_address_space_svc $(B)/t_address_space_svc_unlimited
+	$(B)/t_address_space_svc
+	$(B)/t_address_space_svc_unlimited
+address-space-svc-sanitize: $(B)/t_address_space_svc_sanitize
+	$(B)/t_address_space_svc_sanitize
+address-space-svc-tsan: $(B)/t_address_space_svc_tsan
+	$(B)/t_address_space_svc_tsan
+run: address-space-svc
+
+# Logical MapMemory source ownership through the real SVC dispatcher. Simulated
+# 16 KiB host pages exercise neighboring 4 KiB source/destination lifetimes on
+# Linux as well; this is not a hardware-isolation or Apple-device test.
+MAP_MEMORY_FLAGS = -Imap_memory_profile $(AS_SVC_FLAGS)
+MAP_MEMORY_DEPS = t_map_memory.c map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h
+$(B)/t_map_memory: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_unlimited: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_16k: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_16k_unlimited: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_sanitize: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_sanitize_unlimited: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_sanitize_16k: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_sanitize_16k_unlimited: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_tsan: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_tsan_unlimited: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_tsan_16k: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=thread -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+$(B)/t_map_memory_tsan_16k_unlimited: $(MAP_MEMORY_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ t_map_memory.c ../hle_address_space.c
+.PHONY: map-memory map-memory-sanitize map-memory-tsan
+map-memory: $(B)/t_map_memory $(B)/t_map_memory_unlimited $(B)/t_map_memory_16k $(B)/t_map_memory_16k_unlimited
+	$(B)/t_map_memory
+	$(B)/t_map_memory_unlimited
+	$(B)/t_map_memory_16k
+	$(B)/t_map_memory_16k_unlimited
+map-memory-sanitize: $(B)/t_map_memory_sanitize $(B)/t_map_memory_sanitize_unlimited $(B)/t_map_memory_sanitize_16k $(B)/t_map_memory_sanitize_16k_unlimited
+	$(B)/t_map_memory_sanitize
+	$(B)/t_map_memory_sanitize_unlimited
+	$(B)/t_map_memory_sanitize_16k
+	$(B)/t_map_memory_sanitize_16k_unlimited
+map-memory-tsan: $(B)/t_map_memory_tsan $(B)/t_map_memory_tsan_unlimited $(B)/t_map_memory_tsan_16k $(B)/t_map_memory_tsan_16k_unlimited
+	$(B)/t_map_memory_tsan
+	$(B)/t_map_memory_tsan_unlimited
+	$(B)/t_map_memory_tsan_16k
+	$(B)/t_map_memory_tsan_16k_unlimited
+run: map-memory
