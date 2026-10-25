@@ -23,5 +23,15 @@ typedef uint64_t (*dm_memory_hook_resolver)(module_t *, const Elf64_Sym *);
 int dm_memory_hooks_install(module_t *modules, size_t count,
     const dm_sa_adapter_config *allocator, const dm_vamm_adapter_config *vamm,
     dm_memory_hook_resolver resolve);
+// SDK-only transaction: intercept the complete 18-name Vamm group
+// while leaving every StandardAllocator definition/binding untouched. This is
+// separately authorized bounded startup mode, NOT permission granted by the
+// full-group experiment. Default production remains disabled. Only its own
+// live opaque SDK-only permit may enter this path in an opt-in host build.
+// Unknown/missing Vamm methods fail closed; unselected relocation slots still
+// participate in journal-overlap validation. No live-owner migration.
+int dm_memory_hooks_install_vamm_only(module_t *modules, size_t count,
+    const dm_vamm_adapter_config *vamm, dm_memory_hook_resolver resolve);
 // Actual loader entrypoint using the loaded process census and bind_sym.
 int loader_install_memory_hooks(const dm_sa_adapter_config *, const dm_vamm_adapter_config *);
+int loader_install_vamm_hooks(const dm_vamm_adapter_config *);

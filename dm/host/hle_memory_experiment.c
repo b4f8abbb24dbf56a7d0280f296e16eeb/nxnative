@@ -26,7 +26,8 @@ const char *dm_memory_experiment_preflight(const module_t *modules, size_t count
     return NULL;
 }
 
-struct dm_memory_experiment_authorization { dm_memory_runtime *runtime; int installing; };
+enum { FULL_MEMORY, SDK_MEMORY };
+struct dm_memory_experiment_authorization { dm_memory_runtime *runtime; int installing, mode; };
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
 static struct dm_memory_experiment_authorization authorization;
 #endif
@@ -34,7 +35,17 @@ static int startup_seen;
 int dm_memory_experiment_authorized(const struct dm_memory_experiment_authorization *a,
                                     const void *context) {
 #if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
-    return a == &authorization && authorization.installing && context && context == authorization.runtime;
+    return a == &authorization && authorization.installing && authorization.mode == FULL_MEMORY &&
+        context && context == authorization.runtime;
+#else
+    (void)a; (void)context; return 0;
+#endif
+}
+int dm_memory_experiment_authorized_sdk_only(const struct dm_memory_experiment_authorization *a,
+                                             const void *context) {
+#if defined(DM_EXPERIMENTAL_SHARED_MEMORY) && DM_EXPERIMENTAL_SHARED_MEMORY && defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
+    return a == &authorization && authorization.installing && authorization.mode == SDK_MEMORY &&
+        context && context == authorization.runtime;
 #else
     (void)a; (void)context; return 0;
 #endif
@@ -77,15 +88,21 @@ static void vamm_fatal(void *context, const char *operation) {
     (void)context;
     die("[RED] experimental shared memory Vamm %s failed; SDK ownership will not be restored", operation);
 }
+static void sdk_vamm_fatal(void *context, const char *operation) {
+    (void)context;
+    die("[RED] experimental SDK-only memory Vamm %s failed; SDK ownership will not be restored", operation);
+}
 #endif
 
 int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
     if (diagnostic) *diagnostic = NULL;
     const char *why = NULL;
+    int sdk_only = request && !strcmp(request, DM_SDK_MEMORY_EXPERIMENT_NAME);
     int repeated = startup_seen; startup_seen = 1;
     if (repeated) why = "startup/restart is unsupported; start a new host process";
     else if (!request || !*request || !strcmp(request, "0")) return DM_MEMORY_EXPERIMENT_OFF;
-    else if (strcmp(request, DM_MEMORY_EXPERIMENT_NAME)) why = "expected DM_EXPERIMENTAL_SHARED_MEMORY=" DM_MEMORY_EXPERIMENT_NAME;
+    else if (strcmp(request, DM_MEMORY_EXPERIMENT_NAME) && !sdk_only)
+        why = "expected DM_EXPERIMENTAL_SHARED_MEMORY=" DM_MEMORY_EXPERIMENT_NAME " or " DM_SDK_MEMORY_EXPERIMENT_NAME;
 #if !defined(DM_EXPERIMENTAL_SHARED_MEMORY) || !DM_EXPERIMENTAL_SHARED_MEMORY
     else why = "host was built without EXPERIMENTAL_SHARED_MEMORY=1";
 #elif !defined(DM_MEMORY_RUNTIME_ALIGNED_LEASES)
@@ -96,28 +113,40 @@ int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
         // Bounded host metadata, allocated before any guest entry. This limits
         // live reservations, not the allocator's nominal virtual capacity.
         dm_memory_runtime *runtime = NULL;
-        dm_sa_adapter_config allocator;
-        dm_vamm_adapter_config vamm;
-        if (dm_memory_runtime_create(&runtime, 65536) != DM_SA_OK) why = "cannot create native shared owner";
-        else if (dm_memory_runtime_configs(runtime, &vamm, &allocator) != DM_SA_OK) why = "cannot configure native shared owner";
+        dm_sa_adapter_config allocator = {0};
+        dm_vamm_adapter_config vamm = {0};
+        if ((sdk_only ? dm_memory_runtime_create_vamm_only(&runtime, 65536) :
+                        dm_memory_runtime_create(&runtime, 65536)) != DM_SA_OK)
+            why = "cannot create native memory owner";
+        else if ((sdk_only ? dm_memory_runtime_vamm_config(runtime, &vamm) :
+                             dm_memory_runtime_configs(runtime, &vamm, &allocator)) != DM_SA_OK)
+            why = "cannot configure native memory owner";
         else {
             authorization.runtime = runtime;
-            allocator.experimental_startup = vamm.experimental_startup = &authorization;
+            authorization.mode = sdk_only ? SDK_MEMORY : FULL_MEMORY;
+            vamm.experimental_startup = &authorization;
             // No PROOF_ALL: static closure evidence is deliberately narrower
             // than general behavior/concurrency/teardown compatibility.
-            allocator.reject_managed_walk = 1;
-            allocator.dump = allocator_dump; allocator.event = allocator_event; allocator.fatal = allocator_fatal;
-            vamm.fatal = vamm_fatal;
+            if (!sdk_only) {
+                allocator.experimental_startup = &authorization;
+                allocator.reject_managed_walk = 1;
+                allocator.dump = allocator_dump; allocator.event = allocator_event; allocator.fatal = allocator_fatal;
+            }
+            vamm.fatal = sdk_only ? sdk_vamm_fatal : vamm_fatal;
             authorization.installing = 1;
-            int result = loader_install_memory_hooks(&allocator, &vamm);
+            int result = sdk_only ? loader_install_vamm_hooks(&vamm) :
+                                   loader_install_memory_hooks(&allocator, &vamm);
             authorization.installing = 0;
             if (result == DM_MEMORY_HOOKS_OK) {
                 // Process lifetime only. dm_host_shutdown's _exit is not an
                 // exclusive guest teardown boundary. Never release/reactivate.
-                LOG("experimental shared memory %s active: exact main+sdk, process lifetime, managed Walk rejected", DM_MEMORY_EXPERIMENT_NAME);
+                if (sdk_only)
+                    LOG("experimental SDK-only memory %s active: exact main+sdk, process lifetime, original StandardAllocator and profile alignment retained; original 12 GiB startup arena remains unchanged and may exceed native alias domain", DM_SDK_MEMORY_EXPERIMENT_NAME);
+                else
+                    LOG("experimental shared memory %s active: exact main+sdk, process lifetime, managed Walk rejected", DM_MEMORY_EXPERIMENT_NAME);
                 return DM_MEMORY_EXPERIMENT_ACTIVE;
             }
-            LOG("[RED] experimental shared memory relocation transaction rejected (%d)", result);
+            LOG("[RED] experimental %s memory relocation transaction rejected (%d)", sdk_only ? "SDK-only" : "shared", result);
             why = "loader rejected the complete ownership transaction";
         }
         authorization.runtime = NULL;
@@ -125,7 +154,7 @@ int dm_memory_experiment_startup(const char *request, const char **diagnostic) {
         // reservation/config can exist before guest entry; failure to destroy
         // is a lifecycle bug, not permission to resume under the SDK.
         if (runtime && dm_memory_runtime_destroy(runtime) != DM_SA_OK)
-            die("[RED] experimental shared memory prepublication cleanup failed");
+            die("[RED] experimental %s memory prepublication cleanup failed", sdk_only ? "SDK-only" : "shared");
     }
 #endif
     if (diagnostic) *diagnostic = why;

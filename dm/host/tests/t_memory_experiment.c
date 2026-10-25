@@ -32,6 +32,9 @@ int loader_install_memory_hooks(const dm_sa_adapter_config *a, const dm_vamm_ada
     startup_allocator = *a; startup_vamm = *v;
     return dm_memory_hooks_install(g_mod, (size_t)g_nmod, a, v, startup_resolve);
 }
+int loader_install_vamm_hooks(const dm_vamm_adapter_config *v) {
+    (void)v; assert(!"full-group test must not select SDK-only startup"); return DM_MEMORY_HOOKS_INVALID;
+}
 #ifdef MEMORY_EXPERIMENT_NO_ALIGNED_LEASES
 #undef DM_MEMORY_RUNTIME_ALIGNED_LEASES
 #endif
@@ -54,9 +57,17 @@ static void identities(void) {
     }
     g_nmod = 2;
 }
+static void unreviewed_sdk(void) {
+    // Same inspected SDK-side contracts do not authorize a different whole
+    // game closure. In particular, SDK20.5.8 is not another experiment target.
+    const char *id = "e01950c58e17b080c90494784ea1dd29e9dbd486000000000000000000000000";
+    strcpy(g_mod[1].full_build_id, id);
+    memcpy(g_mod[1].build_id, id, 32); g_mod[1].build_id[32] = 0;
+}
 static void preflight(void) {
     identities();
     assert(!dm_memory_experiment_preflight(g_mod, 2));
+    unreviewed_sdk(); assert(dm_memory_experiment_preflight(g_mod, 2)); identities();
     assert(dm_memory_experiment_preflight(NULL, 2));
     assert(dm_memory_experiment_preflight(g_mod, 1));
     assert(dm_memory_experiment_preflight(g_mod, 3));
@@ -254,6 +265,7 @@ static void scenario(unsigned which) {
     if (which == 15) fail_create = 1;
     if (which == 16) fail_configs = 1;
     if (which == 18) { module_t saved = g_mod[0]; g_mod[0] = g_mod[1]; g_mod[1] = saved; }
+    if (which == 19) unreviewed_sdk();
     int result = dm_memory_experiment_startup(request, &why);
     if (which < 3) {
         assert(result == DM_MEMORY_EXPERIMENT_OFF && !why && !creates && !installs && !destroys);
@@ -263,7 +275,8 @@ static void scenario(unsigned which) {
             assert(result == DM_MEMORY_EXPERIMENT_ACTIVE && !why && creates == 1 && installs == 1 && !destroys);
             active_calls(); return;
         }
-        if (which == 18) assert(!creates && !installs && !destroys && why && strstr(why, "main then sdk"));
+        if (which == 19) assert(!creates && !installs && !destroys && why && strstr(why, "full NSO build ID"));
+        else if (which == 18) assert(!creates && !installs && !destroys && why && strstr(why, "main then sdk"));
         else if (which == 15) assert(creates == 1 && !installs && !destroys);
         else if (which == 16) assert(creates == 1 && !installs && destroys == 1);
         else if (which >= 10) assert(creates == 1 && installs == 1 && destroys == 1);
@@ -284,7 +297,7 @@ static void run_scenario(void *which) { scenario(*(unsigned *)which); }
 int main(void) {
     struct rlimit limit = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &limit));
     startup_images_create(); preflight();
-    for (unsigned i = 0; i <= 18; ++i) {
+    for (unsigned i = 0; i <= 19; ++i) {
         char log[32768];
         int status = child_log(run_scenario, &i, log, sizeof log);
         if (!WIFEXITED(status) || WEXITSTATUS(status)) fputs(log, stderr);

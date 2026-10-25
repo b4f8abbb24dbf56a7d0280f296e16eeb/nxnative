@@ -317,6 +317,9 @@ static uint64_t memory_hook_resolve(module_t *m, const Elf64_Sym *s) {
 int loader_install_memory_hooks(const dm_sa_adapter_config *sa, const dm_vamm_adapter_config *va) {
     return dm_memory_hooks_install(g_mod, (size_t)g_nmod, sa, va, memory_hook_resolve);
 }
+int loader_install_vamm_hooks(const dm_vamm_adapter_config *va) {
+    return dm_memory_hooks_install_vamm_only(g_mod, (size_t)g_nmod, va, memory_hook_resolve);
+}
 
 typedef struct { const Elf64_Rela *tab[2]; uint64_t n[2]; uint64_t relr, relrsz; } relocs_t;
 static relocs_t relocs_of(const module_t *m) {

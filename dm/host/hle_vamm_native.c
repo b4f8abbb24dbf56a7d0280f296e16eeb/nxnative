@@ -41,12 +41,26 @@ static dm_vamm_resource_usage native_resources(void *context) {
     // The owner adds the bounded 512 KiB headroom exactly once, not here.
     return (dm_vamm_resource_usage){dm_vamm_svc_info(16), dm_vamm_svc_info(17)};
 }
-uint32_t dm_vamm_native_configure(dm_vamm_config *out, size_t max_regions) {
-    if (!out || !max_regions) return DM_VAMM_INVALID;
+uint32_t dm_vamm_native_configure_domain(dm_vamm_config *out, size_t max_regions,
+                                         dm_vamm_native_domain_policy policy) {
+    if (!out || !max_regions || (policy != DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+                                policy != DM_VAMM_DOMAIN_RAW_ALIAS))
+        return DM_VAMM_INVALID;
     dm_vamm_config c = {.max_regions = max_regions,
-        .change_pages = native_pages, .resources = native_resources};
-    uint32_t result = dm_vamm_native_decode_domain(dm_vamm_svc_info(2),
-        dm_vamm_svc_info(3), dm_vamm_svc_info(28), &c.base, &c.size);
+        .change_pages = native_pages, .resources = native_resources,
+        // The reviewed runtime remains modern. Legacy placement mechanisms
+        // must not imply ABI/bootstrap eligibility or enable another SDK.
+        .placement = DM_VAMM_PLACEMENT_MODERN};
+    uint64_t alias_base = dm_vamm_svc_info(2), alias_size = dm_vamm_svc_info(3);
+    // Legacy raw-alias callers must not even query the extra-size service.
+    uint64_t extra_size = policy == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA ?
+        dm_vamm_svc_info(28) : 0;
+    uint32_t result = dm_vamm_native_decode_domain(alias_base, alias_size,
+                                                  extra_size, &c.base, &c.size);
     if (!result) *out = c;
     return result;
+}
+uint32_t dm_vamm_native_configure(dm_vamm_config *out, size_t max_regions) {
+    return dm_vamm_native_configure_domain(out, max_regions,
+                                            DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA);
 }

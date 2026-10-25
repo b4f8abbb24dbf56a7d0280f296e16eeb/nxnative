@@ -263,7 +263,44 @@ static void no_config(dm_sa_adapter_config *a) {
     assert(a->make_config(a->context,self,(size_t)62<<30,0,&c) == DM_SA_INVALID);
     assert(!memcmp(&c,&before,sizeof c));
 }
+static void owner_only_runtime_tests(void) {
+    dm_memory_runtime *runtime = NULL;
+    assert(dm_memory_runtime_create_vamm_only(&runtime, 128) == DM_SA_OK);
+    dm_vamm_adapter_config v, before_v;
+    dm_sa_adapter_config a, before_a;
+    memset(&v, 0xa5, sizeof v); before_v = v;
+    memset(&a, 0x5a, sizeof a); before_a = a;
+    assert(dm_memory_runtime_configs(runtime, &v, &a) == DM_SA_INVALID);
+    assert(!memcmp(&v, &before_v, sizeof v) && !memcmp(&a, &before_a, sizeof a));
+    assert(dm_memory_runtime_vamm_config(runtime, &v) == DM_SA_OK);
+    assert(v.shared_owner && v.context == runtime && !v.proofs && !v.symbols && !v.experimental_startup);
+    assert(!dm_vamm_is_initialized(v.shared_owner) && !alias_mapped());
+    assert(!v.retain_owner(v.context, v.shared_owner));
+    assert(v.retain_owner(v.context, v.shared_owner) == DM_VAMM_INVALID);
+    assert(dm_memory_runtime_destroy(runtime) == DM_SA_BUSY);
+    unsigned calls = atomic_load(&protect_calls);
+    dm_vamm_initialize(v.shared_owner);
+    assert(atomic_load(&protect_calls) == calls && !alias_mapped());
+    uintptr_t base = 123;
+    if (dm_vamm_is_enabled(v.shared_owner)) {
+        assert(!dm_vamm_allocate(v.shared_owner, &base, SMALL, 1));
+        assert(alias_mapped() == SMALL);
+        memset((void *)base, 0x43, SMALL);
+        v.release_owner(v.context, v.shared_owner);
+        // A live SDK-facing reservation independently pins the owner after its
+        // table lease is dropped. No StandardAllocator config/provider exists.
+        assert(dm_memory_runtime_destroy(runtime) == DM_SA_BUSY);
+        assert(*(unsigned char *)base == 0x43 && !dm_vamm_free(v.shared_owner, base));
+        assert(!alias_mapped());
+        assert(v.retain_owner(v.context, v.shared_owner) == DM_VAMM_INVALID);
+    } else {
+        assert(dm_vamm_allocate(v.shared_owner, &base, SMALL, 1) == DM_VAMM_INVALID && base == 123);
+        v.release_owner(v.context, v.shared_owner);
+    }
+    assert(dm_memory_runtime_destroy(runtime) == DM_SA_OK);
+}
 int main(void) {
+    owner_only_runtime_tests();
     dm_memory_runtime *runtime = (void *)1;
     assert(dm_memory_runtime_create(&runtime,0) == DM_SA_INVALID && runtime == (void *)1);
     assert(dm_memory_runtime_create(NULL,32) == DM_SA_INVALID);
@@ -271,6 +308,9 @@ int main(void) {
     assert(dm_memory_runtime_create(&runtime,128) == DM_SA_OK);
     dm_vamm_adapter_config v;
     dm_sa_adapter_config a;
+    memset(&v, 0xa5, sizeof v);
+    dm_vamm_adapter_config before_v = v;
+    assert(dm_memory_runtime_vamm_config(runtime, &v) == DM_SA_INVALID && !memcmp(&v, &before_v, sizeof v));
     assert(dm_memory_runtime_configs(runtime,&v,&a) == DM_SA_OK);
     assert(v.shared_owner && v.context == runtime && a.context == runtime);
     assert(!v.proofs && !a.proofs && !alias_mapped());

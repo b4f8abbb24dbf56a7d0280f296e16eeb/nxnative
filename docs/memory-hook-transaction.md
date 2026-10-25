@@ -15,10 +15,12 @@ change permissions, invent offsets, or accept a caller-supplied installed mask.
    window. The first `guest_main` entry closes it **before** thread initialization,
    Oodle tool-mode execution, or any SDK entry. `run_module_inits` independently
    checks that no transaction is in flight. Reentry/concurrent install rejects.
-2. The transaction requires one defining module for all 22 StandardAllocator and
+2. The full-group transaction requires one defining module for all 22 StandardAllocator and
    18 Vamm names, with ordinary global/default/function definitions. It rejects
    duplicate names or overlapping module images, additional class methods,
-   missing/duplicate definitions, any deferred NRO, and unloaded modules.
+   missing/duplicate definitions, any deferred NRO, and unloaded modules. Unknown
+   members are detected by mangled owner prefix (including cv/ref qualifiers),
+   not by a class name that may occur in an unrelated service parameter type.
 3. It captures originals from those definitions and prepares both adapters.
    Preparation copies immutable tables and preallocates the Vamm owner. It does
    not invoke a constructor, factory, resource callback, or SDK initializer.
@@ -54,6 +56,21 @@ implementations still return the unwrapped target with the existing diagnostic,
 without generating code or reopening executable pages. Sealing an empty pool
 also closes stub creation. Preflight still requires
 an exact slot match; there is no guessed wrapper unwrapping or special bypass.
+
+## SDK-only selection and authority
+
+`loader_install_vamm_hooks` uses the same actual resolver and module census, but
+selects all 18 Vamm names only. Every StandardAllocator slot, including the
+existing forced size-allocation/profile-alignment shim, remains unchanged.
+Missing or additional SA methods are outside this ownership group; unknown
+Vamm members still fail closed. Untouched SA and other relocations participate
+in overlap checks, so they cannot alias a selected write silently.
+
+The [bounded SDK-only startup](bounded-sdk-memory-experiment.md) requires its own
+live mode-scoped permit for the same exact reviewed main/SDK pair. A full-group
+permit cannot choose SDK-only installation; an SDK-only permit cannot prepare a
+StandardAllocator table or commit the full group. The owner-only runtime creates
+no unused SA provider. No generic SDK-family/build flag grants authority.
 
 ## Native lifetime contract, not permission to enable
 
