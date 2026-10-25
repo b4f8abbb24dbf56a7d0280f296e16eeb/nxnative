@@ -44,8 +44,10 @@ finer and query prefixes may be clipped. It is not merely a minimum callback
 alignment or the host protection-page size. The native capability remains
 4 KiB on both 4 KiB and 16 KiB hosts. Finer existing commitment states are not
 supported by an advertised coarser capability.
-The production runtime does **not** supply this callback, and activation gates
-remain unchanged. Sparse commitment statistics, whole-lease draining,
+Existing runtime constructors and admitted startup descriptors do **not** supply
+this callback. The [explicit page-capable constructor](shared-memory-runtime.md#explicit-page-capable-construction-not-startup-admission)
+is currently exercised only by synthetic runtime integration fixtures; activation
+gates remain unchanged. Sparse commitment statistics, whole-lease draining,
 recommit-on-reuse/growth and optional native reclamation are implemented as
 staged core layers below. These policies are not active in production.
 
@@ -71,8 +73,8 @@ generation/range validation, preserved live neighbors on simulated 16 KiB hosts,
 idempotent accounting, failure retention, in-flight serialization, borrow races,
 zero-reservation-gap recommit, stale-budget rejection and release through holes.
 The native Vamm fixture also exercises the capability through `dm_vamm_pages`
-and the real SVC backend without wiring it into production. Runtime wiring still
-requires a separate implementation/review. This establishes no SDK policy parity,
+and the real SVC backend. Explicit runtime construction is separately tested;
+startup selection still requires review and native CI. This establishes no SDK policy parity,
 new admission, gameplay result or permission to remove an existing cut.
 
 ### Sparse accounting and whole-lease draining
@@ -92,7 +94,7 @@ cost; borrowed runs are barriers. No persistent residency ledger is introduced.
 Query failures leave the entire caller output unchanged.
 
 Page-capable free-space statistics describe budgeted recommit potential, not a
-promise against a competing physical commit after a snapshot. Production
+promise against a competing physical commit after a snapshot. Admitted startup
 callbacks stay absent. Synthetic tests create holes through exact captured leases
 in proven wholly free granules, or through the core reclamation policy below.
 
