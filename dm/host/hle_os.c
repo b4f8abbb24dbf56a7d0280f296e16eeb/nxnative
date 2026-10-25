@@ -102,9 +102,12 @@ uint64_t dm_entropy64(void) {
     uint64_t n = atomic_fetch_add(&g_detrng_n, 1) + 1; if (n == 1 || n % 1000 == 0) LOG("DM_DETCLOCK: deterministic entropy call %llu", (unsigned long long)n);
     return z;
 }
-HLE("getentropy", int, g_getentropy, void *p, size_t n) {
-    if (!detclock_cfg()) { arc4random_buf(p, n); return 0; }
+void dm_entropy_bytes(void *p, size_t n) {
+    if (!detclock_cfg()) { arc4random_buf(p, n); return; }
     for (size_t i = 0; i < n; i += 8) { uint64_t v = dm_entropy64(); memcpy((uint8_t *)p + i, &v, n - i < 8 ? n - i : 8); }
+}
+HLE("getentropy", int, g_getentropy, void *p, size_t n) {
+    dm_entropy_bytes(p, n);
     return 0;
 }
 // The SDK's own getentropy (Unicorn Overlord, SDK 16.2.4: std::random_device at nnMain) fills through nn::crypto::GenerateCryptographicallyRandomBytes, which opens the csrng service;

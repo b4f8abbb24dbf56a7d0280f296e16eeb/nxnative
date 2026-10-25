@@ -81,6 +81,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 ## Services and SDK calls
 
 - `sm::Initialize` aborts right after `ConnectToNamedPort` (SVC 0x1F) and `SendSyncRequest` (0x21); abort inside `nn::sm::Initialize`, the log showing `SVC 0x1f` (ConnectToNamedPort, port name `sm:`) and `SVC 0x21` answered by placeholders, then an `nn::diag` abort; abort with no message at start-up in a service call the host has no hook for (`Break` from `sdk+…` with an `nn::diag` backtrace). → [SDK calls that open a system service through sm](../reference/services.md#sdk-calls-that-open-a-system-service-through-sm)
+- the random-byte client reaches native `ConnectToNamedPort` / `SendSyncRequest`, but the old placeholder SVC replies provide neither a service handle nor a valid CMIF response. → [Checked native SM and CSRNG transport](../reference/services.md#checked-native-sm-and-csrng-transport)
 - a game update aborts at boot where the base game ran. → [A game update imports SDK calls the base game did not](../reference/services.md#a-game-update-imports-sdk-calls-the-base-game-did-not)
 - abort in `sm::Initialize` under `sf::hipc::InitializeHipcServiceResolution`, right after the first frames (from `main+0x5b8198`). → [Game-linked HIPC clients of system services](../reference/services.md#game-linked-hipc-clients-of-system-services)
 - a call the host hooks under its newer name reaches the SDK's own code on an older game. → [Older SDK names for the same calls](../reference/services.md#older-sdk-names-for-the-same-calls)
