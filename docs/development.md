@@ -2,6 +2,8 @@
 
 The README covers packing and playing. This page is for working on nxnative itself: how it is built, the script's options, running games on the Mac, and adding a game (per-game notes are in [dm/games](../dm/games/README.md#games)). Agent-oriented details (bring-up failure catalogue, graphics specifics, debugging recipes) are in [docs/agents](agents/README.md).
 
+The upstream bitmap-backed memory transaction and gated native reservation integration are documented in [Native address regions](native-address-regions.md), including portable tests and the remaining SDK takeover requirements. Existing patches and profiles are retained. The [startup memory-hook transaction](memory-hook-transaction.md) prepares immutable adapters and journals actual loader relocations; default production activation remains disabled, with a separate [bounded experiment](bounded-shared-memory-experiment.md).
+
 ## How it works
 
 | Part | State |
