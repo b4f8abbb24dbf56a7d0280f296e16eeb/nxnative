@@ -2,6 +2,8 @@
 
 The README covers packing and playing. This page is for working on nxnative itself: how it is built, the script's options, running games on the Mac, adding a game, and per-game notes. Agent-oriented details (bring-up failure catalogue, graphics specifics, debugging recipes) are in [docs/agents](agents/README.md).
 
+Shared native alias-page accounting and the gated host reservation core are documented in [Native address regions](native-address-regions.md), including portable tests and the remaining SDK takeover requirements. Existing patches and profiles are retained.
+
 ## How it works
 
 | Part | State |
