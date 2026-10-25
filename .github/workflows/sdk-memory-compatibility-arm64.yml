@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sdk-memory-compatibility-exact-head-${{ github.ref }}
+  group: sdk-memory-compatibility-exact-head-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 env:
@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 9164762893738750420fb5867b01c89bb7b87882
+          ref: 9eefcc69e21c1d6529045c3c34374e149d844ee8
           persist-credentials: false
       - name: Host unit tests (dm/host/tests)
         run: |
@@ -68,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 9164762893738750420fb5867b01c89bb7b87882
+          ref: 9eefcc69e21c1d6529045c3c34374e149d844ee8
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 9164762893738750420fb5867b01c89bb7b87882
+          ref: 9eefcc69e21c1d6529045c3c34374e149d844ee8
           persist-credentials: false
       - name: Mac host for three profiles (Vulkan, NVN, OpenGL)
         run: |
@@ -152,13 +152,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 9164762893738750420fb5867b01c89bb7b87882
+          ref: 9eefcc69e21c1d6529045c3c34374e149d844ee8
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = 9164762893738750420fb5867b01c89bb7b87882
-          test "$(git rev-parse HEAD^{tree})" = 508b42bb293001ba151570007e49591f4ec2ea7b
+          test "$(git rev-parse HEAD)" = 9eefcc69e21c1d6529045c3c34374e149d844ee8
+          test "$(git rev-parse HEAD^{tree})" = 411a64318f92f6bab37c651cb4d0c8f8755b7952
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -226,7 +226,7 @@ jobs:
         run: |
           make -C dm/host/tests CC=clang B="build/ci-$MODE" SA_FLAGS="$FLAGS" AS_FLAGS="$FLAGS" \
             vamm-placement vamm-native-domain memory-hooks-vamm-only memory-runtime-vamm-only \
-            memory-runtime-owner-only sdk-memory-experiment 2>&1 | tee logs/sdk-memory-compatibility.log
+            memory-runtime-owner-only sdk-memory-experiment memory-runtime-contract 2>&1 | tee logs/sdk-memory-compatibility.log
       - name: Actual Apple loader relocation, rollback and binding precedence
         if: ${{ !cancelled() }}
         run: |
@@ -268,7 +268,7 @@ jobs:
         run: |
           make -C dm/host/tests CC=clang B=build/ci-sdk-combined \
             vamm-placement-sanitize vamm-native-domain-sanitize memory-hooks-vamm-only-sanitize \
-            memory-runtime-vamm-only-sanitize memory-runtime-owner-only-sanitize sdk-memory-experiment-sanitize \
+            memory-runtime-vamm-only-sanitize memory-runtime-owner-only-sanitize sdk-memory-experiment-sanitize memory-runtime-contract-sanitize \
             2>&1 | tee logs/sdk-memory-combined.log
       - name: Exact native-Vamm, runtime and transaction TSan targets
         if: ${{ !cancelled() && matrix.mode == 'thread' }}
