@@ -502,6 +502,15 @@ memory-hooks-loader: $(B)/t_memory_hooks_loader
 	$(B)/t_memory_hooks_loader $(B)/memory-hooks-count-empty.tsv --empty
 run: memory-hooks-loader
 
+$(B)/t_memory_hooks_loader_vamm_only: t_memory_hooks_loader_vamm_only.c $(VAMM_ONLY_HOOK_DEPS) ../loader.c ../hle_count.c $(GAME_H) | $(B)
+	clang $(MEMORY_HOOK_NATIVE_FLAGS) -DDM_MEMORY_HOOKS_TESTING -DDM_VAMM_ADAPTER_TESTING -I.. $(GINC) -o $@ t_memory_hooks_loader_vamm_only.c $(MEMORY_HOOK_SRCS)
+.PHONY: memory-hooks-loader-vamm-only
+memory-hooks-loader-vamm-only: $(B)/t_memory_hooks_loader_vamm_only
+	$(B)/t_memory_hooks_loader_vamm_only
+	$(B)/t_memory_hooks_loader_vamm_only $(B)/memory-hooks-vamm-only-count.tsv
+	$(B)/t_memory_hooks_loader_vamm_only $(B)/memory-hooks-vamm-only-count-empty.tsv --empty
+run: memory-hooks-loader-vamm-only
+
 $(B)/t_memory_hooks_tsan: $(MEMORY_HOOK_DEPS) | $(B)
 	$(CC) $(MEMORY_HOOK_TEST_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ t_memory_hooks.c $(MEMORY_HOOK_SRCS)
 .PHONY: memory-hooks-tsan

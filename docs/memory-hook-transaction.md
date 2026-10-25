@@ -115,6 +115,7 @@ make -C dm/host/tests memory-hooks
 ASAN_OPTIONS=detect_leaks=0 make -C dm/host/tests memory-hooks-sanitize
 # Apple host only: actual loader.c / forced-HLE resolver, synthetic ELF images
 make -C dm/host/tests GAME=<profile-id> memory-hooks-loader
+make -C dm/host/tests GAME=<profile-id> memory-hooks-loader-vamm-only
 ```
 
 Portable tests use the actual transaction and both adapters: each missing method,
@@ -132,3 +133,19 @@ immutable RX stub pages, late-entry fallback, executable host-only counters and
 the TSV report. A third run seals an empty pool and rejects late stub creation.
 It is part of the Apple host aggregate, not claimed as run on
 Linux. No proprietary binaries or fixed private offsets are included.
+
+The SDK-only Apple fixture drives the actual `loader_install_vamm_hooks` wrapper
+and resolver with SA adapter activation unavailable. It checks failed census,
+staged-write rollback/retry, all 18 published Vamm bindings, unchanged known and
+unknown SA bindings, and untouched packed-relative slots. A synthetic original
+SA allocation shim remains callable before, after rollback and after publication.
+One selected Vamm method has a forced counting wrapper, proving exact restoration
+on rollback and memory-hook precedence after commit. Its uncounted, counted and
+empty-pool runs use the same sealed-code checks and configurable
+`MEMORY_HOOK_NATIVE_FLAGS` as the full-group fixture.
+
+These loader fixtures use synthetic transaction authorization and do not execute
+Nintendo SDK instructions. Production scoped startup authorization, native-owner
+operations and original-SA dispatch are tested separately by
+`sdk-memory-experiment`; that portable fixture uses a synthetic loader resolver.
+Neither fixture establishes original SDK ABI/call closure or gameplay readiness.

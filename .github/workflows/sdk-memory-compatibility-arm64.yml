@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f2cca49d8310d004e268d7ba7f21bc69307ae62c
+          ref: 9164762893738750420fb5867b01c89bb7b87882
           persist-credentials: false
       - name: Host unit tests (dm/host/tests)
         run: |
@@ -68,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f2cca49d8310d004e268d7ba7f21bc69307ae62c
+          ref: 9164762893738750420fb5867b01c89bb7b87882
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: f2cca49d8310d004e268d7ba7f21bc69307ae62c
+          ref: 9164762893738750420fb5867b01c89bb7b87882
           persist-credentials: false
       - name: Mac host for three profiles (Vulkan, NVN, OpenGL)
         run: |
@@ -152,13 +152,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: f2cca49d8310d004e268d7ba7f21bc69307ae62c
+          ref: 9164762893738750420fb5867b01c89bb7b87882
           persist-credentials: false
       - name: Verify exact source and native ARM64 platform
         run: |
           mkdir -p logs
-          test "$(git rev-parse HEAD)" = f2cca49d8310d004e268d7ba7f21bc69307ae62c
-          test "$(git rev-parse HEAD^{tree})" = 1fd867729b5bc3e833f9734fed0c0f2be074a1a9
+          test "$(git rev-parse HEAD)" = 9164762893738750420fb5867b01c89bb7b87882
+          test "$(git rev-parse HEAD^{tree})" = 508b42bb293001ba151570007e49591f4ec2ea7b
           test "$(uname -m)" = arm64
           git show -s --format=fuller HEAD | tee logs/source.txt
           { uname -a; sw_vers; clang --version; xcodebuild -version; } | tee logs/platform.txt
@@ -236,6 +236,15 @@ jobs:
           grep -Fq 'sealed counters (enabled), rollback and binding precedence passed' logs/memory-hooks-loader.log
           grep -Fq 'sealing an empty counter pool refuses later code generation' logs/memory-hooks-loader.log
           cp dm/host/tests/build/ci-$MODE/memory-hooks-count*.tsv logs/
+      - name: Actual Apple SDK-only loader and unchanged original allocator bindings
+        if: ${{ !cancelled() }}
+        run: |
+          make -C dm/host/tests CC=clang GAME="$GAME" B="build/ci-$MODE" \
+            MEMORY_HOOK_NATIVE_FLAGS="$NATIVE_FLAGS" memory-hooks-loader-vamm-only 2>&1 | tee logs/memory-hooks-loader-vamm-only.log
+          grep -Fq 'sealed counters (disabled), rollback, Vamm precedence and original SA preservation passed' logs/memory-hooks-loader-vamm-only.log
+          grep -Fq 'sealed counters (enabled), rollback, Vamm precedence and original SA preservation passed' logs/memory-hooks-loader-vamm-only.log
+          grep -Fq 'SDK-only loader: sealing an empty counter pool refuses later code generation' logs/memory-hooks-loader-vamm-only.log
+          cp dm/host/tests/build/ci-$MODE/memory-hooks-vamm-only-count*.tsv logs/
       - name: Native AArch64 x8 hash and x0/x1 result ABI plus disabled gates
         if: ${{ !cancelled() }}
         run: |
