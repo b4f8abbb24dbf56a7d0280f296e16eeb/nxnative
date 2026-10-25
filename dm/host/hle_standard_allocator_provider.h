@@ -33,6 +33,12 @@ typedef struct {
     // alignment policy. Original SDK owners leave this NULL unless proven.
     uint32_t (*allocate_memory_aligned)(void *context, uintptr_t *out, size_t size,
                                         size_t alignment);
+    // Optional verified owner page operation. No SDK original is inferred or
+    // installed. Preserve the containing reservation and every committed byte
+    // outside the interval. Returning failure changes no pages/accounting;
+    // commit preserves already committed bytes and initializes logical holes.
+    // The provider applies strict physical-budget scope to every commit.
+    dm_sa_result (*change_pages)(void *context, uintptr_t base, size_t size, int commit);
 } dm_sa_sdk_owner;
 
 // Callbacks are trusted, verified integration boundaries, not plugin hooks.
@@ -58,6 +64,10 @@ void dm_sa_svc_scope_end(void);
 int dm_sa_svc_alias_range_locked(uintptr_t base, size_t size);
 int dm_sa_svc_backed_locked(uintptr_t base, size_t size);
 int dm_sa_svc_available_locked(uintptr_t base, size_t size);
+// Ownership-independent bitmap/borrow inspection; the provider validates its
+// exact lease first. No payload access; clipped to the supplied byte interval.
+dm_sa_result dm_sa_svc_page_run_locked(uintptr_t base, size_t maximum, dm_sa_page_run *out);
+int dm_sa_svc_unborrowed_locked(uintptr_t base, size_t size);
 size_t dm_sa_svc_physical_budget_locked(void);
 // Thread-local, nesting-safe strict physical budget for ONLY an original owner
 // allocation transaction. SVC applies the limit atomically at commit, including

@@ -202,8 +202,9 @@ static void fixture_init(fixture *f, size_t budget) {
 }
 static dm_sa_config config(fixture *f, size_t capacity, size_t pool_size) {
     dm_sa_config c = {0};
-    c.provider = (dm_sa_provider){f, f->granule, provider_begin, provider_end,
-        provider_acquire, provider_release, provider_available, provider_query};
+    c.provider = (dm_sa_provider){.context = f, .granule = f->granule,
+        .begin = provider_begin, .end = provider_end, .acquire = provider_acquire,
+        .release = provider_release, .available = provider_available, .query = provider_query};
     c.capacity = capacity;
     c.pool_size = pool_size;
     c.metadata_context = f;
@@ -296,6 +297,8 @@ static void test_validation(void) {
     bad.provider.granule = 3 * PAGE;
     CHECK(dm_sa_create(&sentinel, &bad) == DM_SA_INVALID);
     bad = c; bad.provider.available = NULL;
+    CHECK(dm_sa_create(&sentinel, &bad) == DM_SA_INVALID);
+    bad = c; bad.provider.pages.granule = PAGE;
     CHECK(dm_sa_create(&sentinel, &bad) == DM_SA_INVALID);
     bad = c; bad.metadata_free = NULL;
     CHECK(dm_sa_create(&sentinel, &bad) == DM_SA_INVALID);

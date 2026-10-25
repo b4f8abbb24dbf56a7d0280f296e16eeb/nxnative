@@ -220,7 +220,9 @@ static void core_tests(void) {
     empty(&f);
 
     // Complete StandardAllocator -> current host owner -> production SVC path.
-    dm_sa_sdk_owner callbacks = {&f, acquire, relinquish, reservation_stats, context_active, SMALL, NULL};
+    dm_sa_sdk_owner callbacks = {.context = &f, .allocate_memory = acquire,
+        .free_address_region = relinquish, .query_reservations = reservation_stats,
+        .guest_context_active = context_active, .guaranteed_alignment = SMALL};
     dm_sa_sdk_provider *provider;
     assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
     dm_sa_config sc = {.provider = dm_sa_sdk_provider_interface(provider), .capacity = (size_t)62 << 30};
