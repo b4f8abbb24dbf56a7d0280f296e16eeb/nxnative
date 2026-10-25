@@ -15,14 +15,20 @@ no StandardAllocator destructor; an extra or missing destructor/method rejects
 this census rather than claiming an unknown ABI is covered.
 
 Synthetic activation requires every symbol, every binding bit, nonrecursive
-original function addresses, an original Allocate(size) forwarding callback,
+original function addresses, an original Allocate(size) forwarding callback, a native managed-alignment policy callback,
 and explicit ABI/caller/inline/current-owner/behavior proof bits. All validation
 precedes publication. These bits are requirements for future integration, not a
 substitute for evidence. A real loader transaction must finish before any guest
 execution and must cover every relocation, dynamically loaded module and direct
 or inline path; the current code does not install such a transaction.
 
-A side table holds the managed instance and its real provider-backed core. Only
+A side table holds the managed instance and its real provider-backed core.
+Initialization publishes a provisional initializing state, then invokes its
+configuration factory and creates the core without holding the registry lock.
+Other instances remain usable from the factory. Same-instance calls, constructors,
+reinitialization and Finalize reject that in-flight state with BUSY rather than
+reentering the SDK or deadlocking. Failed first initialization removes only its
+provisional record; failed reinitialization keeps its finalized tombstone. Only
 null-buffer initialization becomes managed. Provided-buffer and other SDK-owned
 objects call their captured original methods unchanged. Once managed, failures
 never fall back to the SDK's embedded CentralHeap. Finalize waits for in-flight
@@ -33,9 +39,14 @@ embedded heap. Initialized/cache bytes are set within that observed extent.
 
 The existing `hle_os.c` Allocate(size) registration is still the sole forced
 entry. Its managed-only bridge cannot turn an allocation failure into an SDK
-allocation. For unmanaged objects, its original profile alignment branch remains
-unchanged. Future adapter installation must supply that same policy through
-`forward_allocate`; the portable adapter does not duplicate game rules.
+allocation. Its explicit managed alignment input preserves the existing `alloc_big_align`
+policy instead of bypassing it. For unmanaged objects, original forwarding stays
+unchanged. Future adapter installation supplies `forward_allocate` plus the same
+thread-safe, nonreentrant native `allocation_alignment` policy for managed
+Allocate(size). That policy is
+not used for the explicit-alignment overload or SDK-owned objects; malformed or
+unrepresentable managed alignment fails without an SDK fallback. The portable
+adapter does not duplicate game rules.
 
 ## ABI and behavior evidence
 
@@ -107,7 +118,7 @@ make standard-allocator-adapter-sanitize
 ```
 
 The adapter fixture covers all-method forwarding and ownership, constructor
-aliases, complete-group rejection, existing alignment-policy forwarding, guarded
+aliases, complete-group rejection, existing alignment-policy forwarding and managed alignment, callback-safe initialization, concurrent lifecycle rejection and factory-failure cleanup, guarded
 failure/no SDK escape, initialization bounds, zero/resize/query/hash behavior,
 walk stop/reentry/lifetime cases, and concurrent allocation/reallocation/free.
 The gate fixture builds without the testing macro and verifies that production

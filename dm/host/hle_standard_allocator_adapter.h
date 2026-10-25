@@ -30,6 +30,15 @@ typedef struct {
     // alloc_big_align behavior for SDK-owned objects. It must not be an adapter
     // hook; the existing shim's managed-only bridge avoids recursive dispatch.
     void *(*forward_allocate)(void *self, size_t size);
+    // Native policy for managed Allocate(size) only (normally 16). The host
+    // supplies its existing alloc_big_align policy; no game rules live here.
+    // Thread-safe native policy only: must not reenter this adapter or change
+    // instance lifetime. Runs without registry/core locks, with an in-flight
+    // instance reference. Invalid or unrepresentable alignment
+    // makes that allocation fail, never fall through to the SDK.
+    size_t (*allocation_alignment)(void *self, size_t size);
+    // Runs without the registry lock. Other instances may be used; reentry or
+    // concurrent lifecycle calls on this initializing self fail with BUSY.
     dm_sa_result (*make_config)(void *context, void *self, size_t capacity,
                                unsigned thread_cache, dm_sa_config *out);
     // Called only for managed Dump; does not inspect the SDK's embedded heap.
@@ -52,4 +61,6 @@ dm_sa_guest_fn dm_sa_adapter_lookup(const char *name); // NULL while inactive
 int dm_sa_adapter_is_managed(const void *self); // includes finalized tombstones
 // hle_os.c's existing Allocate(size) owner uses this fast bridge. A managed
 // failure returns 1 and NULL; it MUST NOT escape to the original SDK allocator.
-int dm_sa_adapter_allocate_if_managed(void *self, size_t size, void **out);
+int dm_sa_adapter_allocate_if_managed(void *self, size_t size, size_t alignment, void **out);
+// hle_os.c's native policy, shared by its forced entry and future installation.
+size_t dm_sa_host_allocation_alignment(void *self, size_t size);

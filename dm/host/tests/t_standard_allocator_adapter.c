@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -27,6 +28,13 @@ static void fF(void *s) { note(F,s); ((unsigned char*)s)[0]=0; }
 static void *fA(void *s,size_t z) { note(A,s); last_size=z; return &forwarded_pointer; }
 static void *fAA(void *s,size_t z,size_t a) { note(AA,s); last_size=z; last_alignment=a; return &forwarded_pointer; }
 static int profile_big_align;
+static size_t policy_override, last_provider_alignment;
+static _Atomic unsigned policy_calls;
+static int policy_override_active;
+static size_t allocation_alignment(void *s,size_t z) {
+    (void)s; policy_calls++;
+    return policy_override_active ? policy_override : profile_big_align && z>=65536 ? 65536 : 16;
+}
 static void *profile_allocate(void *s,size_t z) {
     return profile_big_align && z>=65536 ? fAA(s,z,65536) : fA(s,z);
 }
@@ -66,7 +74,7 @@ static unsigned acquisitions,releases;
 static void begin(void *c) { (void)c; }
 static void end(void *c) { (void)c; }
 static dm_sa_result acquire(void *c,size_t n,size_t a,dm_sa_span *out) {
-    (void)c; void *p=NULL;
+    (void)c; void *p=NULL; last_provider_alignment=a;
     if (n > 1024*1024-leased || posix_memalign(&p,a,n)) return DM_SA_NO_MEMORY;
     *out=(dm_sa_span){p,n,(uintptr_t)p}; leased+=n; acquisitions++; return DM_SA_OK;
 }
@@ -80,17 +88,38 @@ static int available(void *c,const dm_sa_span *s,size_t o,size_t n) {
 static dm_sa_result query(void *c,size_t a,dm_sa_provider_stats *out) {
     (void)c;(void)a; *out=(dm_sa_provider_stats){1024*1024-leased,1024*1024-leased}; return DM_SA_OK;
 }
+enum { FACTORY_NORMAL, FACTORY_OTHER, FACTORY_REENTER, FACTORY_BLOCK, FACTORY_FAIL };
+static pthread_mutex_t factory_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t factory_changed=PTHREAD_COND_INITIALIZER;
+static void *factory_target,*factory_other;
+static int factory_mode,factory_entered,factory_continue;
 static dm_sa_result make_config(void *c,void *self,size_t capacity,unsigned cache,dm_sa_config *out) {
-    (void)c;(void)self; assert(cache<=1);
+    (void)c; assert(cache<=1);
+    pthread_mutex_lock(&factory_mutex);
+    int mode=self==factory_target?factory_mode:FACTORY_NORMAL;
+    void *other=factory_other;
+    if(mode==FACTORY_BLOCK) {
+        factory_entered=1; pthread_cond_broadcast(&factory_changed);
+        while(!factory_continue) pthread_cond_wait(&factory_changed,&factory_mutex);
+    }
+    pthread_mutex_unlock(&factory_mutex);
+    if(mode==FACTORY_OTHER) assert(HASH(other).block_count==0);
+    if(mode==FACTORY_REENTER) (void)ALLOC(self,16);
+    if(mode==FACTORY_FAIL) return DM_SA_PROVIDER_FAILED;
     *out=(dm_sa_config){.provider={NULL,4096,begin,end,acquire,release,available,query},.capacity=capacity,.pool_size=4096};
     return DM_SA_OK;
 }
 static void diagnostic(void *c,const void *s,const dm_sa_stats *st) { (void)c;(void)s; assert(!st->closed); dumped++; }
-static void fatal(void *c,const char *op,dm_sa_result r) { (void)c; assert(op); assert(r!=DM_SA_OK); _exit(77); }
+static _Thread_local int fatal_in_thread;
+static void fatal(void *c,const char *op,dm_sa_result r) {
+    (void)c; assert(op); assert(r!=DM_SA_OK);
+    if(fatal_in_thread) pthread_exit((void *)(uintptr_t)r);
+    _exit(77);
+}
 static int simple_callback(void *p,size_t n,void *ctx) { assert(p); assert(n); (*(int*)ctx)++; return 1; }
 static void expect_fatal(void (*action)(void *),void *context) {
     pid_t p=fork(); assert(p>=0);
-    if (!p) { action(context); _exit(0); }
+    if (!p) { alarm(10); action(context); _exit(0); }
     int status; assert(waitpid(p,&status,0)==p); assert(WIFEXITED(status) && WEXITSTATUS(status)==77);
 }
 static void foreign_free(void *s) { FREE(s,&forwarded_pointer); }
@@ -164,6 +193,26 @@ static void managed(void) {
     assert(!leased && !acquisitions); // capacity is not an eagerly mapped arena
     expect_fatal(double_initialize,s); expect_fatal(nonnull_transition,s);
     unsigned original_calls[22]; memcpy(original_calls,calls,sizeof calls);
+    profile_big_align=1;
+    void *large=ALLOC(s,65536);
+    assert(large && !((uintptr_t)large&65535) && last_provider_alignment==65536);
+    FREE(s,large);
+    void *bridged=NULL;
+    assert(dm_sa_adapter_allocate_if_managed(s,65536,65536,&bridged));
+    assert(bridged && !((uintptr_t)bridged&65535)); FREE(s,bridged);
+    unsigned before_policy=policy_calls;
+    large=ALIGNED(s,65536,4096);
+    assert(large && last_provider_alignment==4096 && policy_calls==before_policy); FREE(s,large);
+    // Policy applies only to managed size-only dispatch. Malformed and
+    // overflowing alignment must fail without calling any original allocator.
+    policy_override_active=1; policy_override=3; assert(!ALLOC(s,64));
+    policy_override=SIZE_MAX; assert(!ALLOC(s,64));
+    policy_override=(size_t)1<<63; assert(!ALLOC(s,64));
+    policy_override=0; assert(!ALLOC(s,64)); policy_override_active=0;
+    bridged=s; assert(dm_sa_adapter_allocate_if_managed(s,64,0,&bridged) && !bridged);
+    bridged=s; assert(dm_sa_adapter_allocate_if_managed(s,64,3,&bridged) && !bridged);
+    bridged=s; assert(dm_sa_adapter_allocate_if_managed(s,64,(size_t)1<<63,&bridged) && !bridged);
+    profile_big_align=0;
     void *p=ALLOC(s,31), *q=ALIGNED(s,65,65536);
     assert(p&&q&& !((uintptr_t)p&15)&&!((uintptr_t)q&65535));
     assert(SIZE(s,p)==32&&SIZE(s,q)==80);
@@ -222,12 +271,63 @@ static void managed(void) {
     }
     NEW(s); assert(!dm_sa_adapter_is_managed(s)); // retire finalized tombstone
 }
+static void factory_reentry(void *s) {
+    factory_target=s; factory_mode=FACTORY_REENTER; INIT(s,16384,0);
+}
+static void initialize_instance(void *s) { INIT(s,16384,0); }
+static void finalize_instance(void *s) { FINISH(s); }
+static void construct_instance(void *s) { NEW(s); }
+typedef struct { void (*action)(void *); void *self; } thread_action;
+static void *fatal_worker(void *arg) {
+    thread_action *a=arg; fatal_in_thread=1; a->action(a->self); return NULL;
+}
+static void expect_thread_failure(void (*action)(void *),void *self,dm_sa_result expected) {
+    thread_action a={action,self}; pthread_t t; void *result=NULL;
+    assert(!pthread_create(&t,NULL,fatal_worker,&a)); assert(!pthread_join(t,&result));
+    assert((uintptr_t)result==(uintptr_t)expected);
+}
+static void *initialize_worker(void *self) { initialize_instance(self); return NULL; }
+static void initialization_lifecycle(void) {
+    // A bounded alarm turns the pre-fix global-registry deadlock into a test
+    // failure instead of leaving the suite hung indefinitely.
+    alarm(20);
+    unsigned char first[56],second[56]; NEW(first); NEW(second); INIT(first,16384,0);
+    factory_target=second; factory_other=first; factory_mode=FACTORY_OTHER;
+    INIT(second,16384,0); FINISH(second);
+    expect_fatal(factory_reentry,second);
+    factory_mode=FACTORY_BLOCK; factory_entered=0; factory_continue=0;
+    pthread_t pending; assert(!pthread_create(&pending,NULL,initialize_worker,second));
+    pthread_mutex_lock(&factory_mutex);
+    while(!factory_entered) pthread_cond_wait(&factory_changed,&factory_mutex);
+    pthread_mutex_unlock(&factory_mutex);
+    assert(dm_sa_adapter_is_managed(second));
+    expect_thread_failure(initialize_instance,second,DM_SA_BUSY);
+    expect_thread_failure(finalize_instance,second,DM_SA_BUSY);
+    expect_thread_failure(construct_instance,second,DM_SA_BUSY);
+    expect_thread_failure(stale_allocate,second,DM_SA_BUSY);
+    assert(HASH(first).block_count==0); // unrelated instances remain available
+    pthread_mutex_lock(&factory_mutex); factory_continue=1;
+    pthread_cond_broadcast(&factory_changed); pthread_mutex_unlock(&factory_mutex);
+    assert(!pthread_join(pending,NULL)); assert(second[0]==1); FINISH(second);
+    // Failure on a tombstone keeps it owned; failure on a fresh address removes
+    // only its provisional record. Both support an explicit successful retry.
+    factory_mode=FACTORY_FAIL;
+    expect_thread_failure(initialize_instance,second,DM_SA_PROVIDER_FAILED);
+    assert(dm_sa_adapter_is_managed(second) && !second[0]);
+    factory_mode=FACTORY_NORMAL; INIT(second,16384,0); FINISH(second); NEW(second);
+    factory_mode=FACTORY_FAIL;
+    expect_thread_failure(initialize_instance,second,DM_SA_PROVIDER_FAILED);
+    assert(!dm_sa_adapter_is_managed(second) && !second[0]);
+    factory_mode=FACTORY_NORMAL; INIT(second,16384,0); FINISH(second); NEW(second);
+    FINISH(first); NEW(first); factory_target=NULL; factory_other=NULL;
+    alarm(0);
+}
 int main(void) {
     dm_sa_adapter_symbol symbols[22];
     for(size_t n=0;n<22;n++) { symbols[n]=(dm_sa_adapter_symbol){dm_sa_adapter_symbol_name(n),fixture[n]}; assert(!dm_sa_adapter_lookup(symbols[n].name)); }
     assert(!dm_sa_adapter_symbol_name(22));
     dm_sa_adapter_config c={.proofs=DM_SA_PROOF_ALL,.symbols=symbols,.symbol_count=22,
-        .installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS,.forward_allocate=profile_allocate,.make_config=make_config,.dump=diagnostic,.fatal=fatal};
+        .installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS,.forward_allocate=profile_allocate,.allocation_alignment=allocation_alignment,.make_config=make_config,.dump=diagnostic,.fatal=fatal};
     for(unsigned n=0;n<5;n++) { c.proofs=DM_SA_PROOF_ALL^(1u<<n); assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); }
     c.proofs=DM_SA_PROOF_ALL;
     for(unsigned n=0;n<22;n++) {
@@ -235,6 +335,7 @@ int main(void) {
         assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); assert(!dm_sa_adapter_lookup(symbols[A].name));
     }
     c.installed_bindings=DM_SA_ADAPTER_ALL_BINDINGS;
+    c.allocation_alignment=NULL; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); c.allocation_alignment=allocation_alignment;
     c.symbol_count=21; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); c.symbol_count=22;
     dm_sa_adapter_symbol old=symbols[0]; symbols[0]=symbols[1]; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); symbols[0]=old;
     symbols[0].name="_ZN2nn3mem17StandardAllocatorD1Ev"; assert(dm_sa_adapter_install(&c)==DM_SA_INVALID); symbols[0]=old;
@@ -242,6 +343,6 @@ int main(void) {
     assert(dm_sa_adapter_install(&c)==DM_SA_OK); assert(dm_sa_adapter_install(&c)==DM_SA_BUSY);
     for(size_t n=0;n<22;n++) assert(dm_sa_adapter_lookup(symbols[n].name));
     assert(!dm_sa_adapter_lookup("_ZN2nn3mem17StandardAllocatorD1Ev")); assert(!dm_sa_adapter_lookup(NULL));
-    forwarding(); managed();
+    forwarding(); assert(!policy_calls); managed(); initialization_lifecycle();
     puts("StandardAllocator adapter: complete synthetic binding/forwarding/ownership/ABI contracts passed");
 }

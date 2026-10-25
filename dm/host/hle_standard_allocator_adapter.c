@@ -42,7 +42,7 @@ typedef struct instance {
     dm_sa_allocator *allocator;
     unsigned users;
     uint64_t generation;
-    int finalizing;
+    int initializing, finalizing;
     struct instance *next;
 } instance;
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -64,9 +64,10 @@ static instance *find(const void *self) {
 static instance *take(const void *self, const char *operation) {
     pthread_mutex_lock(&mutex);
     instance *i = find(self);
-    if (i && (!i->allocator || i->finalizing)) {
+    if (i && (i->initializing || !i->allocator || i->finalizing)) {
+        dm_sa_result result = i->initializing ? DM_SA_BUSY : DM_SA_CLOSED;
         pthread_mutex_unlock(&mutex);
-        fail(operation, DM_SA_CLOSED);
+        fail(operation, result);
     }
     if (i) i->users++;
     pthread_mutex_unlock(&mutex);
@@ -95,7 +96,7 @@ static void forget_finalized(void *self) {
     while (*p && (*p)->self != self) p = &(*p)->next;
     if (*p) {
         instance *i = *p;
-        if (i->allocator || i->users || i->finalizing) {
+        if (i->initializing || i->allocator || i->users || i->finalizing) {
             pthread_mutex_unlock(&mutex);
             fail("constructor/Initialize", DM_SA_BUSY);
         }
@@ -111,38 +112,52 @@ static void initialize(void *self, void *buffer, size_t capacity, unsigned cache
         else ORIGINAL(INIT_CACHE, void (*)(void *, void *, size_t, unsigned))(self, buffer, capacity, cache);
         return;
     }
-    if (!self || ((unsigned char *)self)[0] || !capacity || (capacity & 4095u) || capacity > INT64_MAX)
+    if (!self || !capacity || (capacity & 4095u) || capacity > INT64_MAX)
         fail("Initialize", DM_SA_INVALID);
     pthread_mutex_lock(&mutex);
     instance *i = find(self);
-    if (i && (i->allocator || i->users || i->finalizing)) {
+    if (i && (i->initializing || i->allocator || i->users || i->finalizing)) {
         pthread_mutex_unlock(&mutex);
         fail("Initialize", DM_SA_BUSY);
     }
-    if (next_generation == UINT64_MAX) {
+    if (((unsigned char *)self)[0] || next_generation == UINT64_MAX) {
         pthread_mutex_unlock(&mutex);
         fail("Initialize", DM_SA_INVALID);
     }
     int fresh = !i;
     if (!i) i = calloc(1, sizeof *i);
     if (!i) { pthread_mutex_unlock(&mutex); fail("Initialize", DM_SA_NO_MEMORY); }
+    i->self = self;
+    i->initializing = 1;
+    i->generation = ++next_generation;
+    if (fresh) { i->next = instances; instances = i; }
+    pthread_mutex_unlock(&mutex);
+    // Factory/provider creation may call other allocator instances. Publish an
+    // initializing owner first so same-instance reentry/lifecycle races fail
+    // without escaping to SDK or reusing this identity while the lock is absent.
     dm_sa_config config = {0};
+    dm_sa_allocator *allocator = NULL;
     dm_sa_result r = settings.make_config(settings.context, self, capacity, cache & 1u, &config);
     // Requested capacity is never silently shrunk, nor represented as a fake
     // reservation. It bounds lazily acquired real backing in the core.
     if (r == DM_SA_OK && config.capacity != capacity) r = DM_SA_INVALID;
-    if (r == DM_SA_OK) r = dm_sa_create(&i->allocator, &config);
-    if (r != DM_SA_OK) {
-        if (fresh) free(i);
-        pthread_mutex_unlock(&mutex);
-        fail("Initialize", r);
+    if (r == DM_SA_OK) r = dm_sa_create(&allocator, &config);
+    pthread_mutex_lock(&mutex);
+    i->initializing = 0;
+    if (r == DM_SA_OK) {
+        i->allocator = allocator;
+        ((unsigned char *)self)[0] = 1;
+        ((unsigned char *)self)[1] = (unsigned char)(cache & 1u);
+    } else if (fresh) {
+        instance **link = &instances;
+        while (*link != i) link = &(*link)->next;
+        *link = i->next;
+        free(i);
     }
-    i->self = self;
-    i->generation = ++next_generation;
-    if (fresh) { i->next = instances; instances = i; }
-    ((unsigned char *)self)[0] = 1;
-    ((unsigned char *)self)[1] = (unsigned char)(cache & 1u);
+    // A failed reinitialization retains the prior finalized tombstone. Only a
+    // failed first initialization removes its provisional ownership record.
     pthread_mutex_unlock(&mutex);
+    if (r != DM_SA_OK) fail("Initialize", r);
 }
 static void ctor1(void *self) { forget_finalized(self); ORIGINAL(CTOR1, void (*)(void *))(self); }
 static void ctor2(void *self) { forget_finalized(self); ORIGINAL(CTOR2, void (*)(void *))(self); }
@@ -166,7 +181,10 @@ static void finalize(void *self) {
     pthread_mutex_lock(&mutex);
     instance *i = find(self);
     if (!i) { pthread_mutex_unlock(&mutex); ORIGINAL(FINALIZE, void (*)(void *))(self); return; }
-    if (!i->allocator || i->finalizing) { pthread_mutex_unlock(&mutex); fail("Finalize", DM_SA_CLOSED); }
+    if (i->initializing || !i->allocator || i->finalizing) {
+        dm_sa_result result = i->initializing ? DM_SA_BUSY : DM_SA_CLOSED;
+        pthread_mutex_unlock(&mutex); fail("Finalize", result);
+    }
     i->finalizing = 1;
     while (i->users) pthread_cond_wait(&idle, &mutex);
     pthread_mutex_unlock(&mutex);
@@ -188,22 +206,22 @@ static void *managed_allocate(instance *i, size_t size, size_t alignment) {
     // malloc(0) sentinel. Both cached and central zero paths return NULL and
     // contribute no live block to Hash/walk, unlike the generic core API.
     if (!size) { drop(i); return NULL; }
-    if (size <= INT64_MAX && alignment && !(alignment & (alignment - 1)))
+    if (size <= INT64_MAX && alignment && alignment <= INT64_MAX && !(alignment & (alignment - 1)))
         r = dm_sa_allocate(i->allocator, size, alignment < 16 ? 16 : alignment, &out);
     drop(i);
     if (r != DM_SA_OK) return NULL;
     return out;
 }
-int dm_sa_adapter_allocate_if_managed(void *self, size_t size, void **out) {
+int dm_sa_adapter_allocate_if_managed(void *self, size_t size, size_t alignment, void **out) {
     if (!atomic_load_explicit(&active, memory_order_acquire)) return 0;
     instance *i = take(self, "Allocate");
     if (!i) return 0;
-    *out = managed_allocate(i, size, 16);
+    *out = managed_allocate(i, size, alignment);
     return 1;
 }
 static void *allocate(void *self, size_t size) {
-    void *out;
-    if (dm_sa_adapter_allocate_if_managed(self, size, &out)) return out;
+    instance *i = take(self, "Allocate");
+    if (i) return managed_allocate(i, size, settings.allocation_alignment(self, size));
     return settings.forward_allocate(self, size);
 }
 static void *allocate_aligned(void *self, size_t size, size_t alignment) {
@@ -356,7 +374,7 @@ dm_sa_result dm_sa_adapter_install(const dm_sa_adapter_config *config) {
     (void)config;
     return DM_SA_INVALID; // No global production activation on incomplete evidence.
 #else
-    if (!config || config->proofs != DM_SA_PROOF_ALL || !config->make_config || !config->forward_allocate ||
+    if (!config || config->proofs != DM_SA_PROOF_ALL || !config->make_config || !config->forward_allocate || !config->allocation_alignment ||
         !config->symbols || config->symbol_count != DM_SA_ADAPTER_SYMBOL_COUNT ||
         config->installed_bindings != DM_SA_ADAPTER_ALL_BINDINGS) return DM_SA_INVALID;
     for (size_t h = 0; h < DM_SA_ADAPTER_SYMBOL_COUNT; h++)
