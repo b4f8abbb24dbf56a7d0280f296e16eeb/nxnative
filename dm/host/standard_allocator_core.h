@@ -87,7 +87,8 @@ typedef struct {
     dm_sa_result (*query)(void *context, size_t alignment, dm_sa_provider_stats *out);
     // All-zero for whole-lease/malloc providers. Partial capabilities are
     // invalid. Statistics, lease draining and allocation reuse/growth consume
-    // this capability. Core operations never initiate decommit of free runs.
+    // this capability. Successful shrink and live-span trim also best-effort
+    // decommit complete unborrowed free granules (an optional native policy).
     dm_sa_page_provider pages;
 } dm_sa_provider;
 
@@ -145,11 +146,16 @@ dm_sa_result dm_sa_destroy(dm_sa_allocator *allocator);
 dm_sa_result dm_sa_allocate(dm_sa_allocator *allocator, size_t size, size_t alignment, void **out);
 dm_sa_result dm_sa_free(dm_sa_allocator *allocator, void *pointer); // NULL is OK
 dm_sa_result dm_sa_reallocate(dm_sa_allocator *allocator, void *pointer, size_t size, void **out);
+// Shrink/realloc-shrink publish logical metadata first; optional page cleanup
+// cannot turn that success into failure. Live/borrowed boundary granules stay
+// committed. Free has no eager partial-page policy; dead spans use full release.
 dm_sa_result dm_sa_shrink(dm_sa_allocator *allocator, void *pointer, size_t size, size_t *out);
 dm_sa_result dm_sa_get_size(dm_sa_allocator *allocator, const void *pointer, size_t *out);
 dm_sa_result dm_sa_get_stats(dm_sa_allocator *allocator, dm_sa_stats *out);
 // No per-thread caches: trim releases any wholly free spans retained after a
-// provider release failure. Live bytes and borrowed ranges are not disturbed.
+// provider release failure and reports the first whole-span release error.
+// Optional free-page reclamation in live spans is best effort; its errors are
+// ignored. Live bytes and borrowed ranges are not disturbed.
 dm_sa_result dm_sa_trim(dm_sa_allocator *allocator);
 // Stable ascending-address enumeration while holding the allocator mutex.
 // Callback: zero continues; nonzero stops. It must not re-enter this allocator
