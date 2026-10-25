@@ -2,6 +2,7 @@
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
 #include "hle_address_space.h"
+#include "hle_standard_allocator_provider.h"
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
@@ -25,6 +26,18 @@ static dm_address_space *g_alias_space;
 // Serializes heap changes with physical maps and their application-pool checks.
 // Lock order: g_map_lock (source ownership), g_phys_mu, address-space lock.
 static pthread_mutex_t g_phys_mu = PTHREAD_MUTEX_INITIALIZER;
+// Only verified current-owner provider allocation callbacks opt in. A stale
+// budget snapshot must not allow their later SVC commit to overdraw the pool,
+// even when the unchanged profile allows ordinary alias maps without a cap.
+static _Thread_local unsigned g_sa_owner_allocation_depth;
+void dm_sa_svc_owner_allocation_begin(void) {
+    if (g_sa_owner_allocation_depth == UINT32_MAX) abort();
+    ++g_sa_owner_allocation_depth;
+}
+void dm_sa_svc_owner_allocation_end(void) {
+    if (!g_sa_owner_allocation_depth) abort();
+    --g_sa_owner_allocation_depth;
+}
 static uint8_t *g_stack; static size_t g_stack_cap;
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
@@ -146,6 +159,45 @@ static int map_source_busy(uint64_t addr, uint64_t size) { // g_map_lock held
     for (int i = 0; i < g_nmap; ++i)
         if (addr < g_map[i].src + g_map[i].size && g_map[i].src < addr + size) return 1;
     return 0;
+}
+// Narrow bridge for existing-owner StandardAllocator leases. These checks do
+// not reserve addresses or assert SDK ownership: the provider's successful
+// original-operation ledger supplies that. No SDK callback runs in this scope.
+void dm_sa_svc_scope_begin(void) { mem_init(); pthread_mutex_lock(&g_map_lock); }
+void dm_sa_svc_scope_end(void) { pthread_mutex_unlock(&g_map_lock); }
+int dm_sa_svc_alias_range_locked(uintptr_t base, size_t size) {
+    return size && memory_contains((uintptr_t)g_alias, g_alias_cap, base, size);
+}
+int dm_sa_svc_backed_locked(uintptr_t base, size_t size) {
+    if (!dm_sa_svc_alias_range_locked(base, size)) return 0;
+    // Suballocations can start/end within a logical page. Require every logical
+    // page they touch, never infer access from a shared native protection page.
+    uintptr_t lo = base & ~(uintptr_t)0xfff;
+    if (size > SIZE_MAX - (base - lo) - 0xfff) return 0;
+    size_t n = (size + (base - lo) + 0xfff) & ~(size_t)0xfff;
+    pthread_mutex_lock(&g_phys_mu);
+    size_t committed = 0;
+    int ok = dm_as_committed_in(g_alias_space, lo, n, &committed) == DM_AS_OK && committed == n;
+    pthread_mutex_unlock(&g_phys_mu);
+    return ok;
+}
+int dm_sa_svc_available_locked(uintptr_t base, size_t size) {
+    return dm_sa_svc_alias_range_locked(base, size) && !map_source_busy(base, size) &&
+        dm_sa_svc_backed_locked(base, size);
+}
+size_t dm_sa_svc_physical_budget_locked(void) {
+    pthread_mutex_lock(&g_phys_mu);
+    size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
+    if (image > floor) floor = image;
+    size_t heap = atomic_load(&g_heap_cur), mapped = alias_mapped();
+    size_t remaining = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
+    remaining = heap < remaining ? remaining - heap : 0;
+    remaining = mapped < remaining ? remaining - mapped : 0;
+    pthread_mutex_unlock(&g_phys_mu);
+    // Deliberately conservative even in legacy unlimited-map profiles. Existing
+    // SVC/GetInfo policy is unchanged; this provider never advertises free RAM
+    // merely because a legacy map path does not enforce the application pool.
+    return remaining;
 }
 // Clip a module-data query to one host protection run. Loader metadata is
 // immutable after startup; its text/patch seals use fixed 16 KiB boundaries on
@@ -459,6 +511,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (DM_GAME_MEM_MAP_LIMIT) {
             uint64_t used = (uint64_t)atomic_load(&g_heap_cur) + DM_GAME_MEM_USED + big_bss_bytes();
             limit = used < APP_POOL ? (size_t)(APP_POOL - used) : 0;
+        }
+        if (g_sa_owner_allocation_depth) {
+            size_t floor = DM_GAME_MEM_USED + big_bss_bytes(), image = image_bytes();
+            if (image > floor) floor = image;
+            size_t strict = floor < APP_POOL ? (size_t)(APP_POOL - floor) : 0;
+            size_t heap = atomic_load(&g_heap_cur);
+            strict = heap < strict ? strict - heap : 0;
+            if (strict < limit) limit = strict;
         }
         dm_as_result result = num == 0x2C ? dm_as_commit(g_alias_space, a, size, limit)
                                          : dm_as_decommit(g_alias_space, a, size);

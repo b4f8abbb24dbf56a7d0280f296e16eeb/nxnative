@@ -38,7 +38,7 @@ $(GAME_H):
 	$(MAKE) -C .. game_profile GAME=$(GAME)
 # The fail-fast regression uses the synthetic profile and production manager,
 # so it covers initialization/accounting without a game header or Apple SDK.
-HEAP_SIZE_DEPS = t_heap_size.c address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h
+HEAP_SIZE_DEPS = t_heap_size.c address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_heap_size: $(HEAP_SIZE_DEPS) | $(B)
 	$(CC) $(AS_SVC_FLAGS) -Wno-unused-function -fsanitize=undefined -o $@ t_heap_size.c ../hle_address_space.c
 $(B)/t_heap_size_sanitize: $(HEAP_SIZE_DEPS) | $(B)
@@ -122,7 +122,7 @@ run: address-space
 # profiles must retain their accounting policy. Existing Darwin printf formats
 # use %llx for uint64_t, so suppress that platform-only warning in this harness.
 AS_SVC_FLAGS = $(AS_FLAGS) -std=gnu11 -Wno-format -Iaddress_space_profile
-AS_SVC_DEPS = t_address_space_svc.c heap_failure_test.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h
+AS_SVC_DEPS = t_address_space_svc.c heap_failure_test.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_address_space_svc: $(AS_SVC_DEPS) | $(B)
 	$(CC) $(AS_SVC_FLAGS) -o $@ t_address_space_svc.c ../hle_address_space.c
 $(B)/t_address_space_svc_unlimited: $(AS_SVC_DEPS) | $(B)
@@ -145,7 +145,7 @@ run: address-space-svc
 # 16 KiB host pages exercise neighboring 4 KiB source/destination lifetimes on
 # Linux as well; this is not a hardware-isolation or Apple-device test.
 MAP_MEMORY_FLAGS = -Imap_memory_profile $(AS_SVC_FLAGS)
-MAP_MEMORY_DEPS = t_map_memory.c heap_failure_test.h map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h
+MAP_MEMORY_DEPS = t_map_memory.c heap_failure_test.h map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.c ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
 $(B)/t_map_memory: $(MAP_MEMORY_DEPS) | $(B)
 	$(CC) $(MAP_MEMORY_FLAGS) -o $@ t_map_memory.c ../hle_address_space.c
 $(B)/t_map_memory_unlimited: $(MAP_MEMORY_DEPS) | $(B)
@@ -187,3 +187,155 @@ map-memory-tsan: $(B)/t_map_memory_tsan $(B)/t_map_memory_tsan_unlimited $(B)/t_
 	$(B)/t_map_memory_tsan_16k
 	$(B)/t_map_memory_tsan_16k_unlimited
 run: map-memory
+
+# Instance-owned StandardAllocator core over a small real synthetic provider.
+# No game profile or proprietary SDK binary is read or linked by these tests.
+SA_FLAGS = -std=c11 -O1 -g -Wall -Wextra -Werror -pthread -I..
+SA_DEPS = t_standard_allocator_core.c ../hle_standard_allocator_core.c ../standard_allocator_core.h
+$(B)/t_standard_allocator_core: $(SA_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -o $@ t_standard_allocator_core.c ../hle_standard_allocator_core.c
+$(B)/t_standard_allocator_core_sanitize: $(SA_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_standard_allocator_core.c ../hle_standard_allocator_core.c
+$(B)/t_standard_allocator_core_tsan: $(SA_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ t_standard_allocator_core.c ../hle_standard_allocator_core.c
+.PHONY: standard-allocator standard-allocator-sanitize standard-allocator-tsan
+standard-allocator: $(B)/t_standard_allocator_core
+	$(B)/t_standard_allocator_core
+standard-allocator-sanitize: $(B)/t_standard_allocator_core_sanitize
+	$(B)/t_standard_allocator_core_sanitize
+standard-allocator-tsan: $(B)/t_standard_allocator_core_tsan
+	$(B)/t_standard_allocator_core_tsan
+run: standard-allocator
+
+# Test-only synthetic ABI exercise; shipping registration remains disabled.
+SA_ADAPTER_FLAGS = $(SA_FLAGS) -DDM_SA_ADAPTER_TESTING
+SA_ADAPTER_DEPS = t_standard_allocator_adapter.c ../hle_standard_allocator_adapter.c ../hle_standard_allocator_adapter.h ../hle_standard_allocator_core.c ../standard_allocator_core.h
+$(B)/t_standard_allocator_adapter: $(SA_ADAPTER_DEPS) | $(B)
+	$(CC) $(SA_ADAPTER_FLAGS) -o $@ t_standard_allocator_adapter.c ../hle_standard_allocator_adapter.c ../hle_standard_allocator_core.c
+$(B)/t_standard_allocator_adapter_sanitize: $(SA_ADAPTER_DEPS) | $(B)
+	$(CC) $(SA_ADAPTER_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ t_standard_allocator_adapter.c ../hle_standard_allocator_adapter.c ../hle_standard_allocator_core.c
+.PHONY: standard-allocator-adapter standard-allocator-adapter-sanitize
+standard-allocator-adapter: $(B)/t_standard_allocator_adapter
+	$(B)/t_standard_allocator_adapter
+standard-allocator-adapter-sanitize: $(B)/t_standard_allocator_adapter_sanitize
+	$(B)/t_standard_allocator_adapter_sanitize
+run: standard-allocator-adapter
+
+SA_GATE_DEPS = t_standard_allocator_gate.c ../hle_standard_allocator_adapter.c ../hle_standard_allocator_adapter.h ../hle_standard_allocator_core.c ../standard_allocator_core.h
+$(B)/t_standard_allocator_gate: $(SA_GATE_DEPS) | $(B)
+	$(CC) $(SA_FLAGS) -o $@ t_standard_allocator_gate.c ../hle_standard_allocator_adapter.c ../hle_standard_allocator_core.c
+$(B)/t_standard_allocator_aarch64_abi: t_standard_allocator_aarch64_abi.c ../hle_standard_allocator_adapter.h ../standard_allocator_core.h | $(B)
+	$(CC) $(SA_FLAGS) -o $@ t_standard_allocator_aarch64_abi.c
+.PHONY: standard-allocator-gate standard-allocator-abi
+standard-allocator-gate: $(B)/t_standard_allocator_gate
+	$(B)/t_standard_allocator_gate
+standard-allocator-abi: $(B)/t_standard_allocator_aarch64_abi
+	$(B)/t_standard_allocator_aarch64_abi
+run: standard-allocator-gate standard-allocator-abi
+
+$(B)/t_standard_allocator_adapter_tsan: $(SA_ADAPTER_DEPS) | $(B)
+	$(CC) $(SA_ADAPTER_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ t_standard_allocator_adapter.c ../hle_standard_allocator_adapter.c ../hle_standard_allocator_core.c
+.PHONY: standard-allocator-adapter-tsan
+standard-allocator-adapter-tsan: $(B)/t_standard_allocator_adapter_tsan
+	$(B)/t_standard_allocator_adapter_tsan
+
+# Existing-owner leases through the actual portable SVC dispatcher. Stub only
+# original SDK operations with a synthetic reservation ledger; no binary input.
+SA_PROVIDER_SRCS = t_standard_allocator_provider.c ../hle_address_space.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+SA_PROVIDER_DEPS = $(SA_PROVIDER_SRCS) map_memory_profile/game_profile.h address_space_profile/game_profile.h ../hle_svc.c ../dm.h ../hle_address_space.h ../hle_standard_allocator_provider.h ../standard_allocator_core.h
+$(B)/t_standard_allocator_provider: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_unlimited: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_16k: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_16k_unlimited: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(SA_PROVIDER_SRCS)
+.PHONY: standard-allocator-provider
+standard-allocator-provider: $(B)/t_standard_allocator_provider $(B)/t_standard_allocator_provider_unlimited $(B)/t_standard_allocator_provider_16k $(B)/t_standard_allocator_provider_16k_unlimited
+	$(B)/t_standard_allocator_provider
+	$(B)/t_standard_allocator_provider_unlimited
+	$(B)/t_standard_allocator_provider_16k
+	$(B)/t_standard_allocator_provider_16k_unlimited
+$(B)/t_standard_allocator_provider_sanitize: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_sanitize_unlimited: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_sanitize_16k: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_sanitize_16k_unlimited: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+.PHONY: standard-allocator-provider-sanitize
+standard-allocator-provider-sanitize: $(B)/t_standard_allocator_provider_sanitize $(B)/t_standard_allocator_provider_sanitize_unlimited $(B)/t_standard_allocator_provider_sanitize_16k $(B)/t_standard_allocator_provider_sanitize_16k_unlimited
+	$(B)/t_standard_allocator_provider_sanitize
+	$(B)/t_standard_allocator_provider_sanitize_unlimited
+	$(B)/t_standard_allocator_provider_sanitize_16k
+	$(B)/t_standard_allocator_provider_sanitize_16k_unlimited
+$(B)/t_standard_allocator_provider_tsan: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_tsan_unlimited: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_tsan_16k: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=thread -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+$(B)/t_standard_allocator_provider_tsan_16k_unlimited: $(SA_PROVIDER_DEPS) | $(B)
+	$(CC) $(MAP_MEMORY_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(SA_PROVIDER_SRCS)
+.PHONY: standard-allocator-provider-tsan
+standard-allocator-provider-tsan: $(B)/t_standard_allocator_provider_tsan $(B)/t_standard_allocator_provider_tsan_unlimited $(B)/t_standard_allocator_provider_tsan_16k $(B)/t_standard_allocator_provider_tsan_16k_unlimited
+	$(B)/t_standard_allocator_provider_tsan
+	$(B)/t_standard_allocator_provider_tsan_unlimited
+	$(B)/t_standard_allocator_provider_tsan_16k
+	$(B)/t_standard_allocator_provider_tsan_16k_unlimited
+run: standard-allocator-provider
+
+.PHONY: standard-allocator-check standard-allocator-check-sanitize standard-allocator-check-tsan
+standard-allocator-check: standard-allocator standard-allocator-adapter standard-allocator-provider standard-allocator-gate standard-allocator-abi
+standard-allocator-check-sanitize: standard-allocator-sanitize standard-allocator-adapter-sanitize standard-allocator-provider-sanitize
+standard-allocator-check-tsan: standard-allocator-tsan standard-allocator-adapter-tsan standard-allocator-provider-tsan
+
+# Reservation-only Vamm owner, complete synthetic ABI dispatch, existing span
+# provider and real external-mode SVC manager; no proprietary inputs or hooks.
+VAMM_SRCS = t_vamm.c ../hle_vamm.c ../hle_vamm_adapter.c ../hle_address_space.c ../hle_standard_allocator_provider.c ../hle_standard_allocator_core.c
+VAMM_DEPS = $(VAMM_SRCS) ../hle_vamm.h ../hle_vamm_adapter.h $(SA_PROVIDER_DEPS)
+VAMM_FLAGS = $(MAP_MEMORY_FLAGS) -DDM_VAMM_ADAPTER_TESTING
+$(B)/t_vamm: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_unlimited: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_16k: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_TEST_HOST_PAGE_16K -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_16k_unlimited: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_sanitize: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_sanitize_unlimited: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_sanitize_16k: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_sanitize_16k_unlimited: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_tsan: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_tsan_unlimited: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_tsan_16k: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_TEST_HOST_PAGE_16K -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_tsan_16k_unlimited: $(VAMM_DEPS) | $(B)
+	$(CC) $(VAMM_FLAGS) -DDM_TEST_HOST_PAGE_16K -DDM_GAME_MEM_MAP_LIMIT=0 -fsanitize=thread -fno-omit-frame-pointer -o $@ $(VAMM_SRCS)
+$(B)/t_vamm_gate: t_vamm_gate.c ../hle_vamm.c ../hle_vamm.h ../hle_vamm_adapter.c ../hle_vamm_adapter.h | $(B)
+	$(CC) $(SA_FLAGS) -o $@ t_vamm_gate.c ../hle_vamm.c ../hle_vamm_adapter.c
+.PHONY: vamm vamm-sanitize vamm-tsan vamm-gate
+vamm: $(B)/t_vamm $(B)/t_vamm_unlimited $(B)/t_vamm_16k $(B)/t_vamm_16k_unlimited
+	@set -e; for test in $^; do $$test; $$test c2; $$test disabled; done
+vamm-sanitize: $(B)/t_vamm_sanitize $(B)/t_vamm_sanitize_unlimited $(B)/t_vamm_sanitize_16k $(B)/t_vamm_sanitize_16k_unlimited
+	@set -e; for test in $^; do $$test; $$test c2; $$test disabled; done
+vamm-tsan: $(B)/t_vamm_tsan $(B)/t_vamm_tsan_unlimited $(B)/t_vamm_tsan_16k $(B)/t_vamm_tsan_16k_unlimited
+	@set -e; for test in $^; do $$test; $$test c2; $$test disabled; done
+vamm-gate: $(B)/t_vamm_gate
+	$(B)/t_vamm_gate
+run: vamm vamm-gate
+$(B)/t_vamm_aarch64_abi: t_vamm_aarch64_abi.c ../hle_vamm.h | $(B)
+	$(CC) $(SA_FLAGS) -o $@ t_vamm_aarch64_abi.c
+.PHONY: vamm-abi
+vamm-abi: $(B)/t_vamm_aarch64_abi
+	$(B)/t_vamm_aarch64_abi
+run: vamm-abi

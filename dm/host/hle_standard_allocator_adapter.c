@@ -1,0 +1,386 @@
+// Portable dispatch vertical slice. Deliberately NOT globally registered yet.
+#include "hle_standard_allocator_adapter.h"
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+
+_Static_assert(sizeof(dm_sa_hash) == 24, "Hash is an AArch64 indirect x8 result");
+_Static_assert(sizeof(size_t) == 8, "StandardAllocator ABI requires 64-bit size_t");
+enum {
+    CTOR1, CTOR2, CTOR_BUFFER1, CTOR_BUFFER2, CTOR_CACHE1, CTOR_CACHE2,
+    INIT, INIT_CACHE, FINALIZE, ALLOCATE, ALLOCATE_ALIGNED, FREE, REALLOCATE,
+    SHRINK, SIZE, TOTAL_FREE, ALLOCATABLE, CLEAR_CACHE, CLEANUP, WALK, DUMP, HASH
+};
+static const char *const names[DM_SA_ADAPTER_SYMBOL_COUNT] = {
+    "_ZN2nn3mem17StandardAllocatorC1Ev",
+    "_ZN2nn3mem17StandardAllocatorC2Ev",
+    "_ZN2nn3mem17StandardAllocatorC1EPvm",
+    "_ZN2nn3mem17StandardAllocatorC2EPvm",
+    "_ZN2nn3mem17StandardAllocatorC1EPvmb",
+    "_ZN2nn3mem17StandardAllocatorC2EPvmb",
+    "_ZN2nn3mem17StandardAllocator10InitializeEPvm",
+    "_ZN2nn3mem17StandardAllocator10InitializeEPvmb",
+    "_ZN2nn3mem17StandardAllocator8FinalizeEv",
+    "_ZN2nn3mem17StandardAllocator8AllocateEm",
+    "_ZN2nn3mem17StandardAllocator8AllocateEmm",
+    "_ZN2nn3mem17StandardAllocator4FreeEPv",
+    "_ZN2nn3mem17StandardAllocator10ReallocateEPvm",
+    "_ZN2nn3mem17StandardAllocator6ShrinkEPvm",
+    "_ZNK2nn3mem17StandardAllocator9GetSizeOfEPKv",
+    "_ZNK2nn3mem17StandardAllocator16GetTotalFreeSizeEv",
+    "_ZNK2nn3mem17StandardAllocator18GetAllocatableSizeEv",
+    "_ZNK2nn3mem17StandardAllocator16ClearThreadCacheEv",
+    "_ZNK2nn3mem17StandardAllocator21CleanUpManagementAreaEv",
+    "_ZNK2nn3mem17StandardAllocator19WalkAllocatedBlocksEPFiPvmS2_ES2_",
+    "_ZNK2nn3mem17StandardAllocator4DumpEv",
+    "_ZNK2nn3mem17StandardAllocator4HashEv"
+};
+
+typedef struct instance {
+    void *self;
+    dm_sa_allocator *allocator;
+    unsigned users;
+    uint64_t generation;
+    int finalizing;
+    struct instance *next;
+} instance;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t idle = PTHREAD_COND_INITIALIZER;
+static instance *instances;
+static uint64_t next_generation;
+static dm_sa_adapter_config settings;
+static dm_sa_guest_fn originals[DM_SA_ADAPTER_SYMBOL_COUNT];
+static _Atomic int active;
+
+static _Noreturn void fail(const char *operation, dm_sa_result result) {
+    if (settings.fatal) settings.fatal(settings.context, operation, result);
+    abort();
+}
+static instance *find(const void *self) {
+    for (instance *i = instances; i; i = i->next) if (i->self == self) return i;
+    return NULL;
+}
+static instance *take(const void *self, const char *operation) {
+    pthread_mutex_lock(&mutex);
+    instance *i = find(self);
+    if (i && (!i->allocator || i->finalizing)) {
+        pthread_mutex_unlock(&mutex);
+        fail(operation, DM_SA_CLOSED);
+    }
+    if (i) i->users++;
+    pthread_mutex_unlock(&mutex);
+    return i;
+}
+static void drop(instance *i) {
+    pthread_mutex_lock(&mutex);
+    if (!--i->users) pthread_cond_broadcast(&idle);
+    pthread_mutex_unlock(&mutex);
+}
+int dm_sa_adapter_is_managed(const void *self) {
+    if (!atomic_load_explicit(&active, memory_order_acquire)) return 0;
+    pthread_mutex_lock(&mutex);
+    int yes = find(self) != NULL;
+    pthread_mutex_unlock(&mutex);
+    return yes;
+}
+const char *dm_sa_adapter_symbol_name(size_t index) {
+    return index < DM_SA_ADAPTER_SYMBOL_COUNT ? names[index] : NULL;
+}
+#define ORIGINAL(n, type) ((type)originals[n])
+
+static void forget_finalized(void *self) {
+    pthread_mutex_lock(&mutex);
+    instance **p = &instances;
+    while (*p && (*p)->self != self) p = &(*p)->next;
+    if (*p) {
+        instance *i = *p;
+        if (i->allocator || i->users || i->finalizing) {
+            pthread_mutex_unlock(&mutex);
+            fail("constructor/Initialize", DM_SA_BUSY);
+        }
+        *p = i->next;
+        free(i);
+    }
+    pthread_mutex_unlock(&mutex);
+}
+static void initialize(void *self, void *buffer, size_t capacity, unsigned cache, int overload) {
+    if (buffer) {
+        forget_finalized(self);
+        if (overload == INIT) ORIGINAL(INIT, void (*)(void *, void *, size_t))(self, buffer, capacity);
+        else ORIGINAL(INIT_CACHE, void (*)(void *, void *, size_t, unsigned))(self, buffer, capacity, cache);
+        return;
+    }
+    if (!self || ((unsigned char *)self)[0] || !capacity || (capacity & 4095u) || capacity > INT64_MAX)
+        fail("Initialize", DM_SA_INVALID);
+    pthread_mutex_lock(&mutex);
+    instance *i = find(self);
+    if (i && (i->allocator || i->users || i->finalizing)) {
+        pthread_mutex_unlock(&mutex);
+        fail("Initialize", DM_SA_BUSY);
+    }
+    if (next_generation == UINT64_MAX) {
+        pthread_mutex_unlock(&mutex);
+        fail("Initialize", DM_SA_INVALID);
+    }
+    int fresh = !i;
+    if (!i) i = calloc(1, sizeof *i);
+    if (!i) { pthread_mutex_unlock(&mutex); fail("Initialize", DM_SA_NO_MEMORY); }
+    dm_sa_config config = {0};
+    dm_sa_result r = settings.make_config(settings.context, self, capacity, cache & 1u, &config);
+    // Requested capacity is never silently shrunk, nor represented as a fake
+    // reservation. It bounds lazily acquired real backing in the core.
+    if (r == DM_SA_OK && config.capacity != capacity) r = DM_SA_INVALID;
+    if (r == DM_SA_OK) r = dm_sa_create(&i->allocator, &config);
+    if (r != DM_SA_OK) {
+        if (fresh) free(i);
+        pthread_mutex_unlock(&mutex);
+        fail("Initialize", r);
+    }
+    i->self = self;
+    i->generation = ++next_generation;
+    if (fresh) { i->next = instances; instances = i; }
+    ((unsigned char *)self)[0] = 1;
+    ((unsigned char *)self)[1] = (unsigned char)(cache & 1u);
+    pthread_mutex_unlock(&mutex);
+}
+static void ctor1(void *self) { forget_finalized(self); ORIGINAL(CTOR1, void (*)(void *))(self); }
+static void ctor2(void *self) { forget_finalized(self); ORIGINAL(CTOR2, void (*)(void *))(self); }
+static void ctor_buffer(void *self, void *buffer, size_t capacity, int which) {
+    forget_finalized(self);
+    if (buffer) ORIGINAL(which, void (*)(void *, void *, size_t))(self, buffer, capacity);
+    else { ORIGINAL(CTOR1, void (*)(void *))(self); initialize(self, NULL, capacity, 0, INIT); }
+}
+static void ctor_buffer1(void *s, void *b, size_t n) { ctor_buffer(s, b, n, CTOR_BUFFER1); }
+static void ctor_buffer2(void *s, void *b, size_t n) { ctor_buffer(s, b, n, CTOR_BUFFER2); }
+static void ctor_cache(void *self, void *buffer, size_t capacity, unsigned cache, int which) {
+    forget_finalized(self);
+    if (buffer) ORIGINAL(which, void (*)(void *, void *, size_t, unsigned))(self, buffer, capacity, cache);
+    else { ORIGINAL(CTOR1, void (*)(void *))(self); initialize(self, NULL, capacity, cache, INIT_CACHE); }
+}
+static void ctor_cache1(void *s, void *b, size_t n, unsigned c) { ctor_cache(s,b,n,c,CTOR_CACHE1); }
+static void ctor_cache2(void *s, void *b, size_t n, unsigned c) { ctor_cache(s,b,n,c,CTOR_CACHE2); }
+static void init(void *s, void *b, size_t n) { initialize(s,b,n,0,INIT); }
+static void init_cache(void *s, void *b, size_t n, unsigned c) { initialize(s,b,n,c,INIT_CACHE); }
+static void finalize(void *self) {
+    pthread_mutex_lock(&mutex);
+    instance *i = find(self);
+    if (!i) { pthread_mutex_unlock(&mutex); ORIGINAL(FINALIZE, void (*)(void *))(self); return; }
+    if (!i->allocator || i->finalizing) { pthread_mutex_unlock(&mutex); fail("Finalize", DM_SA_CLOSED); }
+    i->finalizing = 1;
+    while (i->users) pthread_cond_wait(&idle, &mutex);
+    pthread_mutex_unlock(&mutex);
+    dm_sa_result r = dm_sa_destroy(i->allocator);
+    pthread_mutex_lock(&mutex);
+    if (r == DM_SA_OK) { i->allocator = NULL; ((unsigned char *)self)[0] = 0; }
+    i->finalizing = 0;
+    pthread_mutex_unlock(&mutex);
+    if (r != DM_SA_OK) fail("Finalize", r);
+    // Keep an ownership tombstone until explicit constructor/reinitialization.
+    // A stale method cannot suddenly reach an uninitialized SDK CentralHeap.
+}
+static void *managed_allocate(instance *i, size_t size, size_t alignment) {
+    void *out = NULL;
+    dm_sa_result r = DM_SA_INVALID;
+    // The observed SDK accepts nonzero sub-16 powers of two; backing remains at least
+    // 16-aligned. Reject >INT64_MAX sizes before rounding, as the SDK does.
+    // StandardAllocator passes flags=0 to CentralHeap, disabling its optional
+    // malloc(0) sentinel. Both cached and central zero paths return NULL and
+    // contribute no live block to Hash/walk, unlike the generic core API.
+    if (!size) { drop(i); return NULL; }
+    if (size <= INT64_MAX && alignment && !(alignment & (alignment - 1)))
+        r = dm_sa_allocate(i->allocator, size, alignment < 16 ? 16 : alignment, &out);
+    drop(i);
+    if (r != DM_SA_OK) return NULL;
+    return out;
+}
+int dm_sa_adapter_allocate_if_managed(void *self, size_t size, void **out) {
+    if (!atomic_load_explicit(&active, memory_order_acquire)) return 0;
+    instance *i = take(self, "Allocate");
+    if (!i) return 0;
+    *out = managed_allocate(i, size, 16);
+    return 1;
+}
+static void *allocate(void *self, size_t size) {
+    void *out;
+    if (dm_sa_adapter_allocate_if_managed(self, size, &out)) return out;
+    return settings.forward_allocate(self, size);
+}
+static void *allocate_aligned(void *self, size_t size, size_t alignment) {
+    instance *i = take(self, "Allocate(aligned)");
+    if (i) return managed_allocate(i, size, alignment);
+    return ORIGINAL(ALLOCATE_ALIGNED, void *(*)(void *, size_t, size_t))(self, size, alignment);
+}
+static void release_block(void *self, void *pointer) {
+    instance *i = take(self, "Free");
+    if (!i) { ORIGINAL(FREE, void (*)(void *, void *))(self, pointer); return; }
+    dm_sa_result r = dm_sa_free(i->allocator, pointer);
+    drop(i);
+    if (r != DM_SA_OK) fail("Free", r);
+}
+static void *reallocate(void *self, void *pointer, size_t size) {
+    instance *i = take(self, "Reallocate");
+    if (!i) return ORIGINAL(REALLOCATE, void *(*)(void *, void *, size_t))(self,pointer,size);
+    void *out = NULL;
+    dm_sa_result r = !pointer && !size ? DM_SA_OK : size <= INT64_MAX ? dm_sa_reallocate(i->allocator, pointer, size, &out) : DM_SA_INVALID;
+    drop(i);
+    return r == DM_SA_OK ? out : NULL;
+}
+static size_t shrink(void *self, void *pointer, size_t size) {
+    instance *i = take(self, "Shrink");
+    if (!i) return ORIGINAL(SHRINK, size_t (*)(void *, void *, size_t))(self,pointer,size);
+    size_t out = 0;
+    // SDK Shrink(p,0) keeps a live minimum-sized allocation, unlike Reallocate
+    // (p,0). Core policy uses a 16-byte minimum rather than SDK size classes.
+    dm_sa_result r = size <= INT64_MAX ? dm_sa_shrink(i->allocator, pointer, size ? size : 1, &out) : DM_SA_INVALID;
+    drop(i);
+    return r == DM_SA_OK ? out : 0;
+}
+static size_t get_size(const void *self, const void *pointer) {
+    instance *i = take(self, "GetSizeOf");
+    if (!i) return ORIGINAL(SIZE, size_t (*)(const void *, const void *))(self,pointer);
+    size_t out = 0;
+    dm_sa_result r = pointer ? dm_sa_get_size(i->allocator, pointer, &out) : DM_SA_OK;
+    drop(i);
+    if (r != DM_SA_OK) fail("GetSizeOf", r);
+    return out;
+}
+static size_t stat_size(const void *self, int which) {
+    instance *i = take(self, names[which]);
+    if (!i) return ORIGINAL(which, size_t (*)(const void *))(self);
+    dm_sa_stats stats;
+    dm_sa_result r = dm_sa_get_stats(i->allocator, &stats);
+    drop(i);
+    if (r != DM_SA_OK) fail(names[which], r);
+    return which == TOTAL_FREE ? stats.total_free : stats.largest_free;
+}
+static size_t total_free(const void *self) { return stat_size(self, TOTAL_FREE); }
+static size_t allocatable(const void *self) { return stat_size(self, ALLOCATABLE); }
+static void maintenance(const void *self, int which) {
+    instance *i = take(self, names[which]);
+    if (!i) { ORIGINAL(which, void (*)(const void *))(self); return; }
+    // Managed mode has no thread-local cache, including when the SDK bool was
+    // true. Wholly free real spans are released through their original owner.
+    dm_sa_result r = dm_sa_trim(i->allocator);
+    drop(i);
+    if (r != DM_SA_OK) fail(names[which], r);
+}
+static void clear_cache(const void *self) { maintenance(self, CLEAR_CACHE); }
+static void cleanup(const void *self) { maintenance(self, CLEANUP); }
+
+typedef struct { void *pointer; size_t size; } pair;
+typedef struct { pair *items; size_t count, capacity; int failed; } snapshot;
+static int collect(void *pointer, size_t size, void *context) {
+    snapshot *s = context;
+    if (s->count == s->capacity) {
+        size_t cap = s->capacity ? s->capacity * 2 : 32;
+        if (cap < s->capacity || cap > SIZE_MAX / sizeof(pair)) { s->failed = 1; return 1; }
+        pair *p = realloc(s->items, cap * sizeof *p);
+        if (!p) { s->failed = 1; return 1; }
+        s->items = p; s->capacity = cap;
+    }
+    s->items[s->count++] = (pair){pointer, size};
+    return 0; // core convention; NOT the SDK callback convention
+}
+static int walk(const void *self, dm_sa_walk_fn callback, void *context) {
+    instance *i = take(self, "WalkAllocatedBlocks");
+    if (!i) return ORIGINAL(WALK, int (*)(const void *, dm_sa_walk_fn, void *))(self,callback,context);
+    if (!callback) { drop(i); return 22; }
+    snapshot s = {0};
+    uint64_t generation = i->generation;
+    int callback_result = 0;
+    dm_sa_result r = dm_sa_walk(i->allocator, collect, &s, &callback_result);
+    drop(i);
+    // SDK unlocks across callback invocation; snapshot also permits callbacks
+    // to query/allocate/free/finalize without holding either host mutex. This
+    // does NOT claim the SDK's behavior under concurrent mutation is proven.
+    if (r != DM_SA_OK || s.failed) { free(s.items); return 12; }
+    int result = s.count ? 0 : 2;
+    for (size_t n = 0; n < s.count; n++) {
+        // A previous callback may free a later snapshot entry or finalize the
+        // whole instance. Do not pass an already-known stale block onward.
+        pthread_mutex_lock(&mutex);
+        instance *current = find(self);
+        if (!current || !current->allocator || current->finalizing || current->generation != generation) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+        current->users++;
+        pthread_mutex_unlock(&mutex);
+        size_t live_size = 0;
+        r = dm_sa_get_size(current->allocator, s.items[n].pointer, &live_size);
+        drop(current);
+        if (r == DM_SA_NOT_FOUND || r == DM_SA_INVALID) continue;
+        if (r != DM_SA_OK) { result = 12; break; }
+        if (!callback(s.items[n].pointer, live_size, context)) break;
+    }
+    free(s.items);
+    return result;
+}
+static void dump(const void *self) {
+    instance *i = take(self, "Dump");
+    if (!i) { ORIGINAL(DUMP, void (*)(const void *))(self); return; }
+    dm_sa_stats stats;
+    dm_sa_result r = dm_sa_get_stats(i->allocator, &stats);
+    drop(i);
+    if (r != DM_SA_OK) fail("Dump", r);
+    if (settings.dump) settings.dump(settings.context, self, &stats);
+}
+static dm_sa_hash hash(const void *self) {
+    instance *i = take(self, "Hash");
+    if (!i) return ORIGINAL(HASH, dm_sa_hash (*)(const void *))(self);
+    dm_sa_hash out;
+    dm_sa_result r = dm_sa_get_hash(i->allocator, &out);
+    drop(i);
+    if (r != DM_SA_OK) fail("Hash", r);
+    return out; // AAPCS64 >16-byte aggregate uses the caller's x8 result address
+}
+static const dm_sa_guest_fn hooks[DM_SA_ADAPTER_SYMBOL_COUNT] = {
+    (dm_sa_guest_fn)ctor1, (dm_sa_guest_fn)ctor2,
+    (dm_sa_guest_fn)ctor_buffer1, (dm_sa_guest_fn)ctor_buffer2,
+    (dm_sa_guest_fn)ctor_cache1, (dm_sa_guest_fn)ctor_cache2,
+    (dm_sa_guest_fn)init, (dm_sa_guest_fn)init_cache, (dm_sa_guest_fn)finalize,
+    (dm_sa_guest_fn)allocate, (dm_sa_guest_fn)allocate_aligned,
+    (dm_sa_guest_fn)release_block, (dm_sa_guest_fn)reallocate, (dm_sa_guest_fn)shrink,
+    (dm_sa_guest_fn)get_size, (dm_sa_guest_fn)total_free, (dm_sa_guest_fn)allocatable,
+    (dm_sa_guest_fn)clear_cache, (dm_sa_guest_fn)cleanup, (dm_sa_guest_fn)walk,
+    (dm_sa_guest_fn)dump, (dm_sa_guest_fn)hash
+};
+dm_sa_guest_fn dm_sa_adapter_lookup(const char *name) {
+    if (!name || !atomic_load_explicit(&active, memory_order_acquire)) return NULL;
+    for (size_t n = 0; n < DM_SA_ADAPTER_SYMBOL_COUNT; n++) if (!strcmp(name, names[n])) return hooks[n];
+    return NULL;
+}
+dm_sa_result dm_sa_adapter_install(const dm_sa_adapter_config *config) {
+#ifndef DM_SA_ADAPTER_TESTING
+    (void)config;
+    return DM_SA_INVALID; // No global production activation on incomplete evidence.
+#else
+    if (!config || config->proofs != DM_SA_PROOF_ALL || !config->make_config || !config->forward_allocate ||
+        !config->symbols || config->symbol_count != DM_SA_ADAPTER_SYMBOL_COUNT ||
+        config->installed_bindings != DM_SA_ADAPTER_ALL_BINDINGS) return DM_SA_INVALID;
+    for (size_t h = 0; h < DM_SA_ADAPTER_SYMBOL_COUNT; h++)
+        if ((dm_sa_guest_fn)config->forward_allocate == hooks[h]) return DM_SA_INVALID;
+    dm_sa_guest_fn resolved[DM_SA_ADAPTER_SYMBOL_COUNT] = {0};
+    for (size_t n = 0; n < config->symbol_count; n++) {
+        const dm_sa_adapter_symbol *s = &config->symbols[n];
+        if (!s->name || !s->function) return DM_SA_INVALID;
+        size_t index;
+        for (index = 0; index < DM_SA_ADAPTER_SYMBOL_COUNT; index++) if (!strcmp(s->name,names[index])) break;
+        if (index == DM_SA_ADAPTER_SYMBOL_COUNT || resolved[index]) return DM_SA_INVALID;
+        for (size_t h = 0; h < DM_SA_ADAPTER_SYMBOL_COUNT; h++)
+            if (s->function == hooks[h]) return DM_SA_INVALID; // no recursive original
+        resolved[index] = s->function;
+    }
+    pthread_mutex_lock(&mutex);
+    if (atomic_load_explicit(&active, memory_order_relaxed)) {
+        pthread_mutex_unlock(&mutex); return DM_SA_BUSY;
+    }
+    settings = *config;
+    settings.symbols = NULL; // caller's census need not outlive installation
+    memcpy(originals, resolved, sizeof originals);
+    atomic_store_explicit(&active, 1, memory_order_release);
+    pthread_mutex_unlock(&mutex);
+    return DM_SA_OK;
+#endif
+}
