@@ -8,10 +8,12 @@
 
 static unsigned creates, destroys, installs;
 static int fail_create, fail_configs;
-static dm_sa_result track_create(dm_memory_runtime **out, size_t max_regions) {
+static dm_sa_result track_create(dm_memory_runtime **out, size_t max_regions, const dm_memory_runtime_contract *contract) {
+    assert(contract && contract->domain == DM_VAMM_DOMAIN_ALIAS_MINUS_EXTRA &&
+           contract->placement == DM_VAMM_PLACEMENT_MODERN && max_regions == 65536);
     ++creates;
     if (fail_create) return DM_SA_NO_MEMORY;
-    dm_sa_result result = dm_memory_runtime_create(out, max_regions);
+    dm_sa_result result = dm_memory_runtime_create_with_contract(out, max_regions, contract);
     if (result == DM_SA_OK) startup_runtime = *out;
     return result;
 }
@@ -38,11 +40,11 @@ int loader_install_vamm_hooks(const dm_vamm_adapter_config *v) {
 #ifdef MEMORY_EXPERIMENT_NO_ALIGNED_LEASES
 #undef DM_MEMORY_RUNTIME_ALIGNED_LEASES
 #endif
-#define dm_memory_runtime_create track_create
+#define dm_memory_runtime_create_with_contract track_create
 #define dm_memory_runtime_destroy track_destroy
 #define dm_memory_runtime_configs track_configs
 #include "../hle_memory_experiment.c"
-#undef dm_memory_runtime_create
+#undef dm_memory_runtime_create_with_contract
 #undef dm_memory_runtime_destroy
 #undef dm_memory_runtime_configs
 
