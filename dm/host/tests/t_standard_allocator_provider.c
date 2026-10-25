@@ -241,6 +241,108 @@ static dm_sa_page_run get_run(dm_sa_provider *p, const dm_sa_span *span,
     assert(run.size && run.size <= maximum);
     return run;
 }
+// Single-threaded sparse-core fixture interception. Capture exact provider
+// handles; never infer a reservation from bitmap holes or touch live granules.
+static dm_sa_result (*captured_acquire)(void *, size_t, size_t, dm_sa_span *);
+static dm_sa_result (*captured_run)(void *, const dm_sa_span *, size_t, size_t, dm_sa_page_run *);
+static dm_sa_result (*captured_budget)(void *, size_t *);
+static dm_sa_span captured_lease;
+static int fail_run_query, fail_budget_query, short_run_queries;
+static dm_sa_result capture_acquire(void *context, size_t size, size_t alignment, dm_sa_span *out) {
+    dm_sa_result r = captured_acquire(context, size, alignment, out);
+    if (r == DM_SA_OK) captured_lease = *out;
+    return r;
+}
+static dm_sa_result capture_run(void *context, const dm_sa_span *span,
+                                 size_t offset, size_t maximum, dm_sa_page_run *out) {
+    if (fail_run_query) { fail_run_query = 0; return DM_SA_PROVIDER_FAILED; }
+    if (short_run_queries && maximum > 17) maximum = 17;
+    return captured_run(context, span, offset, maximum, out);
+}
+static dm_sa_result capture_budget(void *context, size_t *out) {
+    if (fail_budget_query) { fail_budget_query = 0; return DM_SA_PROVIDER_FAILED; }
+    return captured_budget(context, out);
+}
+static void test_sparse_core_stats(owner *o, dm_sa_sdk_owner callbacks) {
+    callbacks.change_pages = change_original;
+    dm_sa_sdk_provider *provider = NULL;
+    assert(dm_sa_sdk_provider_create(&provider, &callbacks) == DM_SA_OK);
+    dm_sa_provider p = dm_sa_sdk_provider_interface(provider);
+    captured_acquire = p.acquire; captured_run = p.pages.query_run; captured_budget = p.pages.budget;
+    dm_sa_config config = {.provider = p, .capacity = POOL, .pool_size = POOL};
+    config.provider.acquire = capture_acquire;
+    config.provider.pages.query_run = capture_run;
+    config.provider.pages.budget = capture_budget;
+    dm_sa_allocator *a = NULL;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    void *anchor = NULL;
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK);
+    memset(anchor, 0x57, 32);
+    dm_sa_span lease = captured_lease;
+    p.begin(p.context);
+    assert(p.pages.change(p.context, &lease, PAGE, 8 * PAGE, 0) == DM_SA_OK);
+    p.end(p.context);
+    assert(!call(1, 0, 0x1e00000 - 12 * PAGE, 0)); // 8 backed + 4 headroom pages
+    dm_sa_stats st = stats(a);
+    assert(st.backing_bytes == POOL && st.committed_bytes == 8 * PAGE && st.allocated_bytes == 32);
+    assert(st.total_free == 12 * PAGE - 32 && st.largest_free == 11 * PAGE);
+    short_run_queries = 1;
+    dm_sa_stats short_stats = stats(a);
+    short_run_queries = 0;
+    assert(short_stats.committed_bytes == st.committed_bytes && short_stats.total_free == st.total_free &&
+           short_stats.largest_free == st.largest_free);
+    // Query failures publish none of a partially accumulated statistics result.
+    for (int i = 0; i < 3; ++i) {
+        dm_sa_stats actual, sentinel;
+        memset(&sentinel, 0xa5, sizeof sentinel); actual = sentinel;
+        if (i == 0) fail_run_query = 1;
+        else if (i == 1) fail_budget_query = 1;
+        else o->fail_query = 1;
+        assert(dm_sa_get_stats(a, &actual) == DM_SA_PROVIDER_FAILED);
+        assert(!memcmp(&actual, &sentinel, sizeof actual));
+    }
+    assert(!call(1, 0, 0x1e00000 - 8 * PAGE, 0));
+    st = stats(a);
+    assert(st.total_free == 8 * PAGE - 32 && st.largest_free == 7 * PAGE);
+    borrow(o, (uintptr_t)anchor + 9 * PAGE);
+    st = stats(a);
+    assert(st.total_free == 7 * PAGE - 32 && st.largest_free == 6 * PAGE);
+    assert(dm_sa_finalize(a) == DM_SA_BUSY && !stats(a).closed);
+    size_t usable = 0; assert(dm_sa_get_size(a, anchor, &usable) == DM_SA_OK && usable == 32);
+    for (size_t i = 0; i < 32; ++i) assert(((unsigned char *)anchor)[i] == 0x57);
+    return_borrow(o);
+    // Finalize can drain sparse leases, and a returning owner failure keeps the
+    // closed lease's sparse commitment visible until an exact retry succeeds.
+    o->fail_release = 1;
+    assert(dm_sa_finalize(a) == DM_SA_PROVIDER_FAILED);
+    st = stats(a);
+    assert(st.closed && st.backing_bytes == POOL && st.committed_bytes == 8 * PAGE &&
+           !st.allocated_bytes && !st.allocation_count && !st.total_free && !st.largest_free);
+    assert(dm_sa_destroy(a) == DM_SA_OK && !owned_count(o));
+    assert(!call(1, 0, 0, 0));
+
+    // Shared headroom is counted once even when both new reservations and
+    // recommittable holes exist; the capacity bound still charges full leases.
+    config.capacity = 2 * POOL;
+    assert(dm_sa_create(&a, &config) == DM_SA_OK);
+    assert(dm_sa_allocate(a, 32, 16, &anchor) == DM_SA_OK);
+    lease = captured_lease;
+    p.begin(p.context);
+    assert(p.pages.change(p.context, &lease, PAGE, 8 * PAGE, 0) == DM_SA_OK);
+    p.end(p.context);
+    assert(!call(1, 0, 0x1e00000 - 12 * PAGE, 0));
+    st = stats(a);
+    assert(st.total_free == 12 * PAGE - 32 && st.largest_free == 11 * PAGE);
+    o->fail_release = 1;
+    assert(dm_sa_free(a, anchor) == DM_SA_OK);
+    st = stats(a);
+    assert(!st.allocation_count && st.backing_bytes == POOL && st.committed_bytes == 8 * PAGE);
+    assert(dm_sa_trim(a) == DM_SA_OK && !stats(a).backing_bytes && !stats(a).committed_bytes);
+    assert(dm_sa_destroy(a) == DM_SA_OK);
+    assert(!call(1, 0, 0, 0));
+    assert(!owned_count(o) && !alias_mapped());
+    assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
+}
 static void test_partial_pages(owner *o, dm_sa_sdk_owner callbacks) {
     // Direct lease operations only. Production runtime and allocator Shrink,
     // Free, Trim and reuse have NOT opted in to this experimental capability.
@@ -571,6 +673,7 @@ int main(void) {
     assert(!owned_count(&o) && !alias_mapped());
     assert(dm_sa_sdk_provider_destroy(provider) == DM_SA_OK);
     test_partial_pages(&o, callbacks);
+    test_sparse_core_stats(&o, callbacks);
     assert(!pthread_mutex_destroy(&o.mutex));
     alarm(0);
     puts("standard allocator SDK provider: real-SVC ownership, rollback, races, budget and shared-core tests passed");

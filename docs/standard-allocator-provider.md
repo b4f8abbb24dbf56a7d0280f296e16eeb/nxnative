@@ -38,9 +38,10 @@ An explicitly supplied `change_pages` owner callback exposes an optional
 commit bitmap and source-borrow registry, reads physical headroom independently
 of reservation gaps, and changes aligned pages inside an exact existing lease.
 There is no second bitmap, reservation owner, or hidden malloc-page operation.
-The production runtime does **not** supply this callback. Core Shrink, Free,
-Trim, reuse, allocation statistics and activation gates remain unchanged; the
-core currently validates only the capability's complete shape.
+The production runtime does **not** supply this callback. Core allocation/reuse,
+Shrink and activation gates remain unchanged. Sparse commitment statistics and
+whole-lease draining are implemented as the next staged core layer below; no
+core operation initiates a page decommit or recommit yet.
 
 Queries run without dropping the source guard and never read payload bytes.
 Page changes mark the lease in-flight, drop the guard before the owner callback,
@@ -65,9 +66,38 @@ idempotent accounting, failure retention, in-flight serialization, borrow races,
 zero-reservation-gap recommit, stale-budget rejection and release through holes.
 The native Vamm fixture also exercises the capability through `dm_vamm_pages`
 and the real SVC backend without wiring it into production. Core reclamation,
-recommit-on-reuse, accounting integration and transactional Shrink policy still
+recommit-on-reuse and transactional Shrink policy still
 require a separate implementation/review. This establishes no SDK policy parity,
 new admission, gameplay result or permission to remove an existing cut.
+
+### Sparse accounting and whole-lease draining
+
+`backing_bytes` remains the exact outstanding lease extent and capacity charge;
+`committed_bytes` counts logical commitment from authoritative page runs, including
+borrowed backing. A sparse lease therefore retains its full reservation charge
+without falsely reporting every reserved page as committed. Closed allocators
+retain both figures until failed whole-lease releases succeed on retry.
+
+Free-space statistics exclude borrowed intervals. Backed free bytes consume no
+new physical headroom; holes and additional leases share the same headroom once.
+With backed free bytes `C`, free holes `D`, additional lease extent `V` and physical
+headroom `P`, total free is `C + min(P, D + V)`. Largest free uses a two-cursor
+scan of authoritative runs to bound a contiguous candidate by its missing-page
+cost; borrowed runs are barriers. No persistent residency ledger is introduced.
+Query failures leave the entire caller output unchanged.
+
+**This is a staged capability, not completed allocation support.** Page-capable
+free-space statistics describe budgeted recommit potential; existing allocation
+reuse/growth cannot consume holes until the next layer. Production callbacks
+stay absent. Tests create holes only through exact captured leases and only in
+known wholly free granules; no automatic Shrink/Trim reclamation is enabled.
+
+Sparse release and finalize preflight validate lease ownership and borrowed
+ranges independently of commitment. Missing pages are not a reason for `BUSY`.
+Finalize still checks every lease before closing or releasing any one of them;
+a later release failure retains the exact sparse lease for retry. Providers
+without page capabilities retain the original control flow, with committed
+bytes equal to their fully backed lease extent.
 
 ## Verification and remaining boundary
 
