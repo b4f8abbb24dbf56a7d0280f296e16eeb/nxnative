@@ -3,6 +3,8 @@ t_imga_layout_sanitize
 t_imga_layout.dSYM/
 t_imga_layout_sanitize.dSYM/
 t_nvn
+t_report_value
+t_report_value.dSYM/
 t_nvn.dSYM/
 t_builtin
 t_deswz_gpu

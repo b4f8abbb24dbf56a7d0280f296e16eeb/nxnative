@@ -530,7 +530,8 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
 
 // ---------- Submission ----------
 static void defer_reset(void); static void defer_fallback(void);
-typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; void *vis; uint32_t seg; } post_op;   // vis: the visibility slot table for kind 3; seg: the segment it was encoded in (sub_cut)
+enum { POST_EVENT = 1, POST_COUNTER, POST_SAMPLES, POST_REPORT_VALUE };
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; void *vis; uint32_t seg; } post_op;   // val: CPU event pointer; addr: GPU report address; vis: POST_SAMPLES slot table; seg: the segment it was encoded in (sub_cut)
 static uint32_t g_seg;   // Index of the segment being encoded in this submission (0 until the first sub_cut)
 typedef struct seg_clk seg_clk; static seg_clk *g_sclk; static void seg_clk_put(seg_clk *c);   // Counter timestamps by segment (see gpu_ticks)
 // ---------- Conditional rendering (profile render_cond) ----------
@@ -1124,8 +1125,9 @@ static void post(post_op o) {
     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); }
     g_post[g_npost++] = o;
 }
-void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, NULL}); }
-void mtl_sub_counter(uint64_t addr, uint32_t type) { sbw_note(addr, 16, SBW_REPORT); post((post_op){2, NULL, 0, 0, addr, type, NULL, g_seg}); }
+void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){.kind = POST_EVENT, .val = val, .mode = mode, .v = v}); }
+void mtl_sub_report_value(uint64_t addr, uint32_t v) { post((post_op){.kind = POST_REPORT_VALUE, .addr = addr, .v = v}); }
+void mtl_sub_counter(uint64_t addr, uint32_t type) { sbw_note(addr, 16, SBW_REPORT); post((post_op){POST_COUNTER, NULL, 0, 0, addr, type, NULL, g_seg}); }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
 
 // Counter timestamps (19.2 MHz) are taken from the guest clock (hle_os.c guest_ns, the same source as svc GetSystemTick / cntpct): on hardware GPU timestamps and the CPU counter share one timebase, and games compare them.
@@ -1275,8 +1277,11 @@ uint64_t mtl_sub_commit(void) {
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
         for (int i = 0; i < n; i++) {
-            if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
-            else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
+            if (ops[i].kind == POST_EVENT) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
+            else if (ops[i].kind == POST_REPORT_VALUE) {   // Pool GPU addresses are still CPU identity addresses
+                *(volatile uint32_t *)(uintptr_t)ops[i].addr = ops[i].v;
+            }
+            else if (ops[i].kind == POST_SAMPLES) {   // Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
                 free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
@@ -8130,10 +8135,12 @@ void mtl_exec(const uint8_t *p) {
                 mtl_exec((const uint8_t *)t); g_ret_n--; break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
+            case OP_REPORT_VALUE: { const p_report_value *b = a;
+                PD("Y report_value cmd=%p dst=%#llx value=%u", p, (unsigned long long)b->addr, b->value); mtl_sub_report_value(b->addr, b->value); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
-                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
+                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){POST_SAMPLES, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
